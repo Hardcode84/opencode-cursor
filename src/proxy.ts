@@ -67,7 +67,9 @@ import {
   type McpToolDefinition,
 } from "./proto/agent_pb";
 import { createHash } from "node:crypto";
-import { resolve as pathResolve } from "node:path";
+import { mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, statSync } from "node:fs";
+import { join, resolve as pathResolve } from "node:path";
+import { homedir } from "node:os";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
@@ -162,8 +164,76 @@ function evictStaleConversations(): void {
   for (const [key, stored] of conversationStates) {
     if (now - stored.lastAccessMs > CONVERSATION_TTL_MS) {
       conversationStates.delete(key);
+      try { unlinkSync(convDiskPath(key)); } catch {}
     }
   }
+}
+
+// --- Disk persistence for conversation state across process restarts ---
+
+const CONV_DISK_DIR = join(
+  process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"),
+  "opencode",
+  "cursor-conversations",
+);
+try { mkdirSync(CONV_DISK_DIR, { recursive: true }); } catch {}
+
+const CONV_DISK_TTL_MS = 24 * 60 * 60 * 1000; // 24h on-disk TTL
+
+function convDiskPath(convKey: string): string {
+  return join(CONV_DISK_DIR, `${convKey}.json`);
+}
+
+interface SerializedConversation {
+  conversationId: string;
+  checkpoint: string | null; // base64
+  blobStore: Record<string, string>; // hex key → base64 value
+  savedMs: number;
+}
+
+function persistConversation(convKey: string, stored: StoredConversation): void {
+  const data: SerializedConversation = {
+    conversationId: stored.conversationId,
+    checkpoint: stored.checkpoint ? Buffer.from(stored.checkpoint).toString("base64") : null,
+    blobStore: Object.fromEntries(
+      [...stored.blobStore].map(([k, v]) => [k, Buffer.from(v).toString("base64")]),
+    ),
+    savedMs: Date.now(),
+  };
+  try { writeFileSync(convDiskPath(convKey), JSON.stringify(data)); } catch {}
+}
+
+function loadConversation(convKey: string): StoredConversation | null {
+  try {
+    const raw: SerializedConversation = JSON.parse(readFileSync(convDiskPath(convKey), "utf-8"));
+    if (Date.now() - raw.savedMs > CONV_DISK_TTL_MS) {
+      try { unlinkSync(convDiskPath(convKey)); } catch {}
+      return null;
+    }
+    return {
+      conversationId: raw.conversationId,
+      checkpoint: raw.checkpoint ? new Uint8Array(Buffer.from(raw.checkpoint, "base64")) : null,
+      blobStore: new Map(
+        Object.entries(raw.blobStore).map(([k, v]) => [k, new Uint8Array(Buffer.from(v, "base64"))]),
+      ),
+      lastAccessMs: Date.now(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function evictStaleDiskConversations(): void {
+  try {
+    const now = Date.now();
+    for (const name of readdirSync(CONV_DISK_DIR)) {
+      if (!name.endsWith(".json")) continue;
+      const full = join(CONV_DISK_DIR, name);
+      try {
+        if (now - statSync(full).mtimeMs > CONV_DISK_TTL_MS) unlinkSync(full);
+      } catch {}
+    }
+  } catch {}
 }
 
 /** Length-prefix a message: [4-byte BE length][payload] */
@@ -422,7 +492,6 @@ export function stopProxy(): void {
     active.bridge.end();
   }
   activeBridges.clear();
-  conversationStates.clear();
 }
 
 function handleChatCompletion(
@@ -474,7 +543,7 @@ function handleChatCompletion(
 
   let stored = conversationStates.get(convKey);
   if (!stored) {
-    stored = {
+    stored = loadConversation(convKey) ?? {
       conversationId: deterministicConversationId(convKey),
       checkpoint: null,
       blobStore: new Map(),
@@ -484,6 +553,7 @@ function handleChatCompletion(
   }
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
+  evictStaleDiskConversations();
 
   // Build the request. When tool results are present but the bridge died,
   // we must still include the last user text so Cursor has context.
@@ -1271,6 +1341,7 @@ function createBridgeStreamResponse(
                 if (stored) {
                   stored.checkpoint = checkpointBytes;
                   stored.lastAccessMs = Date.now();
+                  persistConversation(convKey, stored);
                 }
               },
             );
@@ -1294,6 +1365,7 @@ function createBridgeStreamResponse(
         if (stored) {
           for (const [k, v] of blobStore) stored.blobStore.set(k, v);
           stored.lastAccessMs = Date.now();
+          persistConversation(convKey, stored);
         }
         if (!mcpExecReceived) {
           const flushed = tagFilter.flush();
@@ -1490,6 +1562,7 @@ async function collectFullResponse(
             if (stored) {
               stored.checkpoint = checkpointBytes;
               stored.lastAccessMs = Date.now();
+              persistConversation(convKey, stored);
             }
           },
         );
@@ -1506,6 +1579,7 @@ async function collectFullResponse(
     if (stored) {
       for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
       stored.lastAccessMs = Date.now();
+      persistConversation(convKey, stored);
     }
     const flushed = tagFilter.flush();
     fullText += flushed.content;
