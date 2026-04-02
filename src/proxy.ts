@@ -636,27 +636,41 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
     systemPrompt = systemParts.join("\n");
   }
 
-  // Separate tool results from conversation turns
   const nonSystem = messages.filter((m) => m.role !== "system");
   let pendingUser = "";
+  let pendingAssistant = "";
+  const pendingToolCalls: OpenAIToolCall[] = [];
 
   for (const msg of nonSystem) {
     if (msg.role === "tool") {
-      toolResults.push({
-        toolCallId: msg.tool_call_id ?? "",
-        content: textContent(msg.content),
-      });
+      const toolId = msg.tool_call_id ?? "";
+      const call = pendingToolCalls.find((tc) => tc.id === toolId);
+      const toolContent = textContent(msg.content);
+      const truncated = toolContent.length > 2000
+        ? toolContent.slice(0, 2000) + "\n...[truncated]"
+        : toolContent;
+      if (call) {
+        pendingAssistant += `\n[Tool ${call.function.name}(${call.function.arguments})]\n${truncated}\n`;
+      }
+      toolResults.push({ toolCallId: toolId, content: toolContent });
     } else if (msg.role === "user") {
       if (pendingUser) {
-        pairs.push({ userText: pendingUser, assistantText: "" });
+        pairs.push({ userText: pendingUser, assistantText: pendingAssistant });
+        pendingAssistant = "";
+        pendingToolCalls.length = 0;
       }
       pendingUser = textContent(msg.content);
     } else if (msg.role === "assistant") {
-      // Skip assistant messages that are just tool_calls with no text
       const text = textContent(msg.content);
-      if (pendingUser) {
-        pairs.push({ userText: pendingUser, assistantText: text });
+      if (text) pendingAssistant += text;
+      if (msg.tool_calls) {
+        pendingToolCalls.push(...msg.tool_calls);
+      }
+      if (pendingUser && !msg.tool_calls) {
+        pairs.push({ userText: pendingUser, assistantText: pendingAssistant });
         pendingUser = "";
+        pendingAssistant = "";
+        pendingToolCalls.length = 0;
       }
     }
   }
