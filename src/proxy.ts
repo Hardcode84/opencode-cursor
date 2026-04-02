@@ -74,6 +74,13 @@ import { homedir } from "node:os";
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
+
+const DEBUG = process.env.CURSOR_PROXY_DEBUG === "1";
+function proxyLog(msg: string, ...args: unknown[]): void {
+  if (!DEBUG) return;
+  const ts = new Date().toISOString().slice(11, 23);
+  console.error(`[proxy ${ts}] ${msg}`, ...args);
+}
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
@@ -524,12 +531,11 @@ function handleChatCompletion(
     activeBridges.delete(bridgeKey);
 
     if (activeBridge.bridge.alive) {
-      // Resume the live bridge with tool results
+      proxyLog("resume: bridge alive, sending %d tool results", toolResults.length);
       return handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey);
     }
 
-    // Bridge died (timeout, server disconnect, etc.).
-    // Clean up and fall through to start a fresh bridge.
+    proxyLog("resume: bridge DEAD, falling through to fresh bridge (had %d tool results)", toolResults.length);
     clearInterval(activeBridge.heartbeatTimer);
     activeBridge.bridge.end();
   }
@@ -541,6 +547,39 @@ function handleChatCompletion(
     activeBridges.delete(bridgeKey);
   }
 
+  const stored = resolveConversationState(convKey);
+
+  const mcpTools = buildMcpToolDefinitions(tools);
+  const effectiveUserText = userText || (toolResults.length > 0
+    ? toolResults.map((r) => r.content).join("\n")
+    : "");
+  const payload = buildCursorRequest(
+    modelId, systemPrompt, effectiveUserText, turns,
+    stored.conversationId, stored.checkpoint, stored.blobStore,
+  );
+  payload.mcpTools = mcpTools;
+
+  proxyLog("request: model=%s stream=%s tools=%d userText=%d chars checkpoint=%s",
+    modelId, body.stream !== false, tools.length, effectiveUserText.length, !!stored.checkpoint);
+
+  if (body.stream === false) {
+    return handleNonStreamingResponse(payload, accessToken, modelId, convKey);
+  }
+
+  return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, () => {
+    proxyLog("retrying with fresh state after Blob not found");
+    invalidateConversationState(convKey);
+    const fresh = resolveConversationState(convKey);
+    const retryPayload = buildCursorRequest(
+      modelId, systemPrompt, effectiveUserText, turns,
+      fresh.conversationId, fresh.checkpoint, fresh.blobStore,
+    );
+    retryPayload.mcpTools = mcpTools;
+    return handleStreamingResponse(retryPayload, accessToken, modelId, bridgeKey, convKey);
+  });
+}
+
+function resolveConversationState(convKey: string): StoredConversation {
   let stored = conversationStates.get(convKey);
   if (!stored) {
     stored = loadConversation(convKey) ?? {
@@ -554,23 +593,12 @@ function handleChatCompletion(
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
   evictStaleDiskConversations();
+  return stored;
+}
 
-  // Build the request. When tool results are present but the bridge died,
-  // we must still include the last user text so Cursor has context.
-  const mcpTools = buildMcpToolDefinitions(tools);
-  const effectiveUserText = userText || (toolResults.length > 0
-    ? toolResults.map((r) => r.content).join("\n")
-    : "");
-  const payload = buildCursorRequest(
-    modelId, systemPrompt, effectiveUserText, turns,
-    stored.conversationId, stored.checkpoint, stored.blobStore,
-  );
-  payload.mcpTools = mcpTools;
-
-  if (body.stream === false) {
-    return handleNonStreamingResponse(payload, accessToken, modelId, convKey);
-  }
-  return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey);
+function invalidateConversationState(convKey: string): void {
+  conversationStates.delete(convKey);
+  try { unlinkSync(convDiskPath(convKey)); } catch {}
 }
 
 interface ToolResultInfo {
@@ -1050,6 +1078,7 @@ function handleExecMessage(
   // The model tries these first. We must respond with rejection/error
   // so it falls back to our MCP tools (registered via RequestContext).
   const REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
+  proxyLog("reject native tool: %s", execCase);
 
   if (execCase === "readArgs") {
     const args = execMsg.message.value;
@@ -1156,7 +1185,8 @@ function handleExecMessage(
     return;
   }
 
-  // Unknown exec type — log and ignore
+  // Unknown exec type
+  proxyLog("UNHANDLED exec: %s", execCase);
   console.error(`[proxy] unhandled exec: ${execCase}`);
 }
 
@@ -1224,6 +1254,7 @@ function createBridgeStreamResponse(
   modelId: string,
   bridgeKey: string,
   convKey: string,
+  onBlobNotFound?: () => Response,
 ): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -1278,6 +1309,7 @@ function createBridgeStreamResponse(
       const tagFilter = createThinkingTagFilter();
 
       let mcpExecReceived = false;
+      let blobNotFoundRetry: (() => Response) | undefined;
 
       const processChunk = createConnectFrameParser(
         (messageBytes) => {
@@ -1303,6 +1335,7 @@ function createBridgeStreamResponse(
               },
               // onMcpExec — the model wants to execute a tool.
               (exec) => {
+                proxyLog("mcpExec: tool=%s id=%s args=%d chars", exec.toolName, exec.toolCallId, exec.decodedArgs.length);
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
 
@@ -1352,7 +1385,17 @@ function createBridgeStreamResponse(
         (endStreamBytes) => {
           const endError = parseConnectEndStream(endStreamBytes);
           if (endError) {
+            proxyLog("endStream ERROR: %s", endError.message);
+            if (onBlobNotFound && /blob not found/i.test(endError.message)) {
+              proxyLog("Blob not found — killing bridge, will retry with fresh state");
+              clearInterval(heartbeatTimer);
+              bridge.end();
+              blobNotFoundRetry = onBlobNotFound;
+              return;
+            }
             sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
+          } else {
+            proxyLog("endStream: clean close");
           }
         },
       );
@@ -1360,7 +1403,28 @@ function createBridgeStreamResponse(
       bridge.onData(processChunk);
 
       bridge.onClose((code) => {
+        proxyLog("bridge.onClose: code=%d mcpExecReceived=%s pendingExecs=%d blobRetry=%s", code, mcpExecReceived, state.pendingExecs.length, !!blobNotFoundRetry);
         clearInterval(heartbeatTimer);
+
+        if (blobNotFoundRetry) {
+          const retryResponse = blobNotFoundRetry();
+          const retryStream = retryResponse.body;
+          if (retryStream) {
+            const reader = retryStream.getReader();
+            const pump = (): void => {
+              reader.read().then(({ done, value }) => {
+                if (done) { closeController(); return; }
+                if (!closed) controller.enqueue(value);
+                pump();
+              }).catch(() => closeController());
+            };
+            pump();
+          } else {
+            closeController();
+          }
+          return;
+        }
+
         const stored = conversationStates.get(convKey);
         if (stored) {
           for (const [k, v] of blobStore) stored.blobStore.set(k, v);
@@ -1398,6 +1462,7 @@ function startBridge(
   accessToken: string,
   requestBytes: Uint8Array,
 ): { bridge: ReturnType<typeof spawnBridge>; heartbeatTimer: NodeJS.Timeout } {
+  proxyLog("bridge: spawning h2-bridge subprocess");
   const bridge = spawnBridge({
     accessToken,
     rpcPath: "/agent.v1.AgentService/Run",
@@ -1413,12 +1478,14 @@ function handleStreamingResponse(
   modelId: string,
   bridgeKey: string,
   convKey: string,
+  onBlobNotFound?: () => Response,
 ): Response {
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     payload.blobStore, payload.mcpTools,
     modelId, bridgeKey, convKey,
+    onBlobNotFound,
   );
 }
 
