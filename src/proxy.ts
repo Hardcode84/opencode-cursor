@@ -10,8 +10,7 @@
  * - mcpArgs exec → pause stream, return tool_calls to caller
  * - Follow-up request with tool results → resume bridge with mcpResult
  *
- * HTTP/2 transport is delegated to a Node child process (h2-bridge.mjs)
- * because Bun's node:http2 module is broken.
+ * HTTP/2 transport uses in-process node:http2 (works in Bun).
  */
 import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
@@ -90,7 +89,7 @@ import {
   type KvServerMessage,
   type McpToolDefinition,
 } from "./proto/agent_pb";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { execSync, execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, statSync } from "node:fs";
 import { join, resolve as pathResolve } from "node:path";
@@ -99,7 +98,9 @@ import { homedir } from "node:os";
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CURSOR_AGENT_URL = process.env.CURSOR_AGENT_URL ?? "https://agentn.us.api5.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
-const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
+import { connect as h2Connect, type ClientHttp2Session, type ClientHttp2Stream } from "node:http2";
+
+const CURSOR_CLIENT_VERSION = "cli-2026.03.30-a5d3e17";
 
 const DEBUG = process.env.CURSOR_PROXY_DEBUG === "1";
 function proxyLog(msg: string, ...args: unknown[]): void {
@@ -170,7 +171,7 @@ interface PendingExec {
 
 /** A bridge kept alive across requests for tool result continuation. */
 interface ActiveBridge {
-  bridge: ReturnType<typeof spawnBridge>;
+  bridge: BridgeHandle;
   heartbeatTimer: NodeJS.Timeout;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
@@ -199,7 +200,7 @@ const STREAMING_TIMEOUT_MS = 15_000;
 
 function setBridgeInactivityTimer(
   bridgeKey: string,
-  bridge: ReturnType<typeof spawnBridge>,
+  bridge: BridgeHandle,
   heartbeatTimer: NodeJS.Timeout,
   onTimeout: () => void,
   phase: "thinking" | "streaming" = "thinking",
@@ -213,7 +214,6 @@ function setBridgeInactivityTimer(
     clearInterval(heartbeatTimer);
     onTimeout();
     bridge.end();
-    try { bridge.proc.kill(); } catch {}
   }, timeoutMs));
 }
 
@@ -333,13 +333,6 @@ function evictStaleDiskConversations(): void {
 }
 
 /** Length-prefix a message: [4-byte BE length][payload] */
-function lpEncode(data: Uint8Array): Buffer {
-  const buf = Buffer.alloc(4 + data.length);
-  buf.writeUInt32BE(data.length, 0);
-  buf.set(data, 4);
-  return buf;
-}
-
 /** Connect protocol frame: [1-byte flags][4-byte BE length][payload] */
 function frameConnectMessage(data: Uint8Array, flags = 0): Buffer {
   const frame = Buffer.alloc(5 + data.length);
@@ -349,114 +342,121 @@ function frameConnectMessage(data: Uint8Array, flags = 0): Buffer {
   return frame;
 }
 
-/**
- * Spawn the Node H2 bridge and return read/write handles.
- * The bridge uses length-prefixed framing on stdin/stdout.
- */
-interface SpawnBridgeOptions {
-  accessToken: string;
-  rpcPath: string;
-  url?: string;
-  /** When true, use application/proto for unary RPCs instead of Connect streaming. */
-  unary?: boolean;
-}
-
-function spawnBridge(options: SpawnBridgeOptions): {
-  proc: ReturnType<typeof Bun.spawn>;
+interface BridgeHandle {
   write: (data: Uint8Array) => void;
   end: () => void;
   onData: (cb: (chunk: Buffer) => void) => void;
   onClose: (cb: (code: number) => void) => void;
-  /** True while the bridge subprocess is still running. */
-  get alive(): boolean;
-} {
-  const proc = Bun.spawn(["node", BRIDGE_PATH], {
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  readonly alive: boolean;
+}
 
-  const config = JSON.stringify({
-    accessToken: options.accessToken,
-    url: options.url ?? CURSOR_API_URL,
-    path: options.rpcPath,
-    unary: options.unary ?? false,
-  });
-  proc.stdin.write(lpEncode(new TextEncoder().encode(config)));
+interface SpawnBridgeOptions {
+  accessToken: string;
+  rpcPath: string;
+  url?: string;
+  unary?: boolean;
+}
 
-  // Pipe bridge stderr to proxy log
-  (async () => {
-    try {
-      const reader = (proc.stderr as ReadableStream).getReader();
-      let buf = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += new TextDecoder().decode(value);
-        let nl;
-        while ((nl = buf.indexOf("\n")) >= 0) {
-          const line = buf.slice(0, nl).trim();
-          if (line) proxyLog("h2-bridge: %s", line);
-          buf = buf.slice(nl + 1);
-        }
-      }
-    } catch {}
-  })();
+function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
+  const baseUrl = options.url ?? CURSOR_API_URL;
+  const isApi2 = baseUrl.includes("api2.cursor.sh");
+  const connectUrl = isApi2
+    ? baseUrl.replace("api2.cursor.sh", "api2direct.cursor.sh")
+    : baseUrl;
+  const unary = options.unary ?? false;
+
+  const requestId = crypto.randomUUID();
+  const traceId = randomBytes(16).toString("hex");
+  const spanId = randomBytes(8).toString("hex");
+  const traceparent = `00-${traceId}-${spanId}-01`;
 
   const cbs = {
     data: null as ((chunk: Buffer) => void) | null,
     close: null as ((code: number) => void) | null,
   };
+  let alive = true;
+  let closeCode = 0;
+  const pendingChunks: Buffer[] = [];
 
-  // Track exit state so late onClose registrations fire immediately.
-  let exited = false;
-  let exitCode = 1;
-
-  (async () => {
-    const reader = proc.stdout.getReader();
-    let pending = Buffer.alloc(0);
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        pending = Buffer.concat([pending, Buffer.from(value)]);
-
-        while (pending.length >= 4) {
-          const len = pending.readUInt32BE(0);
-          if (pending.length < 4 + len) break;
-          const payload = pending.subarray(4, 4 + len);
-          pending = pending.subarray(4 + len);
-          cbs.data?.(Buffer.from(payload));
-        }
-      }
-    } catch {
-      // Stream ended
-    }
-
-    const code = await proc.exited ?? 1;
-    exited = true;
-    exitCode = code;
+  const finish = (code: number) => {
+    if (!alive) return;
+    alive = false;
+    closeCode = code;
     cbs.close?.(code);
-  })();
+  };
+
+  let h2Session: ClientHttp2Session | undefined;
+  let h2Stream: ClientHttp2Stream | undefined;
+
+  const closeTransport = () => {
+    try { h2Stream?.close(); } catch {}
+    try { h2Session?.close(); } catch {}
+  };
+
+  proxyLog("bridge: connecting to %s", connectUrl);
+  h2Session = h2Connect(connectUrl);
+
+  h2Session.on("error", (err) => {
+    proxyLog("bridge: h2 session error: %s", err?.message ?? err);
+    closeTransport();
+    finish(1);
+  });
+
+  const headers: Record<string, string> = {
+    ":method": "POST",
+    ":path": options.rpcPath || "/agent.v1.AgentService/Run",
+    "content-type": unary ? "application/proto" : "application/connect+proto",
+    "user-agent": "connect-es/1.6.1",
+    authorization: `Bearer ${options.accessToken}`,
+    "x-ghost-mode": "true",
+    "x-cursor-client-version": CURSOR_CLIENT_VERSION,
+    "x-cursor-client-type": "cli",
+    "x-request-id": requestId,
+    "x-original-request-id": requestId,
+    traceparent,
+    "backend-traceparent": traceparent,
+  };
+  if (isApi2) headers[":authority"] = "api2.cursor.sh";
+  if (!unary) headers["connect-protocol-version"] = "1";
+
+  h2Stream = h2Session.request(headers);
+
+  h2Stream.on("data", (chunk: Buffer | Uint8Array) => {
+    const buf = Buffer.from(chunk);
+    if (cbs.data) {
+      cbs.data(buf);
+    } else {
+      pendingChunks.push(buf);
+    }
+  });
+  h2Stream.on("end", () => {
+    proxyLog("bridge: stream ended by server");
+    closeTransport();
+    finish(0);
+  });
+  h2Stream.on("error", (err) => {
+    proxyLog("bridge: stream error: %s", err?.message ?? err);
+    closeTransport();
+    finish(1);
+  });
 
   return {
-    proc,
-    get alive() { return !exited; },
+    get alive() { return alive; },
     write(data) {
-      try { proc.stdin.write(lpEncode(data)); } catch {}
+      if (!alive || !h2Stream) return;
+      try { h2Stream.write(data); } catch {}
     },
     end() {
-      try {
-        proc.stdin.write(lpEncode(new Uint8Array(0)));
-        proc.stdin.end();
-      } catch {}
+      if (!h2Stream) return;
+      try { h2Stream.end(); } catch {}
     },
-    onData(cb) { cbs.data = cb; },
+    onData(cb) {
+      cbs.data = cb;
+      while (pendingChunks.length > 0) cb(pendingChunks.shift()!);
+    },
     onClose(cb) {
-      if (exited) {
-        // Process already exited — invoke immediately so streams don't hang.
-        queueMicrotask(() => cb(exitCode));
+      if (!alive) {
+        queueMicrotask(() => cb(closeCode));
       } else {
         cbs.close = cb;
       }
@@ -474,43 +474,65 @@ interface CursorUnaryRpcOptions {
 
 export async function callCursorUnaryRpc(
   options: CursorUnaryRpcOptions,
- ): Promise<{ body: Uint8Array; exitCode: number; timedOut: boolean }> {
-  const bridge = spawnBridge({
-    accessToken: options.accessToken,
-    rpcPath: options.rpcPath,
-    url: options.url,
-    unary: true,
-  });
-  const chunks: Buffer[] = [];
+): Promise<{ body: Uint8Array; exitCode: number; timedOut: boolean }> {
+  const baseUrl = options.url ?? CURSOR_API_URL;
+  const isApi2 = baseUrl.includes("api2.cursor.sh");
+  const connectUrl = isApi2
+    ? baseUrl.replace("api2.cursor.sh", "api2direct.cursor.sh")
+    : baseUrl;
+
+  const requestId = crypto.randomUUID();
   const { promise, resolve } = Promise.withResolvers<{
     body: Uint8Array;
     exitCode: number;
     timedOut: boolean;
   }>();
   let timedOut = false;
+  let settled = false;
+
+  const session = h2Connect(connectUrl);
   const timeoutMs = options.timeoutMs ?? 5_000;
   const timeout = timeoutMs > 0
     ? setTimeout(() => {
         timedOut = true;
-        try { bridge.proc.kill(); } catch {}
+        try { session.destroy(); } catch {}
       }, timeoutMs)
     : undefined;
 
-  bridge.onData((chunk) => {
-    chunks.push(Buffer.from(chunk));
-  });
-  bridge.onClose((exitCode) => {
+  const finish = (body: Uint8Array, code: number) => {
+    if (settled) return;
+    settled = true;
     if (timeout) clearTimeout(timeout);
-    resolve({
-      body: Buffer.concat(chunks),
-      exitCode,
-      timedOut,
-    });
-  });
+    try { session.close(); } catch {}
+    resolve({ body, exitCode: code, timedOut });
+  };
 
-  // Unary: send raw protobuf body (no Connect framing)
-  bridge.write(options.requestBody);
-  bridge.end();
+  session.on("error", () => finish(new Uint8Array(0), 1));
+
+  const headers: Record<string, string> = {
+    ":method": "POST",
+    ":path": options.rpcPath,
+    "content-type": "application/proto",
+    "user-agent": "connect-es/1.6.1",
+    authorization: `Bearer ${options.accessToken}`,
+    "x-ghost-mode": "true",
+    "x-cursor-client-version": CURSOR_CLIENT_VERSION,
+    "x-cursor-client-type": "cli",
+    "x-request-id": requestId,
+  };
+  if (isApi2) headers[":authority"] = "api2.cursor.sh";
+
+  const stream = session.request(headers);
+  const chunks: Buffer[] = [];
+  stream.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+  stream.on("end", () => finish(Buffer.concat(chunks), 0));
+  stream.on("error", () => finish(Buffer.concat(chunks), 1));
+  // Bun's node:http2 breaks on end(Buffer.alloc(0)) — use bare end() for empty bodies
+  if (options.requestBody.length > 0) {
+    stream.end(Buffer.from(options.requestBody));
+  } else {
+    stream.end();
+  }
 
   return promise;
 }
@@ -1840,7 +1862,7 @@ function deterministicConversationId(convKey: string): string {
 
 /** Create an SSE streaming Response that reads from a live bridge. */
 function createBridgeStreamResponse(
-  bridge: ReturnType<typeof spawnBridge>,
+  bridge: BridgeHandle,
   heartbeatTimer: NodeJS.Timeout,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
@@ -2138,8 +2160,8 @@ function createBridgeStreamResponse(
 function startBridge(
   accessToken: string,
   requestBytes: Uint8Array,
-): { bridge: ReturnType<typeof spawnBridge>; heartbeatTimer: NodeJS.Timeout } {
-  proxyLog("bridge: spawning h2-bridge subprocess → %s", CURSOR_AGENT_URL);
+): { bridge: BridgeHandle; heartbeatTimer: NodeJS.Timeout } {
+  proxyLog("bridge: opening h2 session → %s", CURSOR_AGENT_URL);
   const bridge = spawnBridge({
     accessToken,
     url: CURSOR_AGENT_URL,
