@@ -447,8 +447,8 @@ function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
       try { h2Stream.write(data); } catch {}
     },
     end() {
-      if (!h2Stream) return;
-      try { h2Stream.end(); } catch {}
+      closeTransport();
+      finish(0);
     },
     onData(cb) {
       cbs.data = cb;
@@ -1873,7 +1873,9 @@ function createBridgeStreamResponse(
   accessToken?: string,
   initialExecCount = 0,
   initialToolCallIndex = 0,
+  resumeCount = 0,
 ): Response {
+  const MAX_AUTO_RESUMES = 5;
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
 
@@ -1940,14 +1942,14 @@ function createBridgeStreamResponse(
         setBridgeInactivityTimer(bridgeKey, bridge, heartbeatTimer, () => {
           const timeoutMs = timerPhase === "thinking" ? THINKING_TIMEOUT_MS : STREAMING_TIMEOUT_MS;
           const stored = conversationStates.get(convKey);
-          if (accessToken && stored?.checkpoint) {
-            proxyLog("TIMEOUT after %d execs (%d MCP calls) — auto-resuming via ResumeAction", state.totalExecCount, state.toolCallIndex);
+          if (accessToken && stored?.checkpoint && resumeCount < MAX_AUTO_RESUMES) {
+            proxyLog("TIMEOUT after %d execs (%d MCP calls) — auto-resuming via ResumeAction (attempt %d/%d)", state.totalExecCount, state.toolCallIndex, resumeCount + 1, MAX_AUTO_RESUMES);
             autoResumeRetry = () => {
               const resumePayload = buildResumeRequest(
                 modelId, stored.conversationId, stored.checkpoint,
                 stored.blobStore, mcpTools,
               );
-              return handleStreamingResponse(resumePayload, accessToken, modelId, bridgeKey, convKey);
+              return handleStreamingResponse(resumePayload, accessToken, modelId, bridgeKey, convKey, undefined, resumeCount + 1);
             };
             return;
           }
@@ -2059,14 +2061,14 @@ function createBridgeStreamResponse(
               return;
             }
             const stored = conversationStates.get(convKey);
-            if (/resource_exhausted/i.test(endError.message) && accessToken && stored?.checkpoint) {
-              proxyLog("resource_exhausted with checkpoint — will auto-resume");
+            if (/resource_exhausted/i.test(endError.message) && accessToken && stored?.checkpoint && resumeCount < MAX_AUTO_RESUMES) {
+              proxyLog("resource_exhausted with checkpoint — will auto-resume (attempt %d/%d)", resumeCount + 1, MAX_AUTO_RESUMES);
               autoResumeRetry = () => {
                 const resumePayload = buildResumeRequest(
                   modelId, stored.conversationId, stored.checkpoint,
                   stored.blobStore, mcpTools,
                 );
-                return handleStreamingResponse(resumePayload, accessToken, modelId, bridgeKey, convKey);
+                return handleStreamingResponse(resumePayload, accessToken, modelId, bridgeKey, convKey, undefined, resumeCount + 1);
               };
               return;
             }
@@ -2179,6 +2181,7 @@ function handleStreamingResponse(
   bridgeKey: string,
   convKey: string,
   onBlobNotFound?: () => Response,
+  resumeCount = 0,
 ): Response {
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
@@ -2187,6 +2190,8 @@ function handleStreamingResponse(
     modelId, bridgeKey, convKey,
     onBlobNotFound,
     accessToken,
+    0, 0,
+    resumeCount,
   );
 }
 
