@@ -16,6 +16,26 @@ const GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 const DEFAULT_MAX_TOKENS = 64_000;
 
+const MODEL_LIMITS: Record<string, { context?: number; maxTokens?: number }> = {
+  // Claude — 1M variants
+  "claude-4-sonnet-1m":         { context: 1_000_000 },
+  "claude-4.5-opus":            { context: 200_000, maxTokens: 128_000 },
+  "claude-4.6-opus":            { context: 200_000, maxTokens: 128_000 },
+  "claude-4.6-opus-fast":       { context: 200_000, maxTokens: 128_000 },
+  "claude-4.6-opus-high":       { context: 200_000, maxTokens: 128_000 },
+  // GPT — larger contexts
+  "gpt-5.2":                    { context: 400_000, maxTokens: 128_000 },
+  "gpt-5.2-codex":              { context: 400_000, maxTokens: 128_000 },
+  "gpt-5.3-codex":              { context: 400_000, maxTokens: 128_000 },
+  "gpt-5.4":                    { context: 272_000, maxTokens: 128_000 },
+  "gpt-5.4-medium":             { context: 272_000, maxTokens: 128_000 },
+  // Gemini — 1M+
+  "gemini-3-pro":               { context: 1_000_000 },
+  "gemini-3.1-pro":             { context: 1_000_000 },
+  "gemini-3-flash":             { context: 1_000_000 },
+  "gemini-2.5-flash":           { context: 1_000_000 },
+};
+
 const CursorModelDetailsSchema = z.object({
   modelId: z.string(),
   displayName: z.string().optional().catch(undefined),
@@ -171,13 +191,26 @@ function normalizeSingleModel(model: unknown): CursorModel | null {
   const id = details.modelId.trim();
   if (!id) return null;
 
+  const limits = resolveModelLimits(id);
   return {
     id,
     name: pickDisplayName(details, id),
     reasoning: Boolean(details.thinkingDetails),
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: DEFAULT_MAX_TOKENS,
+    contextWindow: limits.context,
+    maxTokens: limits.maxTokens,
   };
+}
+
+function resolveModelLimits(modelId: string): { context: number; maxTokens: number } {
+  const exact = MODEL_LIMITS[modelId];
+  if (exact) return { context: exact.context ?? DEFAULT_CONTEXT_WINDOW, maxTokens: exact.maxTokens ?? DEFAULT_MAX_TOKENS };
+  // Strip suffixes like "-max-thinking", "-thinking", "-max" and retry
+  const base = modelId.replace(/-(max-thinking|thinking|max|high|medium|low|fast)$/g, "");
+  if (base !== modelId) {
+    const baseLimits = MODEL_LIMITS[base];
+    if (baseLimits) return { context: baseLimits.context ?? DEFAULT_CONTEXT_WINDOW, maxTokens: baseLimits.maxTokens ?? DEFAULT_MAX_TOKENS };
+  }
+  return { context: DEFAULT_CONTEXT_WINDOW, maxTokens: DEFAULT_MAX_TOKENS };
 }
 
 function pickDisplayName(model: CursorModelDetails, fallbackId: string): string {
