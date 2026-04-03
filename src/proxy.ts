@@ -82,6 +82,8 @@ import {
   AskQuestionResultSchema,
   AskQuestionRejectedSchema,
   SwitchModeRequestResponseSchema,
+  CreatePlanRequestResponseSchema,
+  FetchSuccessSchema,
   type AgentServerMessage,
   type ConversationStateStructure,
   type ExecServerMessage,
@@ -1204,7 +1206,10 @@ function handleInteractionQuery(
 ): void {
   const queryId: number = query.id ?? 0;
   const queryCase: string = query.query?.case ?? "unknown";
-  proxyLog("interactionQuery: id=%d type=%s", queryId, queryCase);
+  const queryDetail = queryCase === "webSearchRequestQuery"
+    ? ` search=${JSON.stringify(query.query?.value?.args?.searchTerm ?? "").slice(0, 80)}`
+    : "";
+  proxyLog("interactionQuery: id=%d type=%s%s", queryId, queryCase, queryDetail);
 
   let responseResult: any;
 
@@ -1243,8 +1248,19 @@ function handleInteractionQuery(
       case: "switchModeRequestResponse",
       value: create(SwitchModeRequestResponseSchema, {}),
     };
+  } else if (queryCase === "createPlanRequestQuery") {
+    responseResult = {
+      case: "createPlanRequestResponse",
+      value: create(CreatePlanRequestResponseSchema, {}),
+    };
   } else {
-    proxyLog("interactionQuery: unknown type %s, ignoring", queryCase);
+    proxyLog("interactionQuery: unknown type %s — sending empty response for id=%d", queryCase, queryId);
+    // Send response with just the id so the server doesn't hang waiting
+    const response = create(InteractionResponseSchema, { id: queryId });
+    const clientMsg = create(AgentClientMessageSchema, {
+      message: { case: "interactionResponse", value: response },
+    });
+    sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMsg)));
     return;
   }
 
@@ -1577,11 +1593,40 @@ function handleExecMessage(
     return;
   }
   if (execCase === "fetchArgs") {
-    const args = execMsg.message.value;
-    const result = create(FetchResultSchema, {
-      result: { case: "error", value: create(FetchErrorSchema, { url: args.url ?? "", error: REJECT_REASON }) },
-    });
-    sendExecResult(execMsg, "fetchResult", result, sendFrame);
+    const args = execMsg.message.value as any;
+    const fetchUrl = (args.url ?? "") as string;
+    proxyLog("native fetch: %s", fetchUrl.slice(0, 120));
+    (async () => {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 15_000);
+        const resp = await fetch(fetchUrl, {
+          signal: controller.signal,
+          headers: { "User-Agent": "Mozilla/5.0 (compatible; CursorBot/1.0)" },
+        });
+        clearTimeout(timer);
+        const text = await resp.text();
+        const truncated = text.length > 100_000 ? text.slice(0, 100_000) + "\n[truncated]" : text;
+        const result = create(FetchResultSchema, {
+          result: {
+            case: "success",
+            value: create(FetchSuccessSchema, {
+              url: fetchUrl,
+              content: truncated,
+              statusCode: resp.status,
+              contentType: resp.headers.get("content-type") ?? "",
+            }),
+          },
+        });
+        sendExecResult(execMsg, "fetchResult", result, sendFrame);
+      } catch (e: any) {
+        proxyLog("native fetch FAIL: %s %s", fetchUrl, String(e));
+        const result = create(FetchResultSchema, {
+          result: { case: "error", value: create(FetchErrorSchema, { url: fetchUrl, error: String(e) }) },
+        });
+        sendExecResult(execMsg, "fetchResult", result, sendFrame);
+      }
+    })();
     return;
   }
   if (execCase === "diagnosticsArgs") {
