@@ -72,6 +72,9 @@ import {
   GrepContentResultSchema,
   GrepFileMatchSchema,
   GrepContentMatchSchema,
+  GrepFilesResultSchema,
+  GrepCountResultSchema,
+  GrepFileCountSchema,
   InteractionResponseSchema,
   WebSearchRequestResponseSchema,
   WebSearchRequestResponse_ApprovedSchema,
@@ -1535,6 +1538,70 @@ function handleExecMessage(
     const searchPath = (args.path ?? ".") as string;
     const outputMode = (args.outputMode ?? "content") as string;
     proxyLog("native grep: pattern=%s path=%s mode=%s", pattern, searchPath, outputMode);
+    if (!pattern) {
+      const result = create(GrepResultSchema, {
+        result: { case: "success", value: create(GrepSuccessSchema, { pattern, path: searchPath, outputMode, workspaceResults: {} }) },
+      });
+      sendExecResult(execMsg, "grepResult", result, sendFrame);
+      return;
+    }
+    const buildGrepResult = (stdout: string): any => {
+      const lines = stdout.trimEnd().split("\n").filter(Boolean);
+      if (outputMode === "files_with_matches") {
+        return create(GrepResultSchema, {
+          result: { case: "success", value: create(GrepSuccessSchema, {
+            pattern, path: searchPath, outputMode,
+            workspaceResults: Object.fromEntries(lines.map((f) => [f, create(GrepUnionResultSchema, {
+              result: { case: "files", value: create(GrepFilesResultSchema, { files: [f] }) },
+            })])),
+          }) },
+        });
+      }
+      if (outputMode === "count") {
+        const counts: Array<{ file: string; count: number }> = [];
+        for (const line of lines) {
+          const m = line.match(/^(.+?):(\d+)$/);
+          if (m) counts.push({ file: m[1]!, count: Number(m[2]) });
+        }
+        return create(GrepResultSchema, {
+          result: { case: "success", value: create(GrepSuccessSchema, {
+            pattern, path: searchPath, outputMode,
+            workspaceResults: Object.fromEntries(counts.map((c) => [c.file, create(GrepUnionResultSchema, {
+              result: { case: "count", value: create(GrepCountResultSchema, {
+                counts: [create(GrepFileCountSchema, { file: c.file, count: c.count })],
+              }) },
+            })])),
+          }) },
+        });
+      }
+      const fileMatches: Record<string, Array<{ line: number; content: string; ctx: boolean }>> = {};
+      for (const line of lines) {
+        const m = line.match(/^(.+?):(\d+)([:-])(.*)$/);
+        if (m) {
+          const [, file, ln, sep, text] = m;
+          (fileMatches[file!] ??= []).push({ line: Number(ln), content: text!, ctx: sep === "-" });
+        }
+      }
+      return create(GrepResultSchema, {
+        result: { case: "success", value: create(GrepSuccessSchema, {
+          pattern, path: searchPath, outputMode,
+          workspaceResults: Object.fromEntries(
+            Object.entries(fileMatches).map(([file, matches]) => [file, create(GrepUnionResultSchema, {
+              result: { case: "content", value: create(GrepContentResultSchema, {
+                matches: [create(GrepFileMatchSchema, {
+                  file,
+                  matches: matches.map((m) =>
+                    create(GrepContentMatchSchema, { lineNumber: m.line, content: m.content, isContextLine: m.ctx }),
+                  ),
+                })],
+                totalLines: lines.length,
+                totalMatchedLines: matches.filter((m) => !m.ctx).length,
+              }) },
+            })]),
+          ),
+        }) },
+      });
+    };
     try {
       const rgFlags = ["--no-heading", "--line-number"];
       if (args.caseInsensitive) rgFlags.push("-i");
@@ -1547,50 +1614,12 @@ function handleExecMessage(
       if (outputMode === "files_with_matches") rgFlags.push("-l");
       if (outputMode === "count") rgFlags.push("-c");
       if (args.headLimit) rgFlags.push("--max-count", String(args.headLimit));
+      if (args.sort && args.sort !== "none") {
+        rgFlags.push(args.sortAscending === false ? "--sortr" : "--sort", args.sort);
+      }
       rgFlags.push("--", pattern, searchPath);
       const stdout = execFileSync("rg", rgFlags, { encoding: "utf-8", timeout: 15_000, maxBuffer: 5 * 1024 * 1024 });
-      const lines = stdout.trimEnd().split("\n");
-      const fileMatches: Record<string, Array<{ line: number; content: string; ctx: boolean }>> = {};
-      for (const line of lines) {
-        const m = line.match(/^(.+?):(\d+)[:-](.*)$/);
-        if (m) {
-          const [, file, ln, text] = m;
-          (fileMatches[file!] ??= []).push({ line: Number(ln), content: text!, ctx: line[file!.length + ln!.length + 1] === "-" });
-        }
-      }
-      const result = create(GrepResultSchema, {
-        result: {
-          case: "success",
-          value: create(GrepSuccessSchema, {
-            pattern,
-            path: searchPath,
-            outputMode,
-            workspaceResults: Object.fromEntries(
-              Object.entries(fileMatches).map(([file, matches]) => [
-                file,
-                create(GrepUnionResultSchema, {
-                  result: {
-                    case: "content",
-                    value: create(GrepContentResultSchema, {
-                      matches: [
-                        create(GrepFileMatchSchema, {
-                          file,
-                          matches: matches.map((m) =>
-                            create(GrepContentMatchSchema, { lineNumber: m.line, content: m.content, isContextLine: m.ctx }),
-                          ),
-                        }),
-                      ],
-                      totalLines: lines.length,
-                      totalMatchedLines: matches.filter((m) => !m.ctx).length,
-                    }),
-                  },
-                }),
-              ]),
-            ),
-          }),
-        },
-      });
-      sendExecResult(execMsg, "grepResult", result, sendFrame);
+      sendExecResult(execMsg, "grepResult", buildGrepResult(stdout), sendFrame);
     } catch (e: any) {
       if (e.status === 1) {
         const result = create(GrepResultSchema, {
@@ -1603,7 +1632,12 @@ function handleExecMessage(
       } else if (e.code === "ENOENT") {
         proxyLog("native grep: rg not found, falling back to grep");
         try {
-          const grepFlags = ["-rn"];
+          const grepFlags = ["-rn",
+            "--exclude-dir=.git", "--exclude-dir=node_modules",
+            "--exclude-dir=.next", "--exclude-dir=dist",
+            "--exclude-dir=build", "--exclude-dir=vendor",
+            "--binary-files=without-match",
+          ];
           if (args.caseInsensitive) grepFlags.push("-i");
           if (args.glob) grepFlags.push("--include", args.glob);
           if (args.contextBefore) grepFlags.push("-B", String(args.contextBefore));
@@ -1614,46 +1648,7 @@ function handleExecMessage(
           if (args.headLimit) grepFlags.push("-m", String(args.headLimit));
           grepFlags.push("--", pattern, searchPath);
           const grepOut = execFileSync("grep", grepFlags, { encoding: "utf-8", timeout: 15_000, maxBuffer: 5 * 1024 * 1024 });
-          const lines = grepOut.trimEnd().split("\n");
-          const fileMatches: Record<string, Array<{ line: number; content: string; ctx: boolean }>> = {};
-          for (const line of lines) {
-            const m = line.match(/^(.+?):(\d+)[:-](.*)$/);
-            if (m) {
-              const [, file, ln, text] = m;
-              (fileMatches[file!] ??= []).push({ line: Number(ln), content: text!, ctx: line[file!.length + ln!.length + 1] === "-" });
-            }
-          }
-          const result = create(GrepResultSchema, {
-            result: {
-              case: "success",
-              value: create(GrepSuccessSchema, {
-                pattern, path: searchPath, outputMode,
-                workspaceResults: Object.fromEntries(
-                  Object.entries(fileMatches).map(([file, matches]) => [
-                    file,
-                    create(GrepUnionResultSchema, {
-                      result: {
-                        case: "content",
-                        value: create(GrepContentResultSchema, {
-                          matches: [
-                            create(GrepFileMatchSchema, {
-                              file,
-                              matches: matches.map((m) =>
-                                create(GrepContentMatchSchema, { lineNumber: m.line, content: m.content, isContextLine: m.ctx }),
-                              ),
-                            }),
-                          ],
-                          totalLines: lines.length,
-                          totalMatchedLines: matches.filter((m) => !m.ctx).length,
-                        }),
-                      },
-                    }),
-                  ]),
-                ),
-              }),
-            },
-          });
-          sendExecResult(execMsg, "grepResult", result, sendFrame);
+          sendExecResult(execMsg, "grepResult", buildGrepResult(grepOut), sendFrame);
         } catch (e2: any) {
           if (e2.status === 1) {
             const result = create(GrepResultSchema, {
