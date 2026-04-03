@@ -1134,6 +1134,7 @@ function processServerMessage(
   onText: (text: string, isThinking?: boolean) => void,
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
+  onNotify?: (text: string) => void,
 ): boolean {
   const msgCase = msg.message.case;
 
@@ -1162,7 +1163,7 @@ function processServerMessage(
     }
     return true;
   } else if (msgCase === "interactionQuery") {
-    handleInteractionQuery(msg.message.value as any, sendFrame);
+    handleInteractionQuery(msg.message.value as any, sendFrame, onNotify);
     return true;
   }
   proxyLog("unrecognized server message case: %s", msgCase ?? "undefined");
@@ -1203,17 +1204,20 @@ function handleInteractionUpdate(
 function handleInteractionQuery(
   query: any,
   sendFrame: (data: Uint8Array) => void,
+  onNotify?: (text: string) => void,
 ): void {
   const queryId: number = query.id ?? 0;
   const queryCase: string = query.query?.case ?? "unknown";
-  const queryDetail = queryCase === "webSearchRequestQuery"
-    ? ` search=${JSON.stringify(query.query?.value?.args?.searchTerm ?? "").slice(0, 80)}`
+  const searchTerm = queryCase === "webSearchRequestQuery"
+    ? (query.query?.value?.args?.searchTerm ?? "") as string
     : "";
+  const queryDetail = searchTerm ? ` search=${JSON.stringify(searchTerm).slice(0, 80)}` : "";
   proxyLog("interactionQuery: id=%d type=%s%s", queryId, queryCase, queryDetail);
 
   let responseResult: any;
 
   if (queryCase === "webSearchRequestQuery") {
+    if (onNotify && searchTerm) onNotify(`[web search: ${searchTerm}]`);
     responseResult = {
       case: "webSearchRequestResponse",
       value: create(WebSearchRequestResponseSchema, {
@@ -1839,12 +1843,14 @@ function createBridgeStreamResponse(
                 if (isThinking) {
                   hasNativeThinking = true;
                   sendSSE(makeChunk({ reasoning_content: text }));
-                } else if (hasNativeThinking) {
-                  sendSSE(makeChunk({ content: text }));
                 } else {
-                  const { content, reasoning } = tagFilter.process(text);
-                  if (reasoning) sendSSE(makeChunk({ reasoning_content: reasoning }));
-                  if (content) sendSSE(makeChunk({ content }));
+                  if (hasNativeThinking) {
+                    sendSSE(makeChunk({ content: text }));
+                  } else {
+                    const { content, reasoning } = tagFilter.process(text);
+                    if (reasoning) sendSSE(makeChunk({ reasoning_content: reasoning }));
+                    if (content) sendSSE(makeChunk({ content }));
+                  }
                 }
               },
               // onMcpExec — the model wants to execute a tool.
@@ -1897,6 +1903,9 @@ function createBridgeStreamResponse(
                   stored.lastAccessMs = Date.now();
                   persistConversation(convKey, stored);
                 }
+              },
+              (note) => {
+                sendSSE(makeChunk({ content: `\n${note}\n` }));
               },
             );
           } catch (err) {
