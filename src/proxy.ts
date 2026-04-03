@@ -73,6 +73,15 @@ import {
   GrepContentResultSchema,
   GrepFileMatchSchema,
   GrepContentMatchSchema,
+  InteractionResponseSchema,
+  WebSearchRequestResponseSchema,
+  WebSearchRequestResponse_ApprovedSchema,
+  ExaSearchRequestResponseSchema,
+  ExaFetchRequestResponseSchema,
+  AskQuestionInteractionResponseSchema,
+  AskQuestionResultSchema,
+  AskQuestionRejectedSchema,
+  SwitchModeRequestResponseSchema,
   type AgentServerMessage,
   type ConversationStateStructure,
   type ExecServerMessage,
@@ -1150,6 +1159,9 @@ function processServerMessage(
       onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
     }
     return true;
+  } else if (msgCase === "interactionQuery") {
+    handleInteractionQuery(msg.message.value as any, sendFrame);
+    return true;
   }
   proxyLog("unrecognized server message case: %s", msgCase ?? "undefined");
   return false;
@@ -1183,6 +1195,65 @@ function handleInteractionUpdate(
   } else if (updateCase === "tokenDelta") {
     state.outputTokens += update.message.value.tokens ?? 0;
   }
+}
+
+/** Handle interactionQuery — auto-approve searches, auto-answer questions. */
+function handleInteractionQuery(
+  query: any,
+  sendFrame: (data: Uint8Array) => void,
+): void {
+  const queryId: number = query.id ?? 0;
+  const queryCase: string = query.query?.case ?? "unknown";
+  proxyLog("interactionQuery: id=%d type=%s", queryId, queryCase);
+
+  let responseResult: any;
+
+  if (queryCase === "webSearchRequestQuery") {
+    responseResult = {
+      case: "webSearchRequestResponse",
+      value: create(WebSearchRequestResponseSchema, {
+        result: { case: "approved", value: create(WebSearchRequestResponse_ApprovedSchema, {}) },
+      }),
+    };
+  } else if (queryCase === "exaSearchRequestQuery") {
+    responseResult = {
+      case: "exaSearchRequestResponse",
+      value: create(ExaSearchRequestResponseSchema, {
+        result: { case: "approved", value: {} as any },
+      }),
+    };
+  } else if (queryCase === "exaFetchRequestQuery") {
+    responseResult = {
+      case: "exaFetchRequestResponse",
+      value: create(ExaFetchRequestResponseSchema, {
+        result: { case: "approved", value: {} as any },
+      }),
+    };
+  } else if (queryCase === "askQuestionInteractionQuery") {
+    responseResult = {
+      case: "askQuestionInteractionResponse",
+      value: create(AskQuestionInteractionResponseSchema, {
+        result: create(AskQuestionResultSchema, {
+          result: { case: "rejected", value: create(AskQuestionRejectedSchema, { reason: "Non-interactive session" }) },
+        }),
+      }),
+    };
+  } else if (queryCase === "switchModeRequestQuery") {
+    responseResult = {
+      case: "switchModeRequestResponse",
+      value: create(SwitchModeRequestResponseSchema, {}),
+    };
+  } else {
+    proxyLog("interactionQuery: unknown type %s, ignoring", queryCase);
+    return;
+  }
+
+  const response = create(InteractionResponseSchema, { id: queryId, result: responseResult });
+  const clientMsg = create(AgentClientMessageSchema, {
+    message: { case: "interactionResponse", value: response },
+  });
+  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMsg)));
+  proxyLog("interactionQuery: responded to %s (id=%d)", queryCase, queryId);
 }
 
 /** Send a KV client response back to Cursor. */
@@ -1797,6 +1868,18 @@ function createBridgeStreamResponse(
               clearInterval(heartbeatTimer);
               bridge.end();
               blobNotFoundRetry = onBlobNotFound;
+              return;
+            }
+            const stored = conversationStates.get(convKey);
+            if (/resource_exhausted/i.test(endError.message) && accessToken && stored?.checkpoint) {
+              proxyLog("resource_exhausted with checkpoint — will auto-resume");
+              autoResumeRetry = () => {
+                const resumePayload = buildResumeRequest(
+                  modelId, stored.conversationId, stored.checkpoint,
+                  stored.blobStore, mcpTools,
+                );
+                return handleStreamingResponse(resumePayload, accessToken, modelId, bridgeKey, convKey);
+              };
               return;
             }
             sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
