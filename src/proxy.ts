@@ -671,8 +671,8 @@ function handleChatCompletion(
   const stored = resolveConversationState(convKey);
 
   if (stored.checkpoint && turns.length + 1 < stored.turnCount) {
-    const desiredTC = turns.length + 1;
-    proxyLog("undo detected: turns=%d stored=%d — looking for checkpoint at turnCount=%d (stack=%d)",
+    const desiredTC = turns.length;
+    proxyLog("undo detected: turns=%d stored=%d — looking for checkpoint at turnCount<=%d (stack=%d)",
       turns.length, stored.turnCount, desiredTC, stored.checkpointStack.length);
     let found = false;
     for (let i = stored.checkpointStack.length - 1; i >= 0; i--) {
