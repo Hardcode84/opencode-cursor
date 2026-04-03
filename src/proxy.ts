@@ -656,9 +656,11 @@ function handleChatCompletion(
   const stored = resolveConversationState(convKey);
 
   if (stored.checkpoint && turns.length < stored.turnCount) {
-    proxyLog("undo detected: turns=%d < stored=%d — dropping checkpoint", turns.length, stored.turnCount);
+    proxyLog("undo detected: turns=%d < stored=%d — resetting conversation", turns.length, stored.turnCount);
     stored.checkpoint = null;
     stored.turnCount = 0;
+    stored.conversationId = deterministicConversationId(convKey + `:${Date.now()}`);
+    proxyLog("undo: new conversationId=%s", stored.conversationId);
   }
 
   const mcpTools = buildMcpToolDefinitions(tools);
@@ -671,16 +673,15 @@ function handleChatCompletion(
   );
   payload.mcpTools = mcpTools;
 
-  // Will be committed as turnCount when checkpoint is saved
-  stored.turnCount = turns.length + 1;
-
   const turnsChars = turns.reduce((s, t) => s + t.userText.length + t.assistantText.length, 0);
   proxyLog("request: model=%s stream=%s tools=%d userText=%d chars checkpoint=%s msgs=%d turns=%d turnsChars=%d blobs=%d",
     modelId, body.stream !== false, tools.length, effectiveUserText.length, !!stored.checkpoint,
     body.messages.length, turns.length, turnsChars, stored.blobStore.size);
 
+  const reqTurnCount = turns.length + 1;
+
   if (body.stream === false) {
-    return handleNonStreamingResponse(payload, accessToken, modelId, convKey);
+    return handleNonStreamingResponse(payload, accessToken, modelId, convKey, reqTurnCount);
   }
 
   return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, () => {
@@ -706,9 +707,9 @@ function handleChatCompletion(
       hardPayload.mcpTools = mcpTools;
       proxyLog("hard retry: turns=%d turnsChars=%d blobs=%d",
         turns.length, turnsChars, fresh.blobStore.size);
-      return handleStreamingResponse(hardPayload, accessToken, modelId, bridgeKey, convKey);
-    });
-  });
+      return handleStreamingResponse(hardPayload, accessToken, modelId, bridgeKey, convKey, undefined, reqTurnCount);
+    }, reqTurnCount);
+  }, reqTurnCount);
 }
 
 function resolveConversationState(convKey: string): StoredConversation {
@@ -1821,6 +1822,7 @@ function createBridgeStreamResponse(
   accessToken?: string,
   initialExecCount = 0,
   initialToolCallIndex = 0,
+  requestTurnCount = 0,
 ): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -1981,6 +1983,7 @@ function createBridgeStreamResponse(
                 const stored = conversationStates.get(convKey);
                 if (stored) {
                   stored.checkpoint = checkpointBytes;
+                  stored.turnCount = requestTurnCount;
                   for (const [k, v] of blobStore) stored.blobStore.set(k, v);
                   stored.lastAccessMs = Date.now();
                   persistConversation(convKey, stored);
@@ -2127,6 +2130,7 @@ function handleStreamingResponse(
   bridgeKey: string,
   convKey: string,
   onBlobNotFound?: () => Response,
+  requestTurnCount = 0,
 ): Response {
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
@@ -2135,6 +2139,8 @@ function handleStreamingResponse(
     modelId, bridgeKey, convKey,
     onBlobNotFound,
     accessToken,
+    0, 0,
+    requestTurnCount,
   );
 }
 
@@ -2225,10 +2231,11 @@ async function handleNonStreamingResponse(
   accessToken: string,
   modelId: string,
   convKey: string,
+  requestTurnCount = 0,
 ): Promise<Response> {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
-  const { text, usage } = await collectFullResponse(payload, accessToken, convKey);
+  const { text, usage } = await collectFullResponse(payload, accessToken, convKey, requestTurnCount);
 
   return new Response(
     JSON.stringify({
@@ -2258,6 +2265,7 @@ async function collectFullResponse(
   payload: CursorRequestPayload,
   accessToken: string,
   convKey: string,
+  requestTurnCount = 0,
 ): Promise<CollectedResponse> {
   const { promise, resolve } = Promise.withResolvers<CollectedResponse>();
   let fullText = "";
@@ -2301,6 +2309,7 @@ async function collectFullResponse(
             const stored = conversationStates.get(convKey);
             if (stored) {
               stored.checkpoint = checkpointBytes;
+              stored.turnCount = requestTurnCount;
               for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
               stored.lastAccessMs = Date.now();
               persistConversation(convKey, stored);
