@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Dumb HTTP/2 bidirectional pipe for Cursor gRPC.
+ * HTTP/2 bidirectional pipe for Cursor gRPC (Connect protocol).
  *
  * Bun's node:http2 is broken. This Node script acts as a transparent
  * HTTP/2 proxy: it opens a single bidirectional stream and ferries
@@ -21,7 +21,13 @@
 import http2 from "node:http2";
 import crypto from "node:crypto";
 
-const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
+const CURSOR_CLIENT_VERSION = "cli-2026.03.30-a5d3e17";
+const HEARTBEAT_INTERVAL_MS = 5_000;
+
+// Pre-built Connect frame for AgentClientMessage { clientHeartbeat: {} }
+// Protobuf: field 7 (tag 0x3a), length-delimited, 0 bytes → [0x3a, 0x00]
+// Connect envelope: [flags=0x00][length BE32 = 2][0x3a, 0x00]
+const HEARTBEAT_FRAME = Buffer.from([0x00, 0x00, 0x00, 0x00, 0x02, 0x3a, 0x00]);
 
 /** Write one length-prefixed message to stdout. */
 function writeMessage(data) {
@@ -85,10 +91,16 @@ if (!configBuf) process.exit(1);
 const config = JSON.parse(configBuf.toString("utf8"));
 const { accessToken, url, path: rpcPath, unary } = config;
 
-const client = http2.connect(url || "https://api2.cursor.sh");
+const baseUrl = url || "https://api2.cursor.sh";
+const isApi2 = baseUrl.includes("api2.cursor.sh");
+const connectUrl = isApi2
+  ? baseUrl.replace("api2.cursor.sh", "api2direct.cursor.sh")
+  : baseUrl;
+const isDirect = isApi2;
 
-// Guard against initial connection failure. Reset on any h2 activity
-// so long-running agent conversations (with tool call round-trips) survive.
+process.stderr.write(`[bridge] connecting to ${connectUrl}\n`);
+const client = http2.connect(connectUrl);
+
 let timeout = setTimeout(killBridge, 30_000);
 
 function resetTimeout() {
@@ -98,30 +110,55 @@ function resetTimeout() {
 
 function killBridge() {
   clearTimeout(timeout);
+  clearInterval(heartbeatTimer);
   client.destroy();
   process.exit(1);
 }
 
 client.on("error", () => {
   clearTimeout(timeout);
+  clearInterval(heartbeatTimer);
   process.exit(1);
 });
+
+const requestId = crypto.randomUUID();
+const traceId = crypto.randomBytes(16).toString("hex");
+const spanId = crypto.randomBytes(8).toString("hex");
+const traceparent = `00-${traceId}-${spanId}-01`;
 
 const headers = {
   ":method": "POST",
   ":path": rpcPath || "/agent.v1.AgentService/Run",
   "content-type": unary ? "application/proto" : "application/connect+proto",
-  te: "trailers",
+  "user-agent": "connect-es/1.6.1",
   authorization: `Bearer ${accessToken}`,
   "x-ghost-mode": "true",
   "x-cursor-client-version": CURSOR_CLIENT_VERSION,
   "x-cursor-client-type": "cli",
-  "x-request-id": crypto.randomUUID(),
+  "x-request-id": requestId,
+  "x-original-request-id": requestId,
+  "traceparent": traceparent,
+  "backend-traceparent": traceparent,
 };
+if (isDirect) {
+  headers[":authority"] = "api2.cursor.sh";
+}
 if (!unary) {
   headers["connect-protocol-version"] = "1";
 }
 const h2Stream = client.request(headers);
+
+// --- Client heartbeat: send every 5s to keep the server connection alive ---
+let heartbeatTimer;
+if (!unary) {
+  heartbeatTimer = setInterval(() => {
+    if (!h2Stream.closed && !h2Stream.destroyed) {
+      h2Stream.write(HEARTBEAT_FRAME);
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+} else {
+  heartbeatTimer = undefined;
+}
 
 // Forward H2 response data → stdout (length-prefixed)
 h2Stream.on("data", (chunk) => {
@@ -131,20 +168,20 @@ h2Stream.on("data", (chunk) => {
 
 h2Stream.on("end", () => {
   clearTimeout(timeout);
+  clearInterval(heartbeatTimer);
   client.close();
-  // Give stdout time to flush
   setTimeout(() => process.exit(0), 100);
 });
 
 h2Stream.on("error", () => {
   clearTimeout(timeout);
+  clearInterval(heartbeatTimer);
   client.close();
   process.exit(1);
 });
 
 // Forward stdin → H2 stream (after config message)
 if (unary) {
-  // Unary mode: read a single body message, write it, and end the stream.
   const body = await readMessage();
   if (body && body.length > 0 && !h2Stream.closed && !h2Stream.destroyed) {
     h2Stream.end(body);
@@ -152,20 +189,15 @@ if (unary) {
     h2Stream.end();
   }
 } else {
-  // Streaming mode: forward all stdin messages as Connect frames.
   (async () => {
     while (true) {
       const msg = await readMessage();
-      if (!msg || msg.length === 0) {
-        // EOF or zero-length = done writing
-        break;
-      }
+      if (!msg || msg.length === 0) break;
       if (!h2Stream.closed && !h2Stream.destroyed) {
         resetTimeout();
         h2Stream.write(msg);
       }
     }
-
     if (!h2Stream.closed && !h2Stream.destroyed) {
       h2Stream.end();
     }

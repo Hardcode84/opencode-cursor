@@ -54,12 +54,25 @@ import {
   SetBlobResultSchema,
   ShellRejectedSchema,
   ShellResultSchema,
+  ResumeActionSchema,
   UserMessageActionSchema,
   UserMessageSchema,
   WriteRejectedSchema,
   WriteResultSchema,
   WriteShellStdinErrorSchema,
   WriteShellStdinResultSchema,
+  ExecClientControlMessageSchema,
+  ExecClientStreamCloseSchema,
+  ReadSuccessSchema,
+  LsSuccessSchema,
+  LsDirectoryTreeNodeSchema,
+  LsDirectoryTreeNode_FileSchema,
+  ShellSuccessSchema,
+  GrepSuccessSchema,
+  GrepUnionResultSchema,
+  GrepContentResultSchema,
+  GrepFileMatchSchema,
+  GrepContentMatchSchema,
   type AgentServerMessage,
   type ConversationStateStructure,
   type ExecServerMessage,
@@ -67,11 +80,13 @@ import {
   type McpToolDefinition,
 } from "./proto/agent_pb";
 import { createHash } from "node:crypto";
+import { execSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, statSync } from "node:fs";
 import { join, resolve as pathResolve } from "node:path";
 import { homedir } from "node:os";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
+const CURSOR_AGENT_URL = process.env.CURSOR_AGENT_URL ?? "https://agentn.us.api5.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
 
@@ -150,6 +165,10 @@ interface ActiveBridge {
   mcpTools: McpToolDefinition[];
   pendingExecs: PendingExec[];
   convKey: string;
+  /** Accumulated exec count across all resumes within this bridge session. */
+  totalExecCount: number;
+  toolCallIndex: number;
+  accessToken: string;
 }
 
 // Active bridges keyed by a session token (derived from conversation state).
@@ -158,26 +177,33 @@ interface ActiveBridge {
 const activeBridges = new Map<string, ActiveBridge>();
 
 /** Global per-bridge inactivity timers. Keyed by bridgeKey.
- *  Ensures only ONE timer per bridge regardless of how many streams are created. */
+ *  Ensures only ONE timer per bridge regardless of how many streams are created.
+ *
+ *  Two-stage timeout:
+ *  - THINKING: waiting for the model's first token after tool results (model is reasoning)
+ *  - STREAMING: gap between tokens while the model is actively outputting */
 const bridgeInactivityTimers = new Map<string, NodeJS.Timeout>();
-const INACTIVITY_TIMEOUT_MS = 60_000;
+const THINKING_TIMEOUT_MS = 30_000;
+const STREAMING_TIMEOUT_MS = 15_000;
 
 function setBridgeInactivityTimer(
   bridgeKey: string,
   bridge: ReturnType<typeof spawnBridge>,
   heartbeatTimer: NodeJS.Timeout,
   onTimeout: () => void,
+  phase: "thinking" | "streaming" = "thinking",
 ): void {
+  const timeoutMs = phase === "thinking" ? THINKING_TIMEOUT_MS : STREAMING_TIMEOUT_MS;
   clearBridgeInactivityTimer(bridgeKey);
   bridgeInactivityTimers.set(bridgeKey, setTimeout(() => {
-    proxyLog("TIMEOUT [%s]: no data from Cursor for %ds, killing bridge", bridgeKey.slice(0, 8), INACTIVITY_TIMEOUT_MS / 1000);
+    proxyLog("TIMEOUT [%s]: no data for %ds (phase=%s), killing bridge", bridgeKey.slice(0, 8), timeoutMs / 1000, phase);
     bridgeInactivityTimers.delete(bridgeKey);
     activeBridges.delete(bridgeKey);
     clearInterval(heartbeatTimer);
     onTimeout();
     bridge.end();
     try { bridge.proc.kill(); } catch {}
-  }, INACTIVITY_TIMEOUT_MS));
+  }, timeoutMs));
 }
 
 function clearBridgeInactivityTimer(bridgeKey: string): void {
@@ -316,7 +342,7 @@ function spawnBridge(options: SpawnBridgeOptions): {
   const proc = Bun.spawn(["node", BRIDGE_PATH], {
     stdin: "pipe",
     stdout: "pipe",
-    stderr: "ignore",
+    stderr: "pipe",
   });
 
   const config = JSON.stringify({
@@ -326,6 +352,25 @@ function spawnBridge(options: SpawnBridgeOptions): {
     unary: options.unary ?? false,
   });
   proc.stdin.write(lpEncode(new TextEncoder().encode(config)));
+
+  // Pipe bridge stderr to proxy log
+  (async () => {
+    try {
+      const reader = (proc.stderr as ReadableStream).getReader();
+      let buf = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += new TextDecoder().decode(value);
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          if (line) proxyLog("h2-bridge: %s", line);
+          buf = buf.slice(nl + 1);
+        }
+      }
+    } catch {}
+  })();
 
   const cbs = {
     data: null as ((chunk: Buffer) => void) | null,
@@ -585,6 +630,12 @@ function handleChatCompletion(
     clearInterval(activeBridge.heartbeatTimer);
     activeBridge.bridge.end();
     activeBridges.delete(bridgeKey);
+  }
+
+  const isFirstMessage = turns.length === 0 && toolResults.length === 0;
+  if (isFirstMessage) {
+    proxyLog("new conversation detected (turns=0, no tool results) — clearing stale state for key %s", convKey);
+    invalidateConversationState(convKey);
   }
 
   const stored = resolveConversationState(convKey);
@@ -886,6 +937,55 @@ function buildCursorRequest(
   };
 }
 
+/** Build a resume request (the "Continue" button) to bypass the 25 tool call limit. */
+function buildResumeRequest(
+  modelId: string,
+  conversationId: string,
+  checkpoint: Uint8Array | null,
+  existingBlobStore: Map<string, Uint8Array>,
+  mcpTools: McpToolDefinition[],
+): CursorRequestPayload {
+  const blobStore = new Map<string, Uint8Array>(existingBlobStore);
+
+  const conversationState = checkpoint
+    ? fromBinary(ConversationStateStructureSchema, checkpoint)
+    : create(ConversationStateStructureSchema, {});
+
+  const action = create(ConversationActionSchema, {
+    action: {
+      case: "resumeAction",
+      value: create(ResumeActionSchema, {
+        requestContext: create(RequestContextSchema, {
+          tools: mcpTools,
+        }),
+      }),
+    },
+  });
+
+  const modelDetails = create(ModelDetailsSchema, {
+    modelId,
+    displayModelId: modelId,
+    displayName: modelId,
+  });
+
+  const runRequest = create(AgentRunRequestSchema, {
+    conversationState,
+    action,
+    modelDetails,
+    conversationId,
+  });
+
+  const clientMessage = create(AgentClientMessageSchema, {
+    message: { case: "runRequest", value: runRequest },
+  });
+
+  return {
+    requestBytes: toBinary(AgentClientMessageSchema, clientMessage),
+    blobStore,
+    mcpTools,
+  };
+}
+
 function parseConnectEndStream(data: Uint8Array): Error | null {
   try {
     const payload = JSON.parse(new TextDecoder().decode(data));
@@ -995,6 +1095,8 @@ function createThinkingTagFilter(): {
 
 interface StreamState {
   toolCallIndex: number;
+  /** Total exec round-trips (MCP + native rejects + requestContext). Tracks Cursor's 25-call limit. */
+  totalExecCount: number;
   pendingExecs: PendingExec[];
   outputTokens: number;
   totalTokens: number;
@@ -1032,6 +1134,7 @@ function processServerMessage(
       mcpTools,
       sendFrame,
       onMcpExec,
+      state,
     );
     return true;
   } else if (msgCase === "conversationCheckpointUpdate") {
@@ -1044,6 +1147,7 @@ function processServerMessage(
     }
     return true;
   }
+  proxyLog("unrecognized server message case: %s", msgCase ?? "undefined");
   return false;
 }
 
@@ -1120,10 +1224,12 @@ function handleExecMessage(
   mcpTools: McpToolDefinition[],
   sendFrame: (data: Uint8Array) => void,
   onMcpExec: (exec: PendingExec) => void,
+  state?: StreamState,
 ): void {
   const execCase = execMsg.message.case;
 
   if (execCase === "requestContextArgs") {
+    proxyLog("exec: requestContextArgs (providing %d MCP tools)", mcpTools.length);
     const requestContext = create(RequestContextSchema, {
       rules: [],
       repositoryInfo: [],
@@ -1145,6 +1251,7 @@ function handleExecMessage(
   }
 
   if (execCase === "mcpArgs") {
+    if (state) state.totalExecCount++;
     const mcpArgs = execMsg.message.value;
     const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
     onMcpExec({
@@ -1157,35 +1264,195 @@ function handleExecMessage(
     return;
   }
 
-  // --- Reject native Cursor tools ---
-  // The model tries these first. We must respond with rejection/error
-  // so it falls back to our MCP tools (registered via RequestContext).
+  // --- Handle native Cursor tools locally ---
+  if (state) state.totalExecCount++;
   const REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
-  proxyLog("reject native tool: %s", execCase);
 
   if (execCase === "readArgs") {
-    const args = execMsg.message.value;
-    const result = create(ReadResultSchema, {
-      result: { case: "rejected", value: create(ReadRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
-    });
-    sendExecResult(execMsg, "readResult", result, sendFrame);
+    const args = execMsg.message.value as any;
+    try {
+      const filePath = args.path as string;
+      const stat = statSync(filePath);
+      const content = stat.isDirectory()
+        ? readdirSync(filePath).join("\n")
+        : readFileSync(filePath, "utf-8");
+      proxyLog("native read: %s (%d lines)", filePath, content.split("\n").length);
+      const result = create(ReadResultSchema, {
+        result: {
+          case: "success",
+          value: create(ReadSuccessSchema, {
+            path: filePath,
+            output: { case: "content", value: content },
+            totalLines: content.split("\n").length,
+            fileSize: BigInt(stat.isDirectory() ? 0 : stat.size),
+          }),
+        },
+      });
+      sendExecResult(execMsg, "readResult", result, sendFrame);
+    } catch (e: any) {
+      proxyLog("native read FAIL: %s %s", args.path, String(e));
+      const result = create(ReadResultSchema, {
+        result: { case: "rejected", value: create(ReadRejectedSchema, { path: args.path, reason: String(e) }) },
+      });
+      sendExecResult(execMsg, "readResult", result, sendFrame);
+    }
     return;
   }
+
   if (execCase === "lsArgs") {
-    const args = execMsg.message.value;
-    const result = create(LsResultSchema, {
-      result: { case: "rejected", value: create(LsRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
-    });
-    sendExecResult(execMsg, "lsResult", result, sendFrame);
+    const args = execMsg.message.value as any;
+    try {
+      const dirPath = args.path as string;
+      const entries = readdirSync(dirPath, { withFileTypes: true });
+      proxyLog("native ls: %s (%d entries)", dirPath, entries.length);
+      const result = create(LsResultSchema, {
+        result: {
+          case: "success",
+          value: create(LsSuccessSchema, {
+            directoryTreeRoot: create(LsDirectoryTreeNodeSchema, {
+              absPath: pathResolve(dirPath),
+              childrenDirs: entries
+                .filter((e) => e.isDirectory())
+                .map((d) => create(LsDirectoryTreeNodeSchema, { absPath: pathResolve(dirPath, d.name) })),
+              childrenFiles: entries
+                .filter((e) => e.isFile())
+                .map((f) => create(LsDirectoryTreeNode_FileSchema, { name: f.name })),
+            }),
+          }),
+        },
+      });
+      sendExecResult(execMsg, "lsResult", result, sendFrame);
+    } catch (e: any) {
+      proxyLog("native ls FAIL: %s %s", args.path, String(e));
+      const result = create(LsResultSchema, {
+        result: { case: "rejected", value: create(LsRejectedSchema, { path: args.path, reason: String(e) }) },
+      });
+      sendExecResult(execMsg, "lsResult", result, sendFrame);
+    }
     return;
   }
+
+  if (execCase === "shellArgs" || execCase === "shellStreamArgs") {
+    const args = execMsg.message.value as any;
+    const command = (args.command ?? "") as string;
+    const cwd = (args.workingDirectory ?? process.cwd()) as string;
+    proxyLog("native shell: %s (cwd=%s)", command.slice(0, 80), cwd);
+    try {
+      const stdout = execSync(command, {
+        cwd,
+        encoding: "utf-8",
+        timeout: 30_000,
+        maxBuffer: 10 * 1024 * 1024,
+      });
+      const result = create(ShellResultSchema, {
+        result: {
+          case: "success",
+          value: create(ShellSuccessSchema, { command, workingDirectory: cwd, exitCode: 0, stdout }),
+        },
+      });
+      sendExecResult(execMsg, "shellResult", result, sendFrame);
+    } catch (e: any) {
+      const result = create(ShellResultSchema, {
+        result: {
+          case: "success",
+          value: create(ShellSuccessSchema, {
+            command,
+            workingDirectory: cwd,
+            exitCode: e.status ?? 1,
+            stdout: (e.stdout ?? "") as string,
+            stderr: (e.stderr ?? String(e)) as string,
+          }),
+        },
+      });
+      sendExecResult(execMsg, "shellResult", result, sendFrame);
+    }
+    return;
+  }
+
   if (execCase === "grepArgs") {
-    const result = create(GrepResultSchema, {
-      result: { case: "error", value: create(GrepErrorSchema, { error: REJECT_REASON }) },
-    });
-    sendExecResult(execMsg, "grepResult", result, sendFrame);
+    const args = execMsg.message.value as any;
+    const pattern = (args.pattern ?? "") as string;
+    const searchPath = (args.path ?? ".") as string;
+    const outputMode = (args.outputMode ?? "content") as string;
+    proxyLog("native grep: pattern=%s path=%s mode=%s", pattern, searchPath, outputMode);
+    try {
+      const rgArgs = ["rg", "--no-heading", "--line-number"];
+      if (args.caseInsensitive) rgArgs.push("-i");
+      if (args.glob) rgArgs.push("--glob", args.glob);
+      if (args.type) rgArgs.push("--type", args.type);
+      if (args.multiline) rgArgs.push("-U", "--multiline-dotall");
+      if (args.contextBefore) rgArgs.push("-B", String(args.contextBefore));
+      if (args.contextAfter) rgArgs.push("-A", String(args.contextAfter));
+      if (args.context) rgArgs.push("-C", String(args.context));
+      if (outputMode === "files_with_matches") rgArgs.push("-l");
+      if (outputMode === "count") rgArgs.push("-c");
+      if (args.headLimit) rgArgs.push("--max-count", String(args.headLimit));
+      rgArgs.push("--", pattern, searchPath);
+      const stdout = execSync(rgArgs.join(" "), { encoding: "utf-8", timeout: 15_000, maxBuffer: 5 * 1024 * 1024 });
+      const lines = stdout.trimEnd().split("\n");
+      const fileMatches: Record<string, Array<{ line: number; content: string; ctx: boolean }>> = {};
+      for (const line of lines) {
+        const m = line.match(/^(.+?):(\d+)[:-](.*)$/);
+        if (m) {
+          const [, file, ln, text] = m;
+          (fileMatches[file!] ??= []).push({ line: Number(ln), content: text!, ctx: line[file!.length + ln!.length + 1] === "-" });
+        }
+      }
+      const result = create(GrepResultSchema, {
+        result: {
+          case: "success",
+          value: create(GrepSuccessSchema, {
+            pattern,
+            path: searchPath,
+            outputMode,
+            workspaceResults: Object.fromEntries(
+              Object.entries(fileMatches).map(([file, matches]) => [
+                file,
+                create(GrepUnionResultSchema, {
+                  result: {
+                    case: "content",
+                    value: create(GrepContentResultSchema, {
+                      matches: [
+                        create(GrepFileMatchSchema, {
+                          file,
+                          matches: matches.map((m) =>
+                            create(GrepContentMatchSchema, { lineNumber: m.line, content: m.content, isContextLine: m.ctx }),
+                          ),
+                        }),
+                      ],
+                      totalLines: lines.length,
+                      totalMatchedLines: matches.filter((m) => !m.ctx).length,
+                    }),
+                  },
+                }),
+              ]),
+            ),
+          }),
+        },
+      });
+      sendExecResult(execMsg, "grepResult", result, sendFrame);
+    } catch (e: any) {
+      if (e.status === 1) {
+        const result = create(GrepResultSchema, {
+          result: {
+            case: "success",
+            value: create(GrepSuccessSchema, { pattern, path: searchPath, outputMode, workspaceResults: {} }),
+          },
+        });
+        sendExecResult(execMsg, "grepResult", result, sendFrame);
+      } else {
+        proxyLog("native grep FAIL: %s", String(e));
+        const result = create(GrepResultSchema, {
+          result: { case: "error", value: create(GrepErrorSchema, { error: (e.stderr ?? String(e)) as string }) },
+        });
+        sendExecResult(execMsg, "grepResult", result, sendFrame);
+      }
+    }
     return;
   }
+
+  // --- Reject remaining native tools we can't handle locally ---
+  proxyLog("reject native tool: %s (totalExecs=%d)", execCase, state?.totalExecCount ?? -1);
   if (execCase === "writeArgs") {
     const args = execMsg.message.value;
     const result = create(WriteResultSchema, {
@@ -1200,22 +1467,6 @@ function handleExecMessage(
       result: { case: "rejected", value: create(DeleteRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
     });
     sendExecResult(execMsg, "deleteResult", result, sendFrame);
-    return;
-  }
-  if (execCase === "shellArgs" || execCase === "shellStreamArgs") {
-    const args = execMsg.message.value;
-    const result = create(ShellResultSchema, {
-      result: {
-        case: "rejected",
-        value: create(ShellRejectedSchema, {
-          command: args.command ?? "",
-          workingDirectory: args.workingDirectory ?? "",
-          reason: REJECT_REASON,
-          isReadonly: false,
-        }),
-      },
-    });
-    sendExecResult(execMsg, "shellResult", result, sendFrame);
     return;
   }
   if (execCase === "backgroundShellSpawnArgs") {
@@ -1289,6 +1540,18 @@ function sendExecResult(
     message: { case: "execClientMessage", value: execClientMessage },
   });
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+
+  // Signal exec stream completion — server won't send new execs without this.
+  const streamClose = create(ExecClientControlMessageSchema, {
+    message: {
+      case: "streamClose",
+      value: create(ExecClientStreamCloseSchema, { id: execMsg.id }),
+    },
+  });
+  const closeMsg = create(AgentClientMessageSchema, {
+    message: { case: "execClientControlMessage", value: streamClose },
+  });
+  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, closeMsg)));
 }
 
 /** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
@@ -1342,6 +1605,9 @@ function createBridgeStreamResponse(
   bridgeKey: string,
   convKey: string,
   onBlobNotFound?: () => Response,
+  accessToken?: string,
+  initialExecCount = 0,
+  initialToolCallIndex = 0,
 ): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -1388,7 +1654,8 @@ function createBridgeStreamResponse(
       };
 
       const state: StreamState = {
-        toolCallIndex: 0,
+        toolCallIndex: initialToolCallIndex,
+        totalExecCount: initialExecCount,
         pendingExecs: [],
         outputTokens: 0,
         totalTokens: 0,
@@ -1397,28 +1664,48 @@ function createBridgeStreamResponse(
 
       let mcpExecReceived = false;
       let blobNotFoundRetry: (() => Response) | undefined;
+      let autoResumeRetry: (() => Response) | undefined;
+      let timerPhase: "thinking" | "streaming" = "thinking";
 
-      const resetTimer = () => setBridgeInactivityTimer(bridgeKey, bridge, heartbeatTimer, () => {
-        sendSSE(makeChunk({ content: `\n[Error: Cursor server did not respond for ${INACTIVITY_TIMEOUT_MS / 1000}s — request timed out. Please retry.]` }));
-        sendDone();
-        closeController();
-      });
-      resetTimer();
+      const resetTimer = (phase?: "thinking" | "streaming") => {
+        if (phase) timerPhase = phase;
+        setBridgeInactivityTimer(bridgeKey, bridge, heartbeatTimer, () => {
+          const timeoutMs = timerPhase === "thinking" ? THINKING_TIMEOUT_MS : STREAMING_TIMEOUT_MS;
+          const stored = conversationStates.get(convKey);
+          if (accessToken && stored?.checkpoint) {
+            proxyLog("TIMEOUT after %d execs (%d MCP calls) — auto-resuming via ResumeAction", state.totalExecCount, state.toolCallIndex);
+            autoResumeRetry = () => {
+              const resumePayload = buildResumeRequest(
+                modelId, stored.conversationId, stored.checkpoint,
+                stored.blobStore, mcpTools,
+              );
+              return handleStreamingResponse(resumePayload, accessToken, modelId, bridgeKey, convKey);
+            };
+            return;
+          }
+          sendSSE(makeChunk({ content: `\n[Error: Cursor server did not respond for ${timeoutMs / 1000}s — request timed out. Please retry.]` }));
+          sendDone();
+          closeController();
+        }, timerPhase);
+      };
+      resetTimer("thinking");
 
       const processChunk = createConnectFrameParser(
         (messageBytes) => {
+          resetTimer();
           try {
             const serverMessage = fromBinary(
               AgentServerMessageSchema,
               messageBytes,
             );
-            const recognized = processServerMessage(
+            processServerMessage(
               serverMessage,
               blobStore,
               mcpTools,
               (data) => bridge.write(data),
               state,
               (text, isThinking) => {
+                if (timerPhase === "thinking") resetTimer("streaming");
                 if (isThinking) {
                   sendSSE(makeChunk({ reasoning_content: text }));
                 } else {
@@ -1460,6 +1747,9 @@ function createBridgeStreamResponse(
                   mcpTools,
                   pendingExecs: state.pendingExecs,
                   convKey,
+                  totalExecCount: state.totalExecCount,
+                  toolCallIndex: state.toolCallIndex,
+                  accessToken: accessToken || "",
                 });
 
                 sendSSE(makeChunk({}, "tool_calls"));
@@ -1476,9 +1766,8 @@ function createBridgeStreamResponse(
                 }
               },
             );
-            if (recognized) resetTimer();
-          } catch {
-            // Skip unparseable messages
+          } catch (err) {
+            proxyLog("processChunk error: %s (msgBytes=%d)", String(err), messageBytes.length);
           }
         },
         (endStreamBytes) => {
@@ -1503,11 +1792,12 @@ function createBridgeStreamResponse(
 
       bridge.onClose((code) => {
         clearBridgeInactivityTimer(bridgeKey);
-        proxyLog("bridge.onClose: code=%d mcpExecReceived=%s pendingExecs=%d blobRetry=%s", code, mcpExecReceived, state.pendingExecs.length, !!blobNotFoundRetry);
+        proxyLog("bridge.onClose: code=%d totalExecs=%d mcpCalls=%d mcpExecReceived=%s pendingExecs=%d blobRetry=%s autoResume=%s",
+          code, state.totalExecCount, state.toolCallIndex, mcpExecReceived, state.pendingExecs.length, !!blobNotFoundRetry, !!autoResumeRetry);
         clearInterval(heartbeatTimer);
 
-        if (blobNotFoundRetry) {
-          const retryResponse = blobNotFoundRetry();
+        const pipeRetryResponse = (retryFn: () => Response) => {
+          const retryResponse = retryFn();
           const retryStream = retryResponse.body;
           if (retryStream) {
             const reader = retryStream.getReader();
@@ -1522,6 +1812,15 @@ function createBridgeStreamResponse(
           } else {
             closeController();
           }
+        };
+
+        if (blobNotFoundRetry) {
+          pipeRetryResponse(blobNotFoundRetry);
+          return;
+        }
+
+        if (autoResumeRetry) {
+          pipeRetryResponse(autoResumeRetry);
           return;
         }
 
@@ -1562,9 +1861,10 @@ function startBridge(
   accessToken: string,
   requestBytes: Uint8Array,
 ): { bridge: ReturnType<typeof spawnBridge>; heartbeatTimer: NodeJS.Timeout } {
-  proxyLog("bridge: spawning h2-bridge subprocess");
+  proxyLog("bridge: spawning h2-bridge subprocess → %s", CURSOR_AGENT_URL);
   const bridge = spawnBridge({
     accessToken,
+    url: CURSOR_AGENT_URL,
     rpcPath: "/agent.v1.AgentService/Run",
   });
   bridge.write(frameConnectMessage(requestBytes));
@@ -1586,6 +1886,7 @@ function handleStreamingResponse(
     payload.blobStore, payload.mcpTools,
     modelId, bridgeKey, convKey,
     onBlobNotFound,
+    accessToken,
   );
 }
 
@@ -1644,12 +1945,30 @@ function handleToolResultResume(
     bridge.write(
       frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)),
     );
+
+    // Signal exec stream completion
+    const streamClose = create(ExecClientControlMessageSchema, {
+      message: {
+        case: "streamClose",
+        value: create(ExecClientStreamCloseSchema, { id: exec.execMsgId }),
+      },
+    });
+    const closeMsg = create(AgentClientMessageSchema, {
+      message: { case: "execClientControlMessage", value: streamClose },
+    });
+    bridge.write(
+      frameConnectMessage(toBinary(AgentClientMessageSchema, closeMsg)),
+    );
   }
 
+  proxyLog("resume: carrying forward totalExecs=%d mcpCalls=%d", active.totalExecCount, active.toolCallIndex);
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     blobStore, mcpTools,
     modelId, bridgeKey, convKey,
+    undefined, active.accessToken,
+    active.totalExecCount,
+    active.toolCallIndex,
   );
 }
 
@@ -1699,6 +2018,7 @@ async function collectFullResponse(
 
   const state: StreamState = {
     toolCallIndex: 0,
+    totalExecCount: 0,
     pendingExecs: [],
     outputTokens: 0,
     totalTokens: 0,
