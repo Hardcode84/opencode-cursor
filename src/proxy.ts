@@ -230,6 +230,7 @@ interface StoredConversation {
   checkpoint: Uint8Array | null;
   blobStore: Map<string, Uint8Array>;
   lastAccessMs: number;
+  turnCount: number;
 }
 
 const conversationStates = new Map<string, StoredConversation>();
@@ -265,6 +266,7 @@ interface SerializedConversation {
   checkpoint: string | null; // base64
   blobStore: Record<string, string>; // hex key → base64 value
   savedMs: number;
+  turnCount?: number;
 }
 
 function persistConversation(convKey: string, stored: StoredConversation): void {
@@ -275,6 +277,7 @@ function persistConversation(convKey: string, stored: StoredConversation): void 
       [...stored.blobStore].map(([k, v]) => [k, Buffer.from(v).toString("base64")]),
     ),
     savedMs: Date.now(),
+    turnCount: stored.turnCount,
   };
   try { writeFileSync(convDiskPath(convKey), JSON.stringify(data)); } catch {}
 }
@@ -293,6 +296,7 @@ function loadConversation(convKey: string): StoredConversation | null {
         Object.entries(raw.blobStore).map(([k, v]) => [k, new Uint8Array(Buffer.from(v, "base64"))]),
       ),
       lastAccessMs: Date.now(),
+      turnCount: raw.turnCount ?? 0,
     };
   } catch {
     return null;
@@ -651,6 +655,12 @@ function handleChatCompletion(
 
   const stored = resolveConversationState(convKey);
 
+  if (stored.checkpoint && turns.length < stored.turnCount) {
+    proxyLog("undo detected: turns=%d < stored=%d — dropping checkpoint", turns.length, stored.turnCount);
+    stored.checkpoint = null;
+    stored.turnCount = 0;
+  }
+
   const mcpTools = buildMcpToolDefinitions(tools);
   const effectiveUserText = userText || (toolResults.length > 0
     ? toolResults.map((r) => r.content).join("\n")
@@ -660,6 +670,9 @@ function handleChatCompletion(
     stored.conversationId, stored.checkpoint, stored.blobStore,
   );
   payload.mcpTools = mcpTools;
+
+  // Will be committed as turnCount when checkpoint is saved
+  stored.turnCount = turns.length + 1;
 
   const turnsChars = turns.reduce((s, t) => s + t.userText.length + t.assistantText.length, 0);
   proxyLog("request: model=%s stream=%s tools=%d userText=%d chars checkpoint=%s msgs=%d turns=%d turnsChars=%d blobs=%d",
@@ -706,6 +719,7 @@ function resolveConversationState(convKey: string): StoredConversation {
       checkpoint: null,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
+      turnCount: 0,
     };
     conversationStates.set(convKey, stored);
   }
