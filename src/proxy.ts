@@ -655,12 +655,25 @@ function handleChatCompletion(
 
   const stored = resolveConversationState(convKey);
 
-  if (stored.checkpoint && turns.length < stored.turnCount) {
-    proxyLog("undo detected: turns=%d < stored=%d — resetting conversation", turns.length, stored.turnCount);
-    stored.checkpoint = null;
-    stored.turnCount = 0;
-    stored.conversationId = deterministicConversationId(convKey + `:${Date.now()}`);
-    proxyLog("undo: new conversationId=%s", stored.conversationId);
+  if (stored.checkpoint && turns.length + 1 < stored.turnCount) {
+    const desiredTurns = turns.length;
+    proxyLog("undo detected: turns=%d < stored=%d — trimming checkpoint to %d turns",
+      turns.length, stored.turnCount, desiredTurns);
+    try {
+      const state = fromBinary(ConversationStateStructureSchema, stored.checkpoint);
+      if (state.turns.length > desiredTurns) {
+        state.turns = state.turns.slice(0, desiredTurns);
+        if (state.turnTimings.length > desiredTurns)
+          state.turnTimings = state.turnTimings.slice(0, desiredTurns);
+        stored.checkpoint = toBinary(ConversationStateStructureSchema, state);
+        stored.turnCount = desiredTurns + 1;
+        proxyLog("undo: trimmed checkpoint from %d to %d turns", state.turns.length + (stored.turnCount - desiredTurns - 1), desiredTurns);
+      }
+    } catch (e) {
+      proxyLog("undo: failed to trim checkpoint, dropping it: %s", String(e));
+      stored.checkpoint = null;
+      stored.turnCount = 0;
+    }
   }
 
   const mcpTools = buildMcpToolDefinitions(tools);
