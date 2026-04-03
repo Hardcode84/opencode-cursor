@@ -60,8 +60,6 @@ import {
   WriteResultSchema,
   WriteShellStdinErrorSchema,
   WriteShellStdinResultSchema,
-  ExecClientControlMessageSchema,
-  ExecClientStreamCloseSchema,
   ReadSuccessSchema,
   LsSuccessSchema,
   LsDirectoryTreeNodeSchema,
@@ -1771,17 +1769,7 @@ function handleExecMessage(
     return;
   }
 
-  proxyLog("UNHANDLED exec: %s — sending streamClose so server unblocks", execCase);
-  const streamClose = create(ExecClientControlMessageSchema, {
-    message: {
-      case: "streamClose",
-      value: create(ExecClientStreamCloseSchema, { id: execMsg.id }),
-    },
-  });
-  const closeMsg = create(AgentClientMessageSchema, {
-    message: { case: "execClientControlMessage", value: streamClose },
-  });
-  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, closeMsg)));
+  proxyLog("UNHANDLED exec: %s", execCase);
 }
 
 /** Send an exec client message back to Cursor. */
@@ -1800,18 +1788,6 @@ function sendExecResult(
     message: { case: "execClientMessage", value: execClientMessage },
   });
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
-
-  // Signal exec stream completion — server won't send new execs without this.
-  const streamClose = create(ExecClientControlMessageSchema, {
-    message: {
-      case: "streamClose",
-      value: create(ExecClientStreamCloseSchema, { id: execMsg.id }),
-    },
-  });
-  const closeMsg = create(AgentClientMessageSchema, {
-    message: { case: "execClientControlMessage", value: streamClose },
-  });
-  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, closeMsg)));
 }
 
 /** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
@@ -2244,20 +2220,6 @@ function handleToolResultResume(
 
     bridge.write(
       frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)),
-    );
-
-    // Signal exec stream completion
-    const streamClose = create(ExecClientControlMessageSchema, {
-      message: {
-        case: "streamClose",
-        value: create(ExecClientStreamCloseSchema, { id: exec.execMsgId }),
-      },
-    });
-    const closeMsg = create(AgentClientMessageSchema, {
-      message: { case: "execClientControlMessage", value: streamClose },
-    });
-    bridge.write(
-      frameConnectMessage(toBinary(AgentClientMessageSchema, closeMsg)),
     );
   }
 
