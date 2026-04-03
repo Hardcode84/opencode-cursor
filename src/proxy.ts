@@ -149,12 +149,44 @@ interface ActiveBridge {
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
   pendingExecs: PendingExec[];
+  convKey: string;
 }
 
 // Active bridges keyed by a session token (derived from conversation state).
 // When tool_calls are returned, the bridge stays alive. The next request
 // with tool results looks up the bridge and sends mcpResult messages.
 const activeBridges = new Map<string, ActiveBridge>();
+
+/** Global per-bridge inactivity timers. Keyed by bridgeKey.
+ *  Ensures only ONE timer per bridge regardless of how many streams are created. */
+const bridgeInactivityTimers = new Map<string, NodeJS.Timeout>();
+const INACTIVITY_TIMEOUT_MS = 60_000;
+
+function setBridgeInactivityTimer(
+  bridgeKey: string,
+  bridge: ReturnType<typeof spawnBridge>,
+  heartbeatTimer: NodeJS.Timeout,
+  onTimeout: () => void,
+): void {
+  clearBridgeInactivityTimer(bridgeKey);
+  bridgeInactivityTimers.set(bridgeKey, setTimeout(() => {
+    proxyLog("TIMEOUT [%s]: no data from Cursor for %ds, killing bridge", bridgeKey.slice(0, 8), INACTIVITY_TIMEOUT_MS / 1000);
+    bridgeInactivityTimers.delete(bridgeKey);
+    activeBridges.delete(bridgeKey);
+    clearInterval(heartbeatTimer);
+    onTimeout();
+    bridge.end();
+    try { bridge.proc.kill(); } catch {}
+  }, INACTIVITY_TIMEOUT_MS));
+}
+
+function clearBridgeInactivityTimer(bridgeKey: string): void {
+  const existing = bridgeInactivityTimers.get(bridgeKey);
+  if (existing) {
+    clearTimeout(existing);
+    bridgeInactivityTimers.delete(bridgeKey);
+  }
+}
 
 interface StoredConversation {
   conversationId: string;
@@ -493,12 +525,20 @@ export function stopProxy(): void {
     proxyAccessTokenProvider = undefined;
     proxyModels = [];
   }
-  // Clean up any lingering bridges
+  // Merge blobs from active bridges into stored state before shutdown
   for (const active of activeBridges.values()) {
+    const stored = conversationStates.get(active.convKey);
+    if (stored) {
+      for (const [k, v] of active.blobStore) stored.blobStore.set(k, v);
+      stored.lastAccessMs = Date.now();
+      persistConversation(active.convKey, stored);
+    }
     clearInterval(active.heartbeatTimer);
     active.bridge.end();
   }
   activeBridges.clear();
+  for (const timer of bridgeInactivityTimers.values()) clearTimeout(timer);
+  bridgeInactivityTimers.clear();
 }
 
 function handleChatCompletion(
@@ -559,23 +599,40 @@ function handleChatCompletion(
   );
   payload.mcpTools = mcpTools;
 
-  proxyLog("request: model=%s stream=%s tools=%d userText=%d chars checkpoint=%s",
-    modelId, body.stream !== false, tools.length, effectiveUserText.length, !!stored.checkpoint);
+  const turnsChars = turns.reduce((s, t) => s + t.userText.length + t.assistantText.length, 0);
+  proxyLog("request: model=%s stream=%s tools=%d userText=%d chars checkpoint=%s msgs=%d turns=%d turnsChars=%d blobs=%d",
+    modelId, body.stream !== false, tools.length, effectiveUserText.length, !!stored.checkpoint,
+    body.messages.length, turns.length, turnsChars, stored.blobStore.size);
 
   if (body.stream === false) {
     return handleNonStreamingResponse(payload, accessToken, modelId, convKey);
   }
 
   return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, () => {
-    proxyLog("retrying with fresh state after Blob not found");
-    invalidateConversationState(convKey);
-    const fresh = resolveConversationState(convKey);
-    const retryPayload = buildCursorRequest(
+    proxyLog("Blob not found — soft retry: nulling checkpoint, keeping conversationId + blobStore");
+    const stored2 = resolveConversationState(convKey);
+    stored2.checkpoint = null;
+    persistConversation(convKey, stored2);
+    const softPayload = buildCursorRequest(
       modelId, systemPrompt, effectiveUserText, turns,
-      fresh.conversationId, fresh.checkpoint, fresh.blobStore,
+      stored2.conversationId, null, stored2.blobStore,
     );
-    retryPayload.mcpTools = mcpTools;
-    return handleStreamingResponse(retryPayload, accessToken, modelId, bridgeKey, convKey);
+    softPayload.mcpTools = mcpTools;
+    proxyLog("soft retry: turns=%d turnsChars=%d blobs=%d",
+      turns.length, turnsChars, stored2.blobStore.size);
+    return handleStreamingResponse(softPayload, accessToken, modelId, bridgeKey, convKey, () => {
+      proxyLog("Blob not found again — hard retry: full invalidation");
+      invalidateConversationState(convKey);
+      const fresh = resolveConversationState(convKey);
+      const hardPayload = buildCursorRequest(
+        modelId, systemPrompt, effectiveUserText, turns,
+        fresh.conversationId, null, fresh.blobStore,
+      );
+      hardPayload.mcpTools = mcpTools;
+      proxyLog("hard retry: turns=%d turnsChars=%d blobs=%d",
+        turns.length, turnsChars, fresh.blobStore.size);
+      return handleStreamingResponse(hardPayload, accessToken, modelId, bridgeKey, convKey);
+    });
   });
 }
 
@@ -646,11 +703,14 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
       const toolId = msg.tool_call_id ?? "";
       const call = pendingToolCalls.find((tc) => tc.id === toolId);
       const toolContent = textContent(msg.content);
-      const truncated = toolContent.length > 2000
-        ? toolContent.slice(0, 2000) + "\n...[truncated]"
-        : toolContent;
       if (call) {
-        pendingAssistant += `\n[Tool ${call.function.name}(${call.function.arguments})]\n${truncated}\n`;
+        const argsPreview = call.function.arguments.length > 200
+          ? call.function.arguments.slice(0, 200) + "..."
+          : call.function.arguments;
+        const resultPreview = toolContent.length > 20000
+          ? toolContent.slice(0, 20000) + "\n...[truncated from " + toolContent.length + " chars]"
+          : toolContent;
+        pendingAssistant += `\n[Tool ${call.function.name}(${argsPreview})]\n${resultPreview}\n`;
       }
       toolResults.push({ toolCallId: toolId, content: toolContent });
     } else if (msg.role === "user") {
@@ -947,6 +1007,7 @@ function computeUsage(state: StreamState) {
   return { prompt_tokens, completion_tokens, total_tokens };
 }
 
+/** Returns true if the message was a recognized type (real server activity, not keepalive). */
 function processServerMessage(
   msg: AgentServerMessage,
   blobStore: Map<string, Uint8Array>,
@@ -956,13 +1017,15 @@ function processServerMessage(
   onText: (text: string, isThinking?: boolean) => void,
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
-): void {
+): boolean {
   const msgCase = msg.message.case;
 
   if (msgCase === "interactionUpdate") {
     handleInteractionUpdate(msg.message.value, state, onText);
+    return true;
   } else if (msgCase === "kvServerMessage") {
     handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
+    return true;
   } else if (msgCase === "execServerMessage") {
     handleExecMessage(
       msg.message.value as ExecServerMessage,
@@ -970,6 +1033,7 @@ function processServerMessage(
       sendFrame,
       onMcpExec,
     );
+    return true;
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
     if (stateStructure.tokenDetails) {
@@ -978,7 +1042,9 @@ function processServerMessage(
     if (onCheckpoint) {
       onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
     }
+    return true;
   }
+  return false;
 }
 
 function handleInteractionUpdate(
@@ -1030,6 +1096,9 @@ function handleKvMessage(
     const blobId = kvMsg.message.value.blobId;
     const blobIdKey = Buffer.from(blobId).toString("hex");
     const blobData = blobStore.get(blobIdKey);
+    if (!blobData) {
+      proxyLog("KV getBlob MISS: %s (store has %d blobs)", blobIdKey.slice(0, 16), blobStore.size);
+    }
     sendKvResponse(
       kvMsg, "getBlobResult",
       create(GetBlobResultSchema, blobData ? { blobData } : {}),
@@ -1232,12 +1301,16 @@ function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
     .slice(0, 16);
 }
 
-/** Derive a key for conversation state. Model-independent so context survives model switches. */
+/** Derive a key for conversation state. Model-independent so context survives model switches.
+ *  Uses system prompt hash — stable across all messages in the same session,
+ *  unlike first-user-message which changes every turn when the client sends only [system, latest_user]. */
 function deriveConversationKey(messages: OpenAIMessage[]): string {
-  const firstUserMsg = messages.find((m) => m.role === "user");
-  const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
+  const systemParts = messages
+    .filter((m) => m.role === "system")
+    .map((m) => textContent(m.content));
+  const systemText = systemParts.join("\n");
   return createHash("sha256")
-    .update(`conv:${firstUserText.slice(0, 200)}`)
+    .update(`conv:${systemText.slice(0, 2000)}`)
     .digest("hex")
     .slice(0, 16);
 }
@@ -1325,6 +1398,13 @@ function createBridgeStreamResponse(
       let mcpExecReceived = false;
       let blobNotFoundRetry: (() => Response) | undefined;
 
+      const resetTimer = () => setBridgeInactivityTimer(bridgeKey, bridge, heartbeatTimer, () => {
+        sendSSE(makeChunk({ content: `\n[Error: Cursor server did not respond for ${INACTIVITY_TIMEOUT_MS / 1000}s — request timed out. Please retry.]` }));
+        sendDone();
+        closeController();
+      });
+      resetTimer();
+
       const processChunk = createConnectFrameParser(
         (messageBytes) => {
           try {
@@ -1332,7 +1412,7 @@ function createBridgeStreamResponse(
               AgentServerMessageSchema,
               messageBytes,
             );
-            processServerMessage(
+            const recognized = processServerMessage(
               serverMessage,
               blobStore,
               mcpTools,
@@ -1371,12 +1451,15 @@ function createBridgeStreamResponse(
                 }));
 
                 // Keep the bridge alive for tool result continuation.
+                // Pause the inactivity timer — OpenCode is running the tool.
+                clearBridgeInactivityTimer(bridgeKey);
                 activeBridges.set(bridgeKey, {
                   bridge,
                   heartbeatTimer,
                   blobStore,
                   mcpTools,
                   pendingExecs: state.pendingExecs,
+                  convKey,
                 });
 
                 sendSSE(makeChunk({}, "tool_calls"));
@@ -1387,11 +1470,13 @@ function createBridgeStreamResponse(
                 const stored = conversationStates.get(convKey);
                 if (stored) {
                   stored.checkpoint = checkpointBytes;
+                  for (const [k, v] of blobStore) stored.blobStore.set(k, v);
                   stored.lastAccessMs = Date.now();
                   persistConversation(convKey, stored);
                 }
               },
             );
+            if (recognized) resetTimer();
           } catch {
             // Skip unparseable messages
           }
@@ -1417,6 +1502,7 @@ function createBridgeStreamResponse(
       bridge.onData(processChunk);
 
       bridge.onClose((code) => {
+        clearBridgeInactivityTimer(bridgeKey);
         proxyLog("bridge.onClose: code=%d mcpExecReceived=%s pendingExecs=%d blobRetry=%s", code, mcpExecReceived, state.pendingExecs.length, !!blobNotFoundRetry);
         clearInterval(heartbeatTimer);
 
@@ -1619,14 +1705,17 @@ async function collectFullResponse(
   };
   const tagFilter = createThinkingTagFilter();
 
-  bridge.onData(createConnectFrameParser(
+  const nonStreamBridgeKey = `nonstream-${crypto.randomUUID().slice(0, 8)}`;
+  setBridgeInactivityTimer(nonStreamBridgeKey, bridge, heartbeatTimer, () => {});
+
+  const processChunk = createConnectFrameParser(
     (messageBytes) => {
       try {
         const serverMessage = fromBinary(
           AgentServerMessageSchema,
           messageBytes,
         );
-        processServerMessage(
+        const recognized = processServerMessage(
           serverMessage,
           payload.blobStore,
           payload.mcpTools,
@@ -1642,19 +1731,24 @@ async function collectFullResponse(
             const stored = conversationStates.get(convKey);
             if (stored) {
               stored.checkpoint = checkpointBytes;
+              for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
               stored.lastAccessMs = Date.now();
               persistConversation(convKey, stored);
             }
           },
         );
+        if (recognized) setBridgeInactivityTimer(nonStreamBridgeKey, bridge, heartbeatTimer, () => {});
       } catch {
         // Skip
       }
     },
     () => {},
-  ));
+  );
+
+  bridge.onData(processChunk);
 
   bridge.onClose(() => {
+    clearBridgeInactivityTimer(nonStreamBridgeKey);
     clearInterval(heartbeatTimer);
     const stored = conversationStates.get(convKey);
     if (stored) {
