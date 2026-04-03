@@ -5,6 +5,8 @@
  * 1. Browser-based OAuth login to Cursor
  * 2. Local proxy translating OpenAI format → Cursor gRPC protocol
  */
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
 import {
   generateCursorAuthParams,
@@ -14,6 +16,8 @@ import {
 } from "./auth";
 import { getCursorModels, type CursorModel } from "./models";
 import { startProxy } from "./proxy";
+
+const SDK_WRAPPER_PATH = `file://${resolve(dirname(fileURLToPath(import.meta.url)), "sdk-wrapper.js")}`;
 
 const CURSOR_PROVIDER_ID = "cursor";
 
@@ -153,7 +157,7 @@ function buildCursorProviderModels(
         api: {
           id: model.id,
           url: `http://localhost:${port}/v1`,
-          npm: "@ai-sdk/openai-compatible",
+          npm: SDK_WRAPPER_PATH,
         },
         name: model.name,
         capabilities: {
