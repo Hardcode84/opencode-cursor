@@ -1100,6 +1100,10 @@ interface StreamState {
   pendingExecs: PendingExec[];
   outputTokens: number;
   totalTokens: number;
+  /** Set when the server sends an endStream frame (clean close or error). */
+  endStreamSeen: boolean;
+  /** Tracks last delta type for debug logging transitions. */
+  lastDeltaType: string | null;
 }
 
 function computeUsage(state: StreamState) {
@@ -1160,16 +1164,25 @@ function handleInteractionUpdate(
 
   if (updateCase === "textDelta") {
     const delta = update.message.value.text || "";
-    if (delta) onText(delta, false);
+    if (delta) {
+      if (state.lastDeltaType !== "text") {
+        proxyLog("delta: → textDelta (first=%s)", JSON.stringify(delta.slice(0, 60)));
+        state.lastDeltaType = "text";
+      }
+      onText(delta, false);
+    }
   } else if (updateCase === "thinkingDelta") {
     const delta = update.message.value.text || "";
-    if (delta) onText(delta, true);
+    if (delta) {
+      if (state.lastDeltaType !== "thinking") {
+        proxyLog("delta: → thinkingDelta (first=%s)", JSON.stringify(delta.slice(0, 60)));
+        state.lastDeltaType = "thinking";
+      }
+      onText(delta, true);
+    }
   } else if (updateCase === "tokenDelta") {
     state.outputTokens += update.message.value.tokens ?? 0;
   }
-  // toolCallStarted, partialToolCall, toolCallDelta, toolCallCompleted
-  // are intentionally ignored. MCP tool calls flow through the exec
-  // message path (mcpArgs → mcpResult), not interaction updates.
 }
 
 /** Send a KV client response back to Cursor. */
@@ -1519,9 +1532,7 @@ function handleExecMessage(
     return;
   }
 
-  // Unknown exec type
   proxyLog("UNHANDLED exec: %s", execCase);
-  console.error(`[proxy] unhandled exec: ${execCase}`);
 }
 
 /** Send an exec client message back to Cursor. */
@@ -1659,10 +1670,13 @@ function createBridgeStreamResponse(
         pendingExecs: [],
         outputTokens: 0,
         totalTokens: 0,
+        endStreamSeen: false,
+        lastDeltaType: null,
       };
       const tagFilter = createThinkingTagFilter();
 
       let mcpExecReceived = false;
+      let hasNativeThinking = false;
       let blobNotFoundRetry: (() => Response) | undefined;
       let autoResumeRetry: (() => Response) | undefined;
       let timerPhase: "thinking" | "streaming" = "thinking";
@@ -1707,7 +1721,10 @@ function createBridgeStreamResponse(
               (text, isThinking) => {
                 if (timerPhase === "thinking") resetTimer("streaming");
                 if (isThinking) {
+                  hasNativeThinking = true;
                   sendSSE(makeChunk({ reasoning_content: text }));
+                } else if (hasNativeThinking) {
+                  sendSSE(makeChunk({ content: text }));
                 } else {
                   const { content, reasoning } = tagFilter.process(text);
                   if (reasoning) sendSSE(makeChunk({ reasoning_content: reasoning }));
@@ -1771,6 +1788,7 @@ function createBridgeStreamResponse(
           }
         },
         (endStreamBytes) => {
+          state.endStreamSeen = true;
           const endError = parseConnectEndStream(endStreamBytes);
           if (endError) {
             proxyLog("endStream ERROR: %s", endError.message);
@@ -1783,7 +1801,7 @@ function createBridgeStreamResponse(
             }
             sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
           } else {
-            proxyLog("endStream: clean close");
+            proxyLog("endStream: clean close (execs=%d mcpCalls=%d)", state.totalExecCount, state.toolCallIndex);
           }
         },
       );
@@ -1792,11 +1810,18 @@ function createBridgeStreamResponse(
 
       bridge.onClose((code) => {
         clearBridgeInactivityTimer(bridgeKey);
-        proxyLog("bridge.onClose: code=%d totalExecs=%d mcpCalls=%d mcpExecReceived=%s pendingExecs=%d blobRetry=%s autoResume=%s",
-          code, state.totalExecCount, state.toolCallIndex, mcpExecReceived, state.pendingExecs.length, !!blobNotFoundRetry, !!autoResumeRetry);
+        const stored = conversationStates.get(convKey);
+        const hasCheckpoint = !!(stored?.checkpoint);
+        proxyLog(
+          "bridge.onClose: code=%d execs=%d mcpCalls=%d mcpExec=%s pending=%d endStream=%s checkpoint=%s blobRetry=%s autoResume=%s",
+          code, state.totalExecCount, state.toolCallIndex, mcpExecReceived,
+          state.pendingExecs.length, state.endStreamSeen ? "yes" : "no",
+          hasCheckpoint ? "yes" : "no", !!blobNotFoundRetry, !!autoResumeRetry,
+        );
         clearInterval(heartbeatTimer);
 
         const pipeRetryResponse = (retryFn: () => Response) => {
+          proxyLog("pipeRetryResponse: piping new bridge stream into existing SSE");
           const retryResponse = retryFn();
           const retryStream = retryResponse.body;
           if (retryStream) {
@@ -1815,16 +1840,22 @@ function createBridgeStreamResponse(
         };
 
         if (blobNotFoundRetry) {
+          proxyLog("bridge.onClose → blob retry path");
           pipeRetryResponse(blobNotFoundRetry);
           return;
         }
 
         if (autoResumeRetry) {
+          proxyLog("bridge.onClose → auto-resume path (timeout-triggered)");
           pipeRetryResponse(autoResumeRetry);
           return;
         }
 
-        const stored = conversationStates.get(convKey);
+        // Connection lost unexpectedly — could we resume?
+        if (code !== 0 && !state.endStreamSeen && hasCheckpoint && accessToken) {
+          proxyLog("bridge.onClose → connection lost (code=%d), could resume but NOT IMPLEMENTED YET", code);
+        }
+
         if (stored) {
           for (const [k, v] of blobStore) stored.blobStore.set(k, v);
           stored.lastAccessMs = Date.now();
@@ -1839,8 +1870,6 @@ function createBridgeStreamResponse(
           sendDone();
           closeController();
         } else if (code !== 0) {
-          // Bridge died while tool calls are pending (timeout, crash, etc.).
-          // Close the SSE stream so the client doesn't hang forever.
           sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
           sendSSE(makeChunk({}, "stop"));
           sendSSE(makeUsageChunk());
@@ -2022,6 +2051,8 @@ async function collectFullResponse(
     pendingExecs: [],
     outputTokens: 0,
     totalTokens: 0,
+    endStreamSeen: false,
+    lastDeltaType: null,
   };
   const tagFilter = createThinkingTagFilter();
 

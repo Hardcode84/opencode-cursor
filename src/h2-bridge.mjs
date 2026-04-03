@@ -101,21 +101,23 @@ const isDirect = isApi2;
 process.stderr.write(`[bridge] connecting to ${connectUrl}\n`);
 const client = http2.connect(connectUrl);
 
-let timeout = setTimeout(killBridge, 30_000);
+let timeout = setTimeout(() => killBridge("initial connect timeout 30s"), 30_000);
 
 function resetTimeout() {
   clearTimeout(timeout);
-  timeout = setTimeout(killBridge, 120_000);
+  timeout = setTimeout(() => killBridge("inactivity timeout 120s"), 120_000);
 }
 
-function killBridge() {
+function killBridge(reason) {
+  process.stderr.write(`[bridge] kill: ${reason}\n`);
   clearTimeout(timeout);
   clearInterval(heartbeatTimer);
   client.destroy();
   process.exit(1);
 }
 
-client.on("error", () => {
+client.on("error", (err) => {
+  process.stderr.write(`[bridge] h2 client error: ${err?.message ?? err}\n`);
   clearTimeout(timeout);
   clearInterval(heartbeatTimer);
   process.exit(1);
@@ -167,17 +169,23 @@ h2Stream.on("data", (chunk) => {
 });
 
 h2Stream.on("end", () => {
+  process.stderr.write("[bridge] stream ended by server\n");
   clearTimeout(timeout);
   clearInterval(heartbeatTimer);
   client.close();
   setTimeout(() => process.exit(0), 100);
 });
 
-h2Stream.on("error", () => {
+h2Stream.on("error", (err) => {
+  process.stderr.write(`[bridge] stream error: ${err?.message ?? err}\n`);
   clearTimeout(timeout);
   clearInterval(heartbeatTimer);
   client.close();
   process.exit(1);
+});
+
+h2Stream.on("close", () => {
+  process.stderr.write("[bridge] stream closed\n");
 });
 
 // Forward stdin → H2 stream (after config message)
