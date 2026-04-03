@@ -1754,7 +1754,17 @@ function handleExecMessage(
     return;
   }
 
-  proxyLog("UNHANDLED exec: %s", execCase);
+  proxyLog("UNHANDLED exec: %s — sending streamClose so server unblocks", execCase);
+  const streamClose = create(ExecClientControlMessageSchema, {
+    message: {
+      case: "streamClose",
+      value: create(ExecClientStreamCloseSchema, { id: execMsg.id }),
+    },
+  });
+  const closeMsg = create(AgentClientMessageSchema, {
+    message: { case: "execClientControlMessage", value: streamClose },
+  });
+  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, closeMsg)));
 }
 
 /** Send an exec client message back to Cursor. */
