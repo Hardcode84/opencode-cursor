@@ -91,7 +91,7 @@ import {
   type McpToolDefinition,
 } from "./proto/agent_pb";
 import { createHash } from "node:crypto";
-import { execSync } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, statSync } from "node:fs";
 import { join, resolve as pathResolve } from "node:path";
 import { homedir } from "node:os";
@@ -1480,19 +1480,19 @@ function handleExecMessage(
     const outputMode = (args.outputMode ?? "content") as string;
     proxyLog("native grep: pattern=%s path=%s mode=%s", pattern, searchPath, outputMode);
     try {
-      const rgArgs = ["rg", "--no-heading", "--line-number"];
-      if (args.caseInsensitive) rgArgs.push("-i");
-      if (args.glob) rgArgs.push("--glob", args.glob);
-      if (args.type) rgArgs.push("--type", args.type);
-      if (args.multiline) rgArgs.push("-U", "--multiline-dotall");
-      if (args.contextBefore) rgArgs.push("-B", String(args.contextBefore));
-      if (args.contextAfter) rgArgs.push("-A", String(args.contextAfter));
-      if (args.context) rgArgs.push("-C", String(args.context));
-      if (outputMode === "files_with_matches") rgArgs.push("-l");
-      if (outputMode === "count") rgArgs.push("-c");
-      if (args.headLimit) rgArgs.push("--max-count", String(args.headLimit));
-      rgArgs.push("--", pattern, searchPath);
-      const stdout = execSync(rgArgs.join(" "), { encoding: "utf-8", timeout: 15_000, maxBuffer: 5 * 1024 * 1024 });
+      const rgFlags = ["--no-heading", "--line-number"];
+      if (args.caseInsensitive) rgFlags.push("-i");
+      if (args.glob) rgFlags.push("--glob", args.glob);
+      if (args.type) rgFlags.push("--type", args.type);
+      if (args.multiline) rgFlags.push("-U", "--multiline-dotall");
+      if (args.contextBefore) rgFlags.push("-B", String(args.contextBefore));
+      if (args.contextAfter) rgFlags.push("-A", String(args.contextAfter));
+      if (args.context) rgFlags.push("-C", String(args.context));
+      if (outputMode === "files_with_matches") rgFlags.push("-l");
+      if (outputMode === "count") rgFlags.push("-c");
+      if (args.headLimit) rgFlags.push("--max-count", String(args.headLimit));
+      rgFlags.push("--", pattern, searchPath);
+      const stdout = execFileSync("rg", rgFlags, { encoding: "utf-8", timeout: 15_000, maxBuffer: 5 * 1024 * 1024 });
       const lines = stdout.trimEnd().split("\n");
       const fileMatches: Record<string, Array<{ line: number; content: string; ctx: boolean }>> = {};
       for (const line of lines) {
@@ -1544,6 +1544,74 @@ function handleExecMessage(
           },
         });
         sendExecResult(execMsg, "grepResult", result, sendFrame);
+      } else if (e.code === "ENOENT") {
+        proxyLog("native grep: rg not found, falling back to grep");
+        try {
+          const grepFlags = ["-rn"];
+          if (args.caseInsensitive) grepFlags.push("-i");
+          if (args.glob) grepFlags.push("--include", args.glob);
+          if (args.contextBefore) grepFlags.push("-B", String(args.contextBefore));
+          if (args.contextAfter) grepFlags.push("-A", String(args.contextAfter));
+          if (args.context) grepFlags.push("-C", String(args.context));
+          if (outputMode === "files_with_matches") grepFlags.push("-l");
+          if (outputMode === "count") grepFlags.push("-c");
+          if (args.headLimit) grepFlags.push("-m", String(args.headLimit));
+          grepFlags.push("--", pattern, searchPath);
+          const grepOut = execFileSync("grep", grepFlags, { encoding: "utf-8", timeout: 15_000, maxBuffer: 5 * 1024 * 1024 });
+          const lines = grepOut.trimEnd().split("\n");
+          const fileMatches: Record<string, Array<{ line: number; content: string; ctx: boolean }>> = {};
+          for (const line of lines) {
+            const m = line.match(/^(.+?):(\d+)[:-](.*)$/);
+            if (m) {
+              const [, file, ln, text] = m;
+              (fileMatches[file!] ??= []).push({ line: Number(ln), content: text!, ctx: line[file!.length + ln!.length + 1] === "-" });
+            }
+          }
+          const result = create(GrepResultSchema, {
+            result: {
+              case: "success",
+              value: create(GrepSuccessSchema, {
+                pattern, path: searchPath, outputMode,
+                workspaceResults: Object.fromEntries(
+                  Object.entries(fileMatches).map(([file, matches]) => [
+                    file,
+                    create(GrepUnionResultSchema, {
+                      result: {
+                        case: "content",
+                        value: create(GrepContentResultSchema, {
+                          matches: [
+                            create(GrepFileMatchSchema, {
+                              file,
+                              matches: matches.map((m) =>
+                                create(GrepContentMatchSchema, { lineNumber: m.line, content: m.content, isContextLine: m.ctx }),
+                              ),
+                            }),
+                          ],
+                          totalLines: lines.length,
+                          totalMatchedLines: matches.filter((m) => !m.ctx).length,
+                        }),
+                      },
+                    }),
+                  ]),
+                ),
+              }),
+            },
+          });
+          sendExecResult(execMsg, "grepResult", result, sendFrame);
+        } catch (e2: any) {
+          if (e2.status === 1) {
+            const result = create(GrepResultSchema, {
+              result: { case: "success", value: create(GrepSuccessSchema, { pattern, path: searchPath, outputMode, workspaceResults: {} }) },
+            });
+            sendExecResult(execMsg, "grepResult", result, sendFrame);
+          } else {
+            proxyLog("native grep fallback FAIL: %s", String(e2));
+            const result = create(GrepResultSchema, {
+              result: { case: "error", value: create(GrepErrorSchema, { error: (e2.stderr ?? String(e2)) as string }) },
+            });
+            sendExecResult(execMsg, "grepResult", result, sendFrame);
+          }
+        }
       } else {
         proxyLog("native grep FAIL: %s", String(e));
         const result = create(GrepResultSchema, {
