@@ -11,6 +11,9 @@ import {
   GetUsableModelsResponseSchema,
 } from "./proto/agent_pb";
 
+// TODO: switch to aiserver.v1.AvailableModels which returns per-model
+// context_token_limit and context_token_limit_for_max_mode fields.
+// agent.v1.GetUsableModels lacks context window info entirely.
 const GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
 
 const DEFAULT_CONTEXT_WINDOW = 200_000;
@@ -51,6 +54,7 @@ const CursorModelDetailsSchema = z.object({
       ),
     ),
   thinkingDetails: z.unknown().optional(),
+  maxMode: z.boolean().optional().catch(undefined),
 });
 
 type CursorModelDetails = z.infer<typeof CursorModelDetailsSchema>;
@@ -191,7 +195,7 @@ function normalizeSingleModel(model: unknown): CursorModel | null {
   const id = details.modelId.trim();
   if (!id) return null;
 
-  const limits = resolveModelLimits(id);
+  const limits = resolveModelLimits(id, details.maxMode);
   return {
     id,
     name: pickDisplayName(details, id),
@@ -201,16 +205,25 @@ function normalizeSingleModel(model: unknown): CursorModel | null {
   };
 }
 
-function resolveModelLimits(modelId: string): { context: number; maxTokens: number } {
+function resolveModelLimits(modelId: string, maxMode?: boolean): { context: number; maxTokens: number } {
+  const isMax = maxMode || /-max(?:-|$)/.test(modelId);
   const exact = MODEL_LIMITS[modelId];
-  if (exact) return { context: exact.context ?? DEFAULT_CONTEXT_WINDOW, maxTokens: exact.maxTokens ?? DEFAULT_MAX_TOKENS };
+  if (exact) {
+    let context = exact.context ?? DEFAULT_CONTEXT_WINDOW;
+    if (isMax) context = Math.max(context, 1_000_000);
+    return { context, maxTokens: exact.maxTokens ?? DEFAULT_MAX_TOKENS };
+  }
   // Strip suffixes like "-max-thinking", "-thinking", "-max" and retry
-  const base = modelId.replace(/-(max-thinking|thinking|max|high|medium|low|fast)$/g, "");
+  const base = modelId.replace(/-(max-thinking|thinking|max|high|medium|low|fast|xhigh)$/g, "");
   if (base !== modelId) {
     const baseLimits = MODEL_LIMITS[base];
-    if (baseLimits) return { context: baseLimits.context ?? DEFAULT_CONTEXT_WINDOW, maxTokens: baseLimits.maxTokens ?? DEFAULT_MAX_TOKENS };
+    if (baseLimits) {
+      let context = baseLimits.context ?? DEFAULT_CONTEXT_WINDOW;
+      if (isMax) context = Math.max(context, 1_000_000);
+      return { context, maxTokens: baseLimits.maxTokens ?? DEFAULT_MAX_TOKENS };
+    }
   }
-  return { context: DEFAULT_CONTEXT_WINDOW, maxTokens: DEFAULT_MAX_TOKENS };
+  return { context: isMax ? 1_000_000 : DEFAULT_CONTEXT_WINDOW, maxTokens: DEFAULT_MAX_TOKENS };
 }
 
 function pickDisplayName(model: CursorModelDetails, fallbackId: string): string {
