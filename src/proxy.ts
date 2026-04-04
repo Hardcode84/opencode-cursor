@@ -71,6 +71,8 @@ import {
   AskQuestionRejectedSchema,
   SwitchModeRequestResponseSchema,
   CreatePlanRequestResponseSchema,
+  ExecClientControlMessageSchema,
+  ExecClientStreamCloseSchema,
   type AgentServerMessage,
   type ConversationStateStructure,
   type ExecServerControlMessage,
@@ -657,12 +659,15 @@ function handleChatCompletion(
   if (activeBridge && toolResults.length > 0) {
     activeBridges.delete(bridgeKey);
 
+    const pendingIds = new Set(activeBridge.pendingExecs.map(e => e.toolCallId));
+    const newResults = toolResults.filter(r => pendingIds.has(r.toolCallId));
+
     if (activeBridge.bridge.alive) {
-      proxyLog("resume: bridge alive, sending %d tool results", toolResults.length);
-      return handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey);
+      proxyLog("resume: bridge alive, %d new tool results (of %d total)", newResults.length, toolResults.length);
+      return handleToolResultResume(activeBridge, newResults, modelId, bridgeKey, convKey);
     }
 
-    proxyLog("resume: bridge DEAD, falling through to fresh bridge (had %d tool results)", toolResults.length);
+    proxyLog("resume: bridge DEAD, falling through to fresh bridge (%d results)", newResults.length);
     clearInterval(activeBridge.heartbeatTimer);
     activeBridge.bridge.end();
   }
@@ -1248,6 +1253,8 @@ function handleInteractionUpdate(
     }
   } else if (updateCase === "tokenDelta") {
     state.outputTokens += update.message.value.tokens ?? 0;
+  } else if (updateCase === "turnEnded") {
+    proxyLog("turnEnded received");
   }
 }
 
@@ -1560,6 +1567,21 @@ function sendExecResult(
     message: { case: "execClientMessage", value: execClientMessage },
   });
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+  sendExecStreamClose(execMsg.id, sendFrame);
+}
+
+/** Signal the server that the exec with the given id is complete. */
+function sendExecStreamClose(execId: number, sendFrame: (data: Uint8Array) => void): void {
+  const controlMsg = create(ExecClientControlMessageSchema, {
+    message: {
+      case: "streamClose",
+      value: create(ExecClientStreamCloseSchema, { id: execId }),
+    },
+  });
+  const clientMessage = create(AgentClientMessageSchema, {
+    message: { case: "execClientControlMessage", value: controlMsg },
+  });
+  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
 
 /**
@@ -1592,6 +1614,7 @@ function sendUnknownExecResult(
     message: { case: "execClientMessage", value: execClientMsg },
   });
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+  sendExecStreamClose(execMsg.id, sendFrame);
 }
 
 /** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
@@ -1765,21 +1788,15 @@ function createBridgeStreamResponse(
                   }
                 }
               },
-              // onMcpExec — the model wants to execute a tool.
-              // Multiple mcpExecs can arrive in quick succession. The first one
-              // closes the SSE stream; subsequent ones accumulate in pendingExecs
-              // and are re-emitted as tool_calls in the next SSE response cycle
-              // (see handleToolResultResume).
+              // onMcpExec — collect tool call, emit SSE chunk.
+              // SSE close is deferred to the onData wrapper so all execs from
+              // a single h2 frame are batched into one tool_calls response.
               (exec) => {
                 proxyLog("mcpExec: tool=%s id=%s args=%d chars", exec.toolName, exec.toolCallId, exec.decodedArgs.length);
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
 
                 if (!closed) {
-                  const flushed = tagFilter.flush();
-                  if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-                  if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
-
                   const toolCallIndex = state.toolCallIndex++;
                   sendSSE(makeChunk({
                     tool_calls: [{
@@ -1792,28 +1809,7 @@ function createBridgeStreamResponse(
                       },
                     }],
                   }));
-
-                  clearBridgeInactivityTimer(bridgeKey);
-                  activeBridges.set(bridgeKey, {
-                    bridge,
-                    heartbeatTimer,
-                    blobStore,
-                    mcpTools,
-                    pendingExecs: state.pendingExecs,
-                    convKey,
-                    totalExecCount: state.totalExecCount,
-                    toolCallIndex: state.toolCallIndex,
-                    accessToken: accessToken || "",
-                    resumeCount,
-                  });
-
-                  sendSSE(makeChunk({}, "tool_calls"));
-                  sendDone();
-                  closeController();
                 } else {
-                  // SSE already closed — just accumulate. activeBridges already
-                  // references state.pendingExecs (same array), so the entry
-                  // is automatically up to date.
                   proxyLog("mcpExec: queued (SSE closed), pending=%d", state.pendingExecs.length);
                 }
               },
@@ -1865,7 +1861,34 @@ function createBridgeStreamResponse(
         },
       );
 
-      bridge.onData(processChunk);
+      bridge.onData((chunk) => {
+        processChunk(chunk);
+        // After all messages from this h2 data frame are parsed,
+        // if mcpExecs accumulated, flush them as a single SSE tool_calls batch.
+        if (state.pendingExecs.length > 0 && !closed) {
+          const flushed = tagFilter.flush();
+          if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+          if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+
+          clearBridgeInactivityTimer(bridgeKey);
+          activeBridges.set(bridgeKey, {
+            bridge,
+            heartbeatTimer,
+            blobStore,
+            mcpTools,
+            pendingExecs: state.pendingExecs,
+            convKey,
+            totalExecCount: state.totalExecCount,
+            toolCallIndex: state.toolCallIndex,
+            accessToken: accessToken || "",
+            resumeCount,
+          });
+
+          sendSSE(makeChunk({}, "tool_calls"));
+          sendDone();
+          closeController();
+        }
+      });
 
       bridge.onClose((code) => {
         clearBridgeInactivityTimer(bridgeKey);
@@ -2011,6 +2034,22 @@ function sendMcpResultSuccess(bridge: BridgeHandle, exec: PendingExec, content: 
       toBinary(AgentClientMessageSchema,
         create(AgentClientMessageSchema, {
           message: { case: "execClientMessage", value: execClientMessage },
+        }),
+      ),
+    ),
+  );
+
+  const controlMsg = create(ExecClientControlMessageSchema, {
+    message: {
+      case: "streamClose",
+      value: create(ExecClientStreamCloseSchema, { id: exec.execMsgId }),
+    },
+  });
+  bridge.write(
+    frameConnectMessage(
+      toBinary(AgentClientMessageSchema,
+        create(AgentClientMessageSchema, {
+          message: { case: "execClientControlMessage", value: controlMsg },
         }),
       ),
     ),
