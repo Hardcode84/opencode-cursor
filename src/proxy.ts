@@ -1434,7 +1434,7 @@ function nativeToMcpRedirect(execCase: string, execMsg: ExecServerMessage): Nati
   const toolCallId = args?.toolCallId || crypto.randomUUID();
 
   if (execCase === "readArgs") {
-    const mcpArgs: Record<string, any> = { path: args.path };
+    const mcpArgs: Record<string, any> = { filePath: args.path };
     if (args.offset != null && args.offset !== 0) mcpArgs.offset = args.offset;
     if (args.limit != null && args.limit !== 0) mcpArgs.limit = args.limit;
     return {
@@ -1446,22 +1446,23 @@ function nativeToMcpRedirect(execCase: string, execMsg: ExecServerMessage): Nati
     };
   }
   if (execCase === "writeArgs") {
-    const content = args.fileBytes?.length > 0
+    const fileContent = args.fileBytes?.length > 0
       ? new TextDecoder().decode(args.fileBytes)
-      : args.fileText;
+      : (args.fileText ?? "");
     return {
       toolCallId,
       toolName: "write",
-      decodedArgs: JSON.stringify({ path: args.path, contents: content }),
+      decodedArgs: JSON.stringify({ filePath: args.path, content: fileContent }),
       nativeResultType: "writeResult",
       nativeArgs: { path: args.path },
     };
   }
   if (execCase === "deleteArgs") {
+    const safePath = (args.path ?? "").replace(/'/g, "'\\''");
     return {
       toolCallId,
-      toolName: "delete",
-      decodedArgs: JSON.stringify({ path: args.path }),
+      toolName: "bash",
+      decodedArgs: JSON.stringify({ command: `rm -f -- '${safePath}'`, description: "Delete file" }),
       nativeResultType: "deleteResult",
       nativeArgs: { path: args.path },
     };
@@ -2225,31 +2226,46 @@ function sendNativeResult(bridge: BridgeHandle, exec: PendingExec, content: stri
       break;
     }
     case "shellStreamResult": {
-      const sendStreamEvent = (event: any) => {
-        const msg = create(ExecClientMessageSchema, {
-          id: exec.execMsgId,
-          execId: exec.execId,
-          message: { case: "shellStream" as any, value: create(ShellStreamSchema, { event }) as any },
-        });
+      const writeFrame = (msg: any) => {
         bridge.write(
           frameConnectMessage(
             toBinary(AgentClientMessageSchema,
-              create(AgentClientMessageSchema, {
-                message: { case: "execClientMessage", value: msg },
-              }),
+              create(AgentClientMessageSchema, { message: msg }),
             ),
           ),
         );
+      };
+      const sendStreamEvent = (event: any) => {
+        writeFrame({
+          case: "execClientMessage",
+          value: create(ExecClientMessageSchema, {
+            id: exec.execMsgId,
+            execId: exec.execId,
+            message: { case: "shellStream" as any, value: create(ShellStreamSchema, { event }) as any },
+          }),
+        });
       };
       sendStreamEvent({ case: "start", value: create(ShellStreamStartSchema, {}) });
       if (content) {
         sendStreamEvent({ case: "stdout", value: create(ShellStreamStdoutSchema, { data: content }) });
       }
       sendStreamEvent({ case: "exit", value: create(ShellStreamExitSchema, { code: 0 }) });
+      writeFrame({
+        case: "execClientControlMessage",
+        value: create(ExecClientControlMessageSchema, {
+          message: { case: "streamClose", value: create(ExecClientStreamCloseSchema, { id: exec.execMsgId }) },
+        }),
+      });
       return;
     }
+    case "grepResult":
+    case "lsResult":
     default:
-      proxyLog("sendNativeResult: unknown type %s, falling back to MCP", exec.nativeResultType);
+      if (exec.nativeResultType === "grepResult" || exec.nativeResultType === "lsResult") {
+        proxyLog("sendNativeResult: %s → MCP text fallback (complex proto)", exec.nativeResultType);
+      } else {
+        proxyLog("sendNativeResult: unknown type %s, falling back to MCP", exec.nativeResultType);
+      }
       sendMcpResultSuccess(bridge, exec, content);
       return;
   }
