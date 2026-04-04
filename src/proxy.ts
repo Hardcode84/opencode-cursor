@@ -1790,6 +1790,14 @@ function createBridgeStreamResponse(
           usage: { prompt_tokens, completion_tokens, total_tokens },
         };
       };
+      let lastUsageKey = "";
+      const sendUsageIfChanged = () => {
+        const chunk = makeUsageChunk();
+        const key = JSON.stringify(chunk.usage);
+        if (key === lastUsageKey) return;
+        lastUsageKey = key;
+        sendSSE(chunk);
+      };
 
       const state: StreamState = {
         toolCallIndex: initialToolCallIndex,
@@ -1891,6 +1899,7 @@ function createBridgeStreamResponse(
                   stored.lastAccessMs = Date.now();
                   persistConversation(convKey, stored);
                 }
+                sendUsageIfChanged();
               },
               (note) => {
                 sendSSE(makeChunk({ content: `\n${note}\n` }));
@@ -1949,6 +1958,7 @@ function createBridgeStreamResponse(
               resumeCount,
             });
 
+            sendUsageIfChanged();
             sendSSE(makeChunk({}, "tool_calls"));
             sendDone();
             closeController();
@@ -2014,13 +2024,13 @@ function createBridgeStreamResponse(
           if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
           if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
           sendSSE(makeChunk({}, "stop"));
-          sendSSE(makeUsageChunk());
+          sendUsageIfChanged();
           sendDone();
           closeController();
         } else if (code !== 0) {
           sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
           sendSSE(makeChunk({}, "stop"));
-          sendSSE(makeUsageChunk());
+          sendUsageIfChanged();
           sendDone();
           closeController();
           // Remove stale entry so the next request doesn't try to resume it.
