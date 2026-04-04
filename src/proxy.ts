@@ -28,10 +28,12 @@ import {
   BackgroundShellSpawnResultSchema,
   DeleteResultSchema,
   DeleteRejectedSchema,
+  DeleteSuccessSchema,
   DiagnosticsResultSchema,
   ExecClientMessageSchema,
   FetchErrorSchema,
   FetchResultSchema,
+  FetchSuccessSchema,
   GetBlobResultSchema,
   GrepErrorSchema,
   GrepResultSchema,
@@ -48,6 +50,7 @@ import {
   ModelDetailsSchema,
   ReadRejectedSchema,
   ReadResultSchema,
+  ReadSuccessSchema,
   RequestContextResultSchema,
   RequestContextSchema,
   RequestContextSuccessSchema,
@@ -59,6 +62,7 @@ import {
   UserMessageSchema,
   WriteRejectedSchema,
   WriteResultSchema,
+  WriteSuccessSchema,
   WriteShellStdinErrorSchema,
   WriteShellStdinResultSchema,
   InteractionResponseSchema,
@@ -149,6 +153,9 @@ interface CursorRequestPayload {
   mcpTools: McpToolDefinition[];
 }
 
+/** Native exec types we redirect through MCP instead of rejecting. */
+type NativeResultType = "readResult" | "writeResult" | "deleteResult" | "fetchResult";
+
 /** A pending tool execution waiting for results from the caller. */
 interface PendingExec {
   execId: string;
@@ -157,6 +164,10 @@ interface PendingExec {
   toolName: string;
   /** Decoded arguments JSON string for SSE tool_calls emission. */
   decodedArgs: string;
+  /** Set when this exec originated from a native Cursor tool redirected to MCP. */
+  nativeResultType?: NativeResultType;
+  /** Original native args needed for result construction (e.g., path, url). */
+  nativeArgs?: Record<string, string>;
 }
 
 /** A bridge kept alive across requests for tool result continuation. */
@@ -1381,6 +1392,63 @@ function handleKvMessage(
   }
 }
 
+interface NativeRedirectInfo {
+  toolCallId: string;
+  toolName: string;
+  decodedArgs: string;
+  nativeResultType: NativeResultType;
+  nativeArgs: Record<string, string>;
+}
+
+function nativeToMcpRedirect(execCase: string, execMsg: ExecServerMessage): NativeRedirectInfo | null {
+  const args = execMsg.message.value as any;
+  const toolCallId = args?.toolCallId || crypto.randomUUID();
+
+  if (execCase === "readArgs") {
+    const mcpArgs: Record<string, any> = { path: args.path };
+    if (args.offset != null && args.offset !== 0) mcpArgs.offset = args.offset;
+    if (args.limit != null && args.limit !== 0) mcpArgs.limit = args.limit;
+    return {
+      toolCallId,
+      toolName: "read",
+      decodedArgs: JSON.stringify(mcpArgs),
+      nativeResultType: "readResult",
+      nativeArgs: { path: args.path },
+    };
+  }
+  if (execCase === "writeArgs") {
+    const content = args.fileBytes?.length > 0
+      ? new TextDecoder().decode(args.fileBytes)
+      : args.fileText;
+    return {
+      toolCallId,
+      toolName: "write",
+      decodedArgs: JSON.stringify({ path: args.path, contents: content }),
+      nativeResultType: "writeResult",
+      nativeArgs: { path: args.path },
+    };
+  }
+  if (execCase === "deleteArgs") {
+    return {
+      toolCallId,
+      toolName: "delete",
+      decodedArgs: JSON.stringify({ path: args.path }),
+      nativeResultType: "deleteResult",
+      nativeArgs: { path: args.path },
+    };
+  }
+  if (execCase === "fetchArgs") {
+    return {
+      toolCallId,
+      toolName: "web_fetch",
+      decodedArgs: JSON.stringify({ url: args.url }),
+      nativeResultType: "fetchResult",
+      nativeArgs: { url: args.url },
+    };
+  }
+  return null;
+}
+
 function handleExecMessage(
   execMsg: ExecServerMessage,
   mcpTools: McpToolDefinition[],
@@ -1432,19 +1500,26 @@ function handleExecMessage(
     return;
   }
 
-  // --- Reject native Cursor tools — model should use MCP tools from OpenCode instead ---
+  // --- Redirect supported native tools through OpenCode MCP ---
   if (state) state.totalExecCount++;
-  proxyLog("reject native exec: %s (id=%d)", execCase, execMsg.id);
-  const REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
-
-  if (execCase === "readArgs") {
-    const args = execMsg.message.value;
-    const result = create(ReadResultSchema, {
-      result: { case: "rejected", value: create(ReadRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
+  const nativeRedirect = nativeToMcpRedirect(execCase as string, execMsg);
+  if (nativeRedirect) {
+    proxyLog("redirect native exec: %s → %s (id=%d)", execCase, nativeRedirect.toolName, execMsg.id);
+    onMcpExec({
+      execId: execMsg.execId,
+      execMsgId: execMsg.id,
+      toolCallId: nativeRedirect.toolCallId,
+      toolName: nativeRedirect.toolName,
+      decodedArgs: nativeRedirect.decodedArgs,
+      nativeResultType: nativeRedirect.nativeResultType,
+      nativeArgs: nativeRedirect.nativeArgs,
     });
-    sendExecResult(execMsg, "readResult", result, sendFrame);
     return;
   }
+
+  // --- Reject unsupported native tools ---
+  proxyLog("reject native exec: %s (id=%d)", execCase, execMsg.id);
+  const REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
 
   if (execCase === "lsArgs") {
     const args = execMsg.message.value;
@@ -1480,31 +1555,6 @@ function handleExecMessage(
     return;
   }
 
-  if (execCase === "fetchArgs") {
-    const args = execMsg.message.value as any;
-    const result = create(FetchResultSchema, {
-      result: { case: "error", value: create(FetchErrorSchema, { url: args.url ?? "", error: REJECT_REASON }) },
-    });
-    sendExecResult(execMsg, "fetchResult", result, sendFrame);
-    return;
-  }
-
-  if (execCase === "writeArgs") {
-    const args = execMsg.message.value;
-    const result = create(WriteResultSchema, {
-      result: { case: "rejected", value: create(WriteRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
-    });
-    sendExecResult(execMsg, "writeResult", result, sendFrame);
-    return;
-  }
-  if (execCase === "deleteArgs") {
-    const args = execMsg.message.value;
-    const result = create(DeleteResultSchema, {
-      result: { case: "rejected", value: create(DeleteRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
-    });
-    sendExecResult(execMsg, "deleteResult", result, sendFrame);
-    return;
-  }
   if (execCase === "backgroundShellSpawnArgs") {
     const args = execMsg.message.value;
     const result = create(BackgroundShellSpawnResultSchema, {
@@ -2056,6 +2106,108 @@ function sendMcpResultSuccess(bridge: BridgeHandle, exec: PendingExec, content: 
   );
 }
 
+/** Send a native Cursor tool result for a redirected exec. */
+function sendNativeResult(bridge: BridgeHandle, exec: PendingExec, content: string): void {
+  const args = exec.nativeArgs ?? {};
+  let resultCase: string;
+  let resultValue: any;
+
+  switch (exec.nativeResultType) {
+    case "readResult": {
+      const lines = content.split("\n");
+      resultValue = create(ReadResultSchema, {
+        result: {
+          case: "success",
+          value: create(ReadSuccessSchema, {
+            path: args.path ?? "",
+            totalLines: lines.length,
+            fileSize: BigInt(new TextEncoder().encode(content).byteLength),
+            truncated: false,
+            output: { case: "content", value: content },
+          }),
+        },
+      });
+      resultCase = "readResult";
+      break;
+    }
+    case "writeResult": {
+      const bytes = new TextEncoder().encode(content);
+      resultValue = create(WriteResultSchema, {
+        result: {
+          case: "success",
+          value: create(WriteSuccessSchema, {
+            path: args.path ?? "",
+            linesCreated: content.split("\n").length,
+            fileSize: bytes.byteLength,
+          }),
+        },
+      });
+      resultCase = "writeResult";
+      break;
+    }
+    case "deleteResult": {
+      resultValue = create(DeleteResultSchema, {
+        result: {
+          case: "success",
+          value: create(DeleteSuccessSchema, { path: args.path ?? "" }),
+        },
+      });
+      resultCase = "deleteResult";
+      break;
+    }
+    case "fetchResult": {
+      resultValue = create(FetchResultSchema, {
+        result: {
+          case: "success",
+          value: create(FetchSuccessSchema, {
+            url: args.url ?? "",
+            content,
+            statusCode: 200,
+          }),
+        },
+      });
+      resultCase = "fetchResult";
+      break;
+    }
+    default:
+      proxyLog("sendNativeResult: unknown type %s, falling back to MCP", exec.nativeResultType);
+      sendMcpResultSuccess(bridge, exec, content);
+      return;
+  }
+
+  const execClientMessage = create(ExecClientMessageSchema, {
+    id: exec.execMsgId,
+    execId: exec.execId,
+    message: { case: resultCase as any, value: resultValue as any },
+  });
+
+  bridge.write(
+    frameConnectMessage(
+      toBinary(AgentClientMessageSchema,
+        create(AgentClientMessageSchema, {
+          message: { case: "execClientMessage", value: execClientMessage },
+        }),
+      ),
+    ),
+  );
+
+  const controlMsg = create(ExecClientControlMessageSchema, {
+    message: {
+      case: "streamClose",
+      value: create(ExecClientStreamCloseSchema, { id: exec.execMsgId }),
+    },
+  });
+  bridge.write(
+    frameConnectMessage(
+      toBinary(AgentClientMessageSchema,
+        create(AgentClientMessageSchema, {
+          message: { case: "execClientControlMessage", value: controlMsg },
+        }),
+      ),
+    ),
+  );
+}
+
 /** Resume a paused bridge by sending MCP results and continuing to stream.
  *  Execs without a matching tool result are re-emitted as tool_calls in
  *  the returned SSE response so OpenCode can execute them next cycle. */
@@ -2072,7 +2224,11 @@ function handleToolResultResume(
   for (const exec of pendingExecs) {
     const result = toolResults.find((r) => r.toolCallId === exec.toolCallId);
     if (result) {
-      sendMcpResultSuccess(bridge, exec, result.content);
+      if (exec.nativeResultType) {
+        sendNativeResult(bridge, exec, result.content);
+      } else {
+        sendMcpResultSuccess(bridge, exec, result.content);
+      }
     } else {
       unmatched.push(exec);
     }
