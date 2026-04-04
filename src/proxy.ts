@@ -73,6 +73,7 @@ import {
   CreatePlanRequestResponseSchema,
   type AgentServerMessage,
   type ConversationStateStructure,
+  type ExecServerControlMessage,
   type ExecServerMessage,
   type KvServerMessage,
   type McpToolDefinition,
@@ -1206,6 +1207,12 @@ function processServerMessage(
       onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
     }
     return true;
+  } else if (msgCase === "execServerControlMessage") {
+    const ctrl = msg.message.value as ExecServerControlMessage;
+    if (ctrl.message.case === "abort") {
+      proxyLog("exec ABORT for id=%d", ctrl.message.value.id);
+    }
+    return true;
   } else if (msgCase === "interactionQuery") {
     handleInteractionQuery(msg.message.value as any, sendFrame, onNotify);
     return true;
@@ -1524,6 +1531,7 @@ function handleExecMessage(
   const miscCaseMap: Record<string, string> = {
     listMcpResourcesExecArgs: "listMcpResourcesExecResult",
     readMcpResourceExecArgs: "readMcpResourceExecResult",
+    mcpStateExecArgs: "mcpStateExecResult",
     recordScreenArgs: "recordScreenResult",
     computerUseArgs: "computerUseResult",
   };
@@ -1533,7 +1541,7 @@ function handleExecMessage(
     return;
   }
 
-  proxyLog("UNHANDLED exec: %s", execCase);
+  sendUnknownExecResult(execMsg, sendFrame);
 }
 
 /** Send an exec client message back to Cursor. */
@@ -1550,6 +1558,38 @@ function sendExecResult(
   });
   const clientMessage = create(AgentClientMessageSchema, {
     message: { case: "execClientMessage", value: execClientMessage },
+  });
+  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+}
+
+/**
+ * Send a best-effort empty result for an exec type not in our proto schema.
+ * Extracts the unknown oneof field number from $unknown and mirrors it back
+ * as an empty message on the ExecClientMessage, preventing the server from
+ * waiting indefinitely.
+ */
+function sendUnknownExecResult(
+  execMsg: ExecServerMessage,
+  sendFrame: (data: Uint8Array) => void,
+): void {
+  const unknowns: Array<{ no: number; wireType: number; data: Uint8Array }> | undefined =
+    (execMsg as any).$unknown;
+  const argsField = unknowns?.find(
+    (f) => f.wireType === 2 && f.no !== 1 && f.no !== 15 && f.no !== 19,
+  );
+  if (!argsField) {
+    proxyLog("UNHANDLED exec: case=%s id=%d (no recoverable field number)", execMsg.message.case, execMsg.id);
+    return;
+  }
+  const resultFieldNo = argsField.no;
+  proxyLog("UNHANDLED exec: field=%d id=%d — sending empty result", resultFieldNo, execMsg.id);
+  const execClientMsg = create(ExecClientMessageSchema, {
+    id: execMsg.id,
+    execId: execMsg.execId,
+  });
+  (execClientMsg as any).$unknown = [{ no: resultFieldNo, wireType: 2, data: new Uint8Array(0) }];
+  const clientMessage = create(AgentClientMessageSchema, {
+    message: { case: "execClientMessage", value: execClientMsg },
   });
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
