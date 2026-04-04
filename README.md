@@ -24,9 +24,6 @@ Add this to `~/.config/opencode/opencode.json`:
 The `cursor` provider stub is required because OpenCode drops providers that do
 not already exist in its bundled provider catalog.
 
-OpenCode installs npm plugins automatically at startup, so users do not need to
-clone this repository.
-
 ## Authenticate
 
 ```sh
@@ -47,48 +44,67 @@ OpenAI-compatible proxy on demand and routes requests through Cursor's gRPC API.
 2. Model discovery — queries Cursor's gRPC API for all available models.
 3. Local proxy — translates `POST /v1/chat/completions` into Cursor's
    protobuf/HTTP/2 Connect protocol.
-4. Native tool routing — rejects Cursor's built-in filesystem/shell tools and
-   exposes OpenCode's tool surface via Cursor MCP instead.
-
-HTTP/2 transport runs through a Node child process (`h2-bridge.mjs`) because
-Bun's `node:http2` support is not reliable against Cursor's API.
+4. Native tool routing — redirects Cursor's built-in read/write/delete/fetch
+   tools to OpenCode's MCP equivalents; rejects shell/grep with typed errors so
+   the model falls back to MCP tools.
 
 ## Architecture
 
 ```
 OpenCode  -->  /v1/chat/completions  -->  Bun.serve (proxy)
                                               |
-                                    Node child process (h2-bridge.mjs)
-                                              |
                                      HTTP/2 Connect stream
                                               |
-                                    api2.cursor.sh gRPC
+                                    Cursor gRPC backend
                                       /agent.v1.AgentService/Run
 ```
 
 ### Tool call flow
 
 ```
-1. Cursor model receives OpenAI tools via RequestContext (as MCP tool defs)
+1. Cursor model receives OpenCode tools via RequestContext (as MCP tool defs)
 2. Model tries native tools (readArgs, shellArgs, etc.)
-3. Proxy rejects each with typed error (ReadRejected, ShellRejected, etc.)
-4. Model falls back to MCP tool -> mcpArgs exec message
-5. Proxy emits OpenAI tool_calls SSE chunk, pauses H2 stream
-6. OpenCode executes tool, sends result in follow-up request
-7. Proxy resumes H2 stream with mcpResult, streams continuation
+3. Proxy redirects read/write/delete/fetch to OpenCode MCP tools
+4. Proxy rejects shell/grep/ls with typed errors (ShellRejected, etc.)
+5. Model issues MCP tool call -> mcpArgs exec message
+6. Proxy emits OpenAI tool_calls SSE chunk, keeps H2 stream alive
+7. OpenCode executes tool, sends result in follow-up request
+8. Proxy resumes with mcpResult on the same H2 stream
 ```
+
+### Key design choices
+
+- **Persistent frame parser** — the Connect protocol frame parser lives in the
+  bridge and survives across handler swaps on tool result resume, preventing
+  buffer orphaning that caused silent stalls.
+- **Bidirectional streaming** — a single HTTP/2 stream is kept open for the
+  entire conversation turn; tool results are written back on the same stream
+  without reconnecting.
+- **Disk-backed state** — conversation checkpoints and blob stores persist to
+  disk, surviving proxy restarts and enabling undo/revisit.
+- **Auto-resume** — on timeout or `resource_exhausted`, the proxy automatically
+  rebuilds the request from the last checkpoint (up to 5 attempts).
 
 ## Develop locally
 
 ```sh
 bun install
-bun run build
-bun test/smoke.ts
+bun run build    # tsc — type-checked build
+bun run bundle   # bun build — bundled for deployment
+bun run deploy   # bundle + copy to ~/.config/opencode/node_modules/
 ```
+
+`bun run deploy` bundles the plugin into self-contained JS files (only
+`@opencode-ai/plugin` is external) and copies them into OpenCode's plugin
+directory. No symlinks — survives OpenCode updates.
+
+## MITM proxy (tools/)
+
+`tools/mitm-proxy.ts` is a transparent TLS relay for capturing raw Cursor
+agent traffic for protocol analysis. See the file header for setup instructions.
 
 ## Requirements
 
 - [OpenCode](https://opencode.ai)
 - [Bun](https://bun.sh)
-- [Node.js](https://nodejs.org) >= 18 for the HTTP/2 bridge process
 - Active [Cursor](https://cursor.com) subscription

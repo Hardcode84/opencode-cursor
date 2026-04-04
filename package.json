@@ -19,6 +19,8 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "bundle": "bun build src/index.ts --outfile dist/index.js --target bun --external @opencode-ai/plugin && bun build src/sdk-wrapper.ts --outfile dist/sdk-wrapper.js --target bun",
+    "deploy": "bun run bundle && rm -rf \"$HOME/.config/opencode/node_modules/opencode-cursor-oauth\" && mkdir -p \"$HOME/.config/opencode/node_modules/opencode-cursor-oauth/dist\" && cp package.json \"$HOME/.config/opencode/node_modules/opencode-cursor-oauth/\" && cp dist/index.js dist/sdk-wrapper.js \"$HOME/.config/opencode/node_modules/opencode-cursor-oauth/dist/\"",
     "test": "bun test/smoke.ts",
     "prepublishOnly": "npm run build"
   },
