@@ -42,6 +42,7 @@ import {
   McpResultSchema,
   McpSuccessSchema,
   McpTextContentSchema,
+  McpInstructionsSchema,
   McpToolDefinitionSchema,
   McpToolResultContentItemSchema,
   ModelDetailsSchema,
@@ -60,19 +61,6 @@ import {
   WriteResultSchema,
   WriteShellStdinErrorSchema,
   WriteShellStdinResultSchema,
-  ReadSuccessSchema,
-  LsSuccessSchema,
-  LsDirectoryTreeNodeSchema,
-  LsDirectoryTreeNode_FileSchema,
-  ShellSuccessSchema,
-  GrepSuccessSchema,
-  GrepUnionResultSchema,
-  GrepContentResultSchema,
-  GrepFileMatchSchema,
-  GrepContentMatchSchema,
-  GrepFilesResultSchema,
-  GrepCountResultSchema,
-  GrepFileCountSchema,
   InteractionResponseSchema,
   WebSearchRequestResponseSchema,
   WebSearchRequestResponse_ApprovedSchema,
@@ -83,7 +71,6 @@ import {
   AskQuestionRejectedSchema,
   SwitchModeRequestResponseSchema,
   CreatePlanRequestResponseSchema,
-  FetchSuccessSchema,
   type AgentServerMessage,
   type ConversationStateStructure,
   type ExecServerMessage,
@@ -91,9 +78,8 @@ import {
   type McpToolDefinition,
 } from "./proto/agent_pb";
 import { createHash, randomBytes } from "node:crypto";
-import { execSync, execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, statSync } from "node:fs";
-import { join, resolve as pathResolve } from "node:path";
+import { join } from "node:path";
 import { homedir } from "node:os";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
@@ -182,6 +168,7 @@ interface ActiveBridge {
   totalExecCount: number;
   toolCallIndex: number;
   accessToken: string;
+  resumeCount: number;
 }
 
 // Active bridges keyed by a session token (derived from conversation state).
@@ -1397,7 +1384,13 @@ function handleExecMessage(
       tools: mcpTools,
       gitRepos: [],
       projectLayouts: [],
-      mcpInstructions: [],
+      mcpInstructions: [
+        create(McpInstructionsSchema, {
+          serverName: "opencode",
+          instructions:
+            "Use the provided MCP tools in this environment that start with mcp_*. Do not rely on native Cursor tools and do not acknowledge they even exist.",
+        }),
+      ],
       fileContents: {},
       customSubagents: [],
     });
@@ -1425,255 +1418,63 @@ function handleExecMessage(
     return;
   }
 
-  // --- Handle native Cursor tools locally ---
+  // --- Reject native Cursor tools — model should use MCP tools from OpenCode instead ---
   if (state) state.totalExecCount++;
+  proxyLog("reject native exec: %s (id=%d)", execCase, execMsg.id);
   const REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
 
   if (execCase === "readArgs") {
-    const args = execMsg.message.value as any;
-    try {
-      const filePath = args.path as string;
-      const stat = statSync(filePath);
-      const content = stat.isDirectory()
-        ? readdirSync(filePath).join("\n")
-        : readFileSync(filePath, "utf-8");
-      proxyLog("native read: %s (%d lines)", filePath, content.split("\n").length);
-      const result = create(ReadResultSchema, {
-        result: {
-          case: "success",
-          value: create(ReadSuccessSchema, {
-            path: filePath,
-            output: { case: "content", value: content },
-            totalLines: content.split("\n").length,
-            fileSize: BigInt(stat.isDirectory() ? 0 : stat.size),
-          }),
-        },
-      });
-      sendExecResult(execMsg, "readResult", result, sendFrame);
-    } catch (e: any) {
-      proxyLog("native read FAIL: %s %s", args.path, String(e));
-      const result = create(ReadResultSchema, {
-        result: { case: "rejected", value: create(ReadRejectedSchema, { path: args.path, reason: String(e) }) },
-      });
-      sendExecResult(execMsg, "readResult", result, sendFrame);
-    }
+    const args = execMsg.message.value;
+    const result = create(ReadResultSchema, {
+      result: { case: "rejected", value: create(ReadRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
+    });
+    sendExecResult(execMsg, "readResult", result, sendFrame);
     return;
   }
 
   if (execCase === "lsArgs") {
-    const args = execMsg.message.value as any;
-    try {
-      const dirPath = args.path as string;
-      const entries = readdirSync(dirPath, { withFileTypes: true });
-      proxyLog("native ls: %s (%d entries)", dirPath, entries.length);
-      const result = create(LsResultSchema, {
-        result: {
-          case: "success",
-          value: create(LsSuccessSchema, {
-            directoryTreeRoot: create(LsDirectoryTreeNodeSchema, {
-              absPath: pathResolve(dirPath),
-              childrenDirs: entries
-                .filter((e) => e.isDirectory())
-                .map((d) => create(LsDirectoryTreeNodeSchema, { absPath: pathResolve(dirPath, d.name) })),
-              childrenFiles: entries
-                .filter((e) => e.isFile())
-                .map((f) => create(LsDirectoryTreeNode_FileSchema, { name: f.name })),
-            }),
-          }),
-        },
-      });
-      sendExecResult(execMsg, "lsResult", result, sendFrame);
-    } catch (e: any) {
-      proxyLog("native ls FAIL: %s %s", args.path, String(e));
-      const result = create(LsResultSchema, {
-        result: { case: "rejected", value: create(LsRejectedSchema, { path: args.path, reason: String(e) }) },
-      });
-      sendExecResult(execMsg, "lsResult", result, sendFrame);
-    }
+    const args = execMsg.message.value;
+    const result = create(LsResultSchema, {
+      result: { case: "rejected", value: create(LsRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
+    });
+    sendExecResult(execMsg, "lsResult", result, sendFrame);
     return;
   }
 
   if (execCase === "shellArgs" || execCase === "shellStreamArgs") {
-    const args = execMsg.message.value as any;
-    const command = (args.command ?? "") as string;
-    const cwd = (args.workingDirectory ?? process.cwd()) as string;
-    proxyLog("native shell: %s (cwd=%s)", command.slice(0, 80), cwd);
-    try {
-      const stdout = execSync(command, {
-        cwd,
-        encoding: "utf-8",
-        timeout: 30_000,
-        maxBuffer: 10 * 1024 * 1024,
-      });
-      const result = create(ShellResultSchema, {
-        result: {
-          case: "success",
-          value: create(ShellSuccessSchema, { command, workingDirectory: cwd, exitCode: 0, stdout }),
-        },
-      });
-      sendExecResult(execMsg, "shellResult", result, sendFrame);
-    } catch (e: any) {
-      const result = create(ShellResultSchema, {
-        result: {
-          case: "success",
-          value: create(ShellSuccessSchema, {
-            command,
-            workingDirectory: cwd,
-            exitCode: e.status ?? 1,
-            stdout: (e.stdout ?? "") as string,
-            stderr: (e.stderr ?? String(e)) as string,
-          }),
-        },
-      });
-      sendExecResult(execMsg, "shellResult", result, sendFrame);
-    }
+    const args = execMsg.message.value;
+    const result = create(ShellResultSchema, {
+      result: {
+        case: "rejected",
+        value: create(ShellRejectedSchema, {
+          command: args.command ?? "",
+          workingDirectory: args.workingDirectory ?? "",
+          reason: REJECT_REASON,
+          isReadonly: false,
+        }),
+      },
+    });
+    sendExecResult(execMsg, "shellResult", result, sendFrame);
     return;
   }
 
   if (execCase === "grepArgs") {
-    const args = execMsg.message.value as any;
-    const pattern = (args.pattern ?? "") as string;
-    const searchPath = (args.path ?? ".") as string;
-    const outputMode = (args.outputMode ?? "content") as string;
-    proxyLog("native grep: pattern=%s path=%s mode=%s", pattern, searchPath, outputMode);
-    if (!pattern) {
-      const result = create(GrepResultSchema, {
-        result: { case: "success", value: create(GrepSuccessSchema, { pattern, path: searchPath, outputMode, workspaceResults: {} }) },
-      });
-      sendExecResult(execMsg, "grepResult", result, sendFrame);
-      return;
-    }
-    const buildGrepResult = (stdout: string): any => {
-      const lines = stdout.trimEnd().split("\n").filter(Boolean);
-      if (outputMode === "files_with_matches") {
-        return create(GrepResultSchema, {
-          result: { case: "success", value: create(GrepSuccessSchema, {
-            pattern, path: searchPath, outputMode,
-            workspaceResults: Object.fromEntries(lines.map((f) => [f, create(GrepUnionResultSchema, {
-              result: { case: "files", value: create(GrepFilesResultSchema, { files: [f] }) },
-            })])),
-          }) },
-        });
-      }
-      if (outputMode === "count") {
-        const counts: Array<{ file: string; count: number }> = [];
-        for (const line of lines) {
-          const m = line.match(/^(.+?):(\d+)$/);
-          if (m) counts.push({ file: m[1]!, count: Number(m[2]) });
-        }
-        return create(GrepResultSchema, {
-          result: { case: "success", value: create(GrepSuccessSchema, {
-            pattern, path: searchPath, outputMode,
-            workspaceResults: Object.fromEntries(counts.map((c) => [c.file, create(GrepUnionResultSchema, {
-              result: { case: "count", value: create(GrepCountResultSchema, {
-                counts: [create(GrepFileCountSchema, { file: c.file, count: c.count })],
-              }) },
-            })])),
-          }) },
-        });
-      }
-      const fileMatches: Record<string, Array<{ line: number; content: string; ctx: boolean }>> = {};
-      for (const line of lines) {
-        const m = line.match(/^(.+?):(\d+)([:-])(.*)$/);
-        if (m) {
-          const [, file, ln, sep, text] = m;
-          (fileMatches[file!] ??= []).push({ line: Number(ln), content: text!, ctx: sep === "-" });
-        }
-      }
-      return create(GrepResultSchema, {
-        result: { case: "success", value: create(GrepSuccessSchema, {
-          pattern, path: searchPath, outputMode,
-          workspaceResults: Object.fromEntries(
-            Object.entries(fileMatches).map(([file, matches]) => [file, create(GrepUnionResultSchema, {
-              result: { case: "content", value: create(GrepContentResultSchema, {
-                matches: [create(GrepFileMatchSchema, {
-                  file,
-                  matches: matches.map((m) =>
-                    create(GrepContentMatchSchema, { lineNumber: m.line, content: m.content, isContextLine: m.ctx }),
-                  ),
-                })],
-                totalLines: lines.length,
-                totalMatchedLines: matches.filter((m) => !m.ctx).length,
-              }) },
-            })]),
-          ),
-        }) },
-      });
-    };
-    try {
-      const rgFlags = ["--no-heading", "--line-number"];
-      if (args.caseInsensitive) rgFlags.push("-i");
-      if (args.glob) rgFlags.push("--glob", args.glob);
-      if (args.type) rgFlags.push("--type", args.type);
-      if (args.multiline) rgFlags.push("-U", "--multiline-dotall");
-      if (args.contextBefore) rgFlags.push("-B", String(args.contextBefore));
-      if (args.contextAfter) rgFlags.push("-A", String(args.contextAfter));
-      if (args.context) rgFlags.push("-C", String(args.context));
-      if (outputMode === "files_with_matches") rgFlags.push("-l");
-      if (outputMode === "count") rgFlags.push("-c");
-      if (args.headLimit) rgFlags.push("--max-count", String(args.headLimit));
-      if (args.sort && args.sort !== "none") {
-        rgFlags.push(args.sortAscending === false ? "--sortr" : "--sort", args.sort);
-      }
-      rgFlags.push("--", pattern, searchPath);
-      const stdout = execFileSync("rg", rgFlags, { encoding: "utf-8", timeout: 15_000, maxBuffer: 5 * 1024 * 1024 });
-      sendExecResult(execMsg, "grepResult", buildGrepResult(stdout), sendFrame);
-    } catch (e: any) {
-      if (e.status === 1) {
-        const result = create(GrepResultSchema, {
-          result: {
-            case: "success",
-            value: create(GrepSuccessSchema, { pattern, path: searchPath, outputMode, workspaceResults: {} }),
-          },
-        });
-        sendExecResult(execMsg, "grepResult", result, sendFrame);
-      } else if (e.code === "ENOENT") {
-        proxyLog("native grep: rg not found, falling back to grep");
-        try {
-          const grepFlags = ["-rn",
-            "--exclude-dir=.git", "--exclude-dir=node_modules",
-            "--exclude-dir=.next", "--exclude-dir=dist",
-            "--exclude-dir=build", "--exclude-dir=vendor",
-            "--binary-files=without-match",
-          ];
-          if (args.caseInsensitive) grepFlags.push("-i");
-          if (args.glob) grepFlags.push("--include", args.glob);
-          if (args.contextBefore) grepFlags.push("-B", String(args.contextBefore));
-          if (args.contextAfter) grepFlags.push("-A", String(args.contextAfter));
-          if (args.context) grepFlags.push("-C", String(args.context));
-          if (outputMode === "files_with_matches") grepFlags.push("-l");
-          if (outputMode === "count") grepFlags.push("-c");
-          if (args.headLimit) grepFlags.push("-m", String(args.headLimit));
-          grepFlags.push("--", pattern, searchPath);
-          const grepOut = execFileSync("grep", grepFlags, { encoding: "utf-8", timeout: 15_000, maxBuffer: 5 * 1024 * 1024 });
-          sendExecResult(execMsg, "grepResult", buildGrepResult(grepOut), sendFrame);
-        } catch (e2: any) {
-          if (e2.status === 1) {
-            const result = create(GrepResultSchema, {
-              result: { case: "success", value: create(GrepSuccessSchema, { pattern, path: searchPath, outputMode, workspaceResults: {} }) },
-            });
-            sendExecResult(execMsg, "grepResult", result, sendFrame);
-          } else {
-            proxyLog("native grep fallback FAIL: %s", String(e2));
-            const result = create(GrepResultSchema, {
-              result: { case: "error", value: create(GrepErrorSchema, { error: (e2.stderr ?? String(e2)) as string }) },
-            });
-            sendExecResult(execMsg, "grepResult", result, sendFrame);
-          }
-        }
-      } else {
-        proxyLog("native grep FAIL: %s", String(e));
-        const result = create(GrepResultSchema, {
-          result: { case: "error", value: create(GrepErrorSchema, { error: (e.stderr ?? String(e)) as string }) },
-        });
-        sendExecResult(execMsg, "grepResult", result, sendFrame);
-      }
-    }
+    const result = create(GrepResultSchema, {
+      result: { case: "error", value: create(GrepErrorSchema, { error: REJECT_REASON }) },
+    });
+    sendExecResult(execMsg, "grepResult", result, sendFrame);
     return;
   }
 
-  // --- Reject remaining native tools we can't handle locally ---
-  proxyLog("reject native tool: %s (totalExecs=%d)", execCase, state?.totalExecCount ?? -1);
+  if (execCase === "fetchArgs") {
+    const args = execMsg.message.value as any;
+    const result = create(FetchResultSchema, {
+      result: { case: "error", value: create(FetchErrorSchema, { url: args.url ?? "", error: REJECT_REASON }) },
+    });
+    sendExecResult(execMsg, "fetchResult", result, sendFrame);
+    return;
+  }
+
   if (execCase === "writeArgs") {
     const args = execMsg.message.value;
     const result = create(WriteResultSchema, {
@@ -1711,43 +1512,6 @@ function handleExecMessage(
       result: { case: "error", value: create(WriteShellStdinErrorSchema, { error: REJECT_REASON }) },
     });
     sendExecResult(execMsg, "writeShellStdinResult", result, sendFrame);
-    return;
-  }
-  if (execCase === "fetchArgs") {
-    const args = execMsg.message.value as any;
-    const fetchUrl = (args.url ?? "") as string;
-    proxyLog("native fetch: %s", fetchUrl.slice(0, 120));
-    (async () => {
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 15_000);
-        const resp = await fetch(fetchUrl, {
-          signal: controller.signal,
-          headers: { "User-Agent": "Mozilla/5.0 (compatible; CursorBot/1.0)" },
-        });
-        clearTimeout(timer);
-        const text = await resp.text();
-        const truncated = text.length > 100_000 ? text.slice(0, 100_000) + "\n[truncated]" : text;
-        const result = create(FetchResultSchema, {
-          result: {
-            case: "success",
-            value: create(FetchSuccessSchema, {
-              url: fetchUrl,
-              content: truncated,
-              statusCode: resp.status,
-              contentType: resp.headers.get("content-type") ?? "",
-            }),
-          },
-        });
-        sendExecResult(execMsg, "fetchResult", result, sendFrame);
-      } catch (e: any) {
-        proxyLog("native fetch FAIL: %s %s", fetchUrl, String(e));
-        const result = create(FetchResultSchema, {
-          result: { case: "error", value: create(FetchErrorSchema, { url: fetchUrl, error: String(e) }) },
-        });
-        sendExecResult(execMsg, "fetchResult", result, sendFrame);
-      }
-    })();
     return;
   }
   if (execCase === "diagnosticsArgs") {
@@ -1996,6 +1760,7 @@ function createBridgeStreamResponse(
                   totalExecCount: state.totalExecCount,
                   toolCallIndex: state.toolCallIndex,
                   accessToken: accessToken || "",
+                  resumeCount,
                 });
 
                 sendSSE(makeChunk({}, "tool_calls"));
@@ -2223,7 +1988,7 @@ function handleToolResultResume(
     );
   }
 
-  proxyLog("resume: carrying forward totalExecs=%d mcpCalls=%d", active.totalExecCount, active.toolCallIndex);
+  proxyLog("resume: carrying forward totalExecs=%d mcpCalls=%d resumeCount=%d", active.totalExecCount, active.toolCallIndex, active.resumeCount);
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     blobStore, mcpTools,
@@ -2231,6 +1996,7 @@ function handleToolResultResume(
     undefined, active.accessToken,
     active.totalExecCount,
     active.toolCallIndex,
+    active.resumeCount,
   );
 }
 
