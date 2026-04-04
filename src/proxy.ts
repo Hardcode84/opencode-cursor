@@ -344,10 +344,18 @@ function frameConnectMessage(data: Uint8Array, flags = 0): Buffer {
   return frame;
 }
 
+interface BridgeFrameHandler {
+  onMessage: (bytes: Uint8Array) => void;
+  onEndStream: (bytes: Uint8Array) => void;
+  afterParse?: () => void;
+}
+
 interface BridgeHandle {
   write: (data: Uint8Array) => void;
   end: () => void;
-  onData: (cb: (chunk: Buffer) => void) => void;
+  /** Swap the parsed-message handler. The underlying frame parser (and its
+   *  buffer) persists across calls — no data is lost on handler replacement. */
+  setHandler: (handler: BridgeFrameHandler) => void;
   onClose: (cb: (code: number) => void) => void;
   readonly alive: boolean;
 }
@@ -372,19 +380,27 @@ function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
   const spanId = randomBytes(8).toString("hex");
   const traceparent = `00-${traceId}-${spanId}-01`;
 
-  const cbs = {
-    data: null as ((chunk: Buffer) => void) | null,
-    close: null as ((code: number) => void) | null,
+  const frameCbs: BridgeFrameHandler = {
+    onMessage: () => {},
+    onEndStream: () => {},
+    afterParse: undefined,
   };
+  const frameParser = createConnectFrameParser(
+    (bytes) => frameCbs.onMessage(bytes),
+    (bytes) => frameCbs.onEndStream(bytes),
+  );
+
+  let closeCb: ((code: number) => void) | null = null;
   let alive = true;
   let closeCode = 0;
+  let handlerReady = false;
   const pendingChunks: Buffer[] = [];
 
   const finish = (code: number) => {
     if (!alive) return;
     alive = false;
     closeCode = code;
-    cbs.close?.(code);
+    closeCb?.(code);
   };
 
   let h2Session: ClientHttp2Session | undefined;
@@ -425,8 +441,9 @@ function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
 
   h2Stream.on("data", (chunk: Buffer | Uint8Array) => {
     const buf = Buffer.from(chunk);
-    if (cbs.data) {
-      cbs.data(buf);
+    if (handlerReady) {
+      frameParser(buf);
+      frameCbs.afterParse?.();
     } else {
       pendingChunks.push(buf);
     }
@@ -452,15 +469,21 @@ function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
       closeTransport();
       finish(0);
     },
-    onData(cb) {
-      cbs.data = cb;
-      while (pendingChunks.length > 0) cb(pendingChunks.shift()!);
+    setHandler(handler) {
+      frameCbs.onMessage = handler.onMessage;
+      frameCbs.onEndStream = handler.onEndStream;
+      frameCbs.afterParse = handler.afterParse;
+      handlerReady = true;
+      while (pendingChunks.length > 0) {
+        frameParser(pendingChunks.shift()!);
+        frameCbs.afterParse?.();
+      }
     },
     onClose(cb) {
       if (!alive) {
         queueMicrotask(() => cb(closeCode));
       } else {
-        cbs.close = cb;
+        closeCb = cb;
       }
     },
   };
@@ -1809,8 +1832,8 @@ function createBridgeStreamResponse(
       };
       resetTimer("thinking");
 
-      const processChunk = createConnectFrameParser(
-        (messageBytes) => {
+      bridge.setHandler({
+        onMessage(messageBytes) {
           resetTimer();
           try {
             const serverMessage = fromBinary(
@@ -1838,9 +1861,6 @@ function createBridgeStreamResponse(
                   }
                 }
               },
-              // onMcpExec — collect tool call, emit SSE chunk.
-              // SSE close is deferred to the onData wrapper so all execs from
-              // a single h2 frame are batched into one tool_calls response.
               (exec) => {
                 proxyLog("mcpExec: tool=%s id=%s args=%d chars", exec.toolName, exec.toolCallId, exec.decodedArgs.length);
                 state.pendingExecs.push(exec);
@@ -1880,7 +1900,7 @@ function createBridgeStreamResponse(
             proxyLog("processChunk error: %s (msgBytes=%d)", String(err), messageBytes.length);
           }
         },
-        (endStreamBytes) => {
+        onEndStream(endStreamBytes) {
           state.endStreamSeen = true;
           const endError = parseConnectEndStream(endStreamBytes);
           if (endError) {
@@ -1909,35 +1929,31 @@ function createBridgeStreamResponse(
             proxyLog("endStream: clean close (execs=%d mcpCalls=%d)", state.totalExecCount, state.toolCallIndex);
           }
         },
-      );
+        afterParse() {
+          if (state.pendingExecs.length > 0 && !closed) {
+            const flushed = tagFilter.flush();
+            if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+            if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
 
-      bridge.onData((chunk) => {
-        processChunk(chunk);
-        // After all messages from this h2 data frame are parsed,
-        // if mcpExecs accumulated, flush them as a single SSE tool_calls batch.
-        if (state.pendingExecs.length > 0 && !closed) {
-          const flushed = tagFilter.flush();
-          if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-          if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+            clearBridgeInactivityTimer(bridgeKey);
+            activeBridges.set(bridgeKey, {
+              bridge,
+              heartbeatTimer,
+              blobStore,
+              mcpTools,
+              pendingExecs: state.pendingExecs,
+              convKey,
+              totalExecCount: state.totalExecCount,
+              toolCallIndex: state.toolCallIndex,
+              accessToken: accessToken || "",
+              resumeCount,
+            });
 
-          clearBridgeInactivityTimer(bridgeKey);
-          activeBridges.set(bridgeKey, {
-            bridge,
-            heartbeatTimer,
-            blobStore,
-            mcpTools,
-            pendingExecs: state.pendingExecs,
-            convKey,
-            totalExecCount: state.totalExecCount,
-            toolCallIndex: state.toolCallIndex,
-            accessToken: accessToken || "",
-            resumeCount,
-          });
-
-          sendSSE(makeChunk({}, "tool_calls"));
-          sendDone();
-          closeController();
-        }
+            sendSSE(makeChunk({}, "tool_calls"));
+            sendDone();
+            closeController();
+          }
+        },
       });
 
       bridge.onClose((code) => {
@@ -2370,8 +2386,8 @@ async function collectFullResponse(
   const nonStreamBridgeKey = `nonstream-${crypto.randomUUID().slice(0, 8)}`;
   setBridgeInactivityTimer(nonStreamBridgeKey, bridge, heartbeatTimer, () => {});
 
-  const processChunk = createConnectFrameParser(
-    (messageBytes) => {
+  bridge.setHandler({
+    onMessage(messageBytes) {
       try {
         const serverMessage = fromBinary(
           AgentServerMessageSchema,
@@ -2404,10 +2420,8 @@ async function collectFullResponse(
         // Skip
       }
     },
-    () => {},
-  );
-
-  bridge.onData(processChunk);
+    onEndStream() {},
+  });
 
   bridge.onClose(() => {
     clearBridgeInactivityTimer(nonStreamBridgeKey);
