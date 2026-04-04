@@ -1675,10 +1675,11 @@ function createBridgeStreamResponse(
       const resetTimer = (phase?: "thinking" | "streaming") => {
         if (phase) timerPhase = phase;
         setBridgeInactivityTimer(bridgeKey, bridge, heartbeatTimer, () => {
-          const timeoutMs = timerPhase === "thinking" ? THINKING_TIMEOUT_MS : STREAMING_TIMEOUT_MS;
+          const timeoutSec = (timerPhase === "thinking" ? THINKING_TIMEOUT_MS : STREAMING_TIMEOUT_MS) / 1000;
           const stored = conversationStates.get(convKey);
           if (accessToken && stored?.checkpoint && resumeCount < MAX_AUTO_RESUMES) {
             proxyLog("TIMEOUT after %d execs (%d MCP calls) — auto-resuming via ResumeAction (attempt %d/%d)", state.totalExecCount, state.toolCallIndex, resumeCount + 1, MAX_AUTO_RESUMES);
+            sendSSE(makeChunk({ content: `\n[Cursor server timed out after ${timeoutSec}s — auto-resuming (attempt ${resumeCount + 1}/${MAX_AUTO_RESUMES})]\n` }));
             autoResumeRetry = () => {
               const resumePayload = buildResumeRequest(
                 modelId, stored.conversationId, stored.checkpoint,
@@ -1688,7 +1689,7 @@ function createBridgeStreamResponse(
             };
             return;
           }
-          sendSSE(makeChunk({ content: `\n[Error: Cursor server did not respond for ${timeoutMs / 1000}s — request timed out. Please retry.]` }));
+          sendSSE(makeChunk({ content: `\n[Error: Cursor server did not respond for ${timeoutSec}s — request timed out. Please retry.]` }));
           sendDone();
           closeController();
         }, timerPhase);
@@ -1725,47 +1726,56 @@ function createBridgeStreamResponse(
                 }
               },
               // onMcpExec — the model wants to execute a tool.
+              // Multiple mcpExecs can arrive in quick succession. The first one
+              // closes the SSE stream; subsequent ones accumulate in pendingExecs
+              // and are re-emitted as tool_calls in the next SSE response cycle
+              // (see handleToolResultResume).
               (exec) => {
                 proxyLog("mcpExec: tool=%s id=%s args=%d chars", exec.toolName, exec.toolCallId, exec.decodedArgs.length);
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
 
-                const flushed = tagFilter.flush();
-                if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-                if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+                if (!closed) {
+                  const flushed = tagFilter.flush();
+                  if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+                  if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
 
-                const toolCallIndex = state.toolCallIndex++;
-                sendSSE(makeChunk({
-                  tool_calls: [{
-                    index: toolCallIndex,
-                    id: exec.toolCallId,
-                    type: "function",
-                    function: {
-                      name: exec.toolName,
-                      arguments: exec.decodedArgs,
-                    },
-                  }],
-                }));
+                  const toolCallIndex = state.toolCallIndex++;
+                  sendSSE(makeChunk({
+                    tool_calls: [{
+                      index: toolCallIndex,
+                      id: exec.toolCallId,
+                      type: "function",
+                      function: {
+                        name: exec.toolName,
+                        arguments: exec.decodedArgs,
+                      },
+                    }],
+                  }));
 
-                // Keep the bridge alive for tool result continuation.
-                // Pause the inactivity timer — OpenCode is running the tool.
-                clearBridgeInactivityTimer(bridgeKey);
-                activeBridges.set(bridgeKey, {
-                  bridge,
-                  heartbeatTimer,
-                  blobStore,
-                  mcpTools,
-                  pendingExecs: state.pendingExecs,
-                  convKey,
-                  totalExecCount: state.totalExecCount,
-                  toolCallIndex: state.toolCallIndex,
-                  accessToken: accessToken || "",
-                  resumeCount,
-                });
+                  clearBridgeInactivityTimer(bridgeKey);
+                  activeBridges.set(bridgeKey, {
+                    bridge,
+                    heartbeatTimer,
+                    blobStore,
+                    mcpTools,
+                    pendingExecs: state.pendingExecs,
+                    convKey,
+                    totalExecCount: state.totalExecCount,
+                    toolCallIndex: state.toolCallIndex,
+                    accessToken: accessToken || "",
+                    resumeCount,
+                  });
 
-                sendSSE(makeChunk({}, "tool_calls"));
-                sendDone();
-                closeController();
+                  sendSSE(makeChunk({}, "tool_calls"));
+                  sendDone();
+                  closeController();
+                } else {
+                  // SSE already closed — just accumulate. activeBridges already
+                  // references state.pendingExecs (same array), so the entry
+                  // is automatically up to date.
+                  proxyLog("mcpExec: queued (SSE closed), pending=%d", state.pendingExecs.length);
+                }
               },
               (checkpointBytes) => {
                 const stored = conversationStates.get(convKey);
@@ -1931,7 +1941,45 @@ function handleStreamingResponse(
   );
 }
 
-/** Resume a paused bridge by sending MCP results and continuing to stream. */
+/** Send a single mcpResult (success) on the bridge for a matched exec. */
+function sendMcpResultSuccess(bridge: BridgeHandle, exec: PendingExec, content: string): void {
+  const mcpResult = create(McpResultSchema, {
+    result: {
+      case: "success",
+      value: create(McpSuccessSchema, {
+        content: [
+          create(McpToolResultContentItemSchema, {
+            content: {
+              case: "text",
+              value: create(McpTextContentSchema, { text: content }),
+            },
+          }),
+        ],
+        isError: false,
+      }),
+    },
+  });
+
+  const execClientMessage = create(ExecClientMessageSchema, {
+    id: exec.execMsgId,
+    execId: exec.execId,
+    message: { case: "mcpResult" as any, value: mcpResult as any },
+  });
+
+  bridge.write(
+    frameConnectMessage(
+      toBinary(AgentClientMessageSchema,
+        create(AgentClientMessageSchema, {
+          message: { case: "execClientMessage", value: execClientMessage },
+        }),
+      ),
+    ),
+  );
+}
+
+/** Resume a paused bridge by sending MCP results and continuing to stream.
+ *  Execs without a matching tool result are re-emitted as tool_calls in
+ *  the returned SSE response so OpenCode can execute them next cycle. */
 function handleToolResultResume(
   active: ActiveBridge,
   toolResults: ToolResultInfo[],
@@ -1941,50 +1989,23 @@ function handleToolResultResume(
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
 
-  // Send mcpResult for each pending exec that has a matching tool result
+  const unmatched: PendingExec[] = [];
   for (const exec of pendingExecs) {
-    const result = toolResults.find(
-      (r) => r.toolCallId === exec.toolCallId,
-    );
-    const mcpResult = result
-      ? create(McpResultSchema, {
-          result: {
-            case: "success",
-            value: create(McpSuccessSchema, {
-              content: [
-                create(McpToolResultContentItemSchema, {
-                  content: {
-                    case: "text",
-                    value: create(McpTextContentSchema, { text: result.content }),
-                  },
-                }),
-              ],
-              isError: false,
-            }),
-          },
-        })
-      : create(McpResultSchema, {
-          result: {
-            case: "error",
-            value: create(McpErrorSchema, { error: "Tool result not provided" }),
-          },
-        });
+    const result = toolResults.find((r) => r.toolCallId === exec.toolCallId);
+    if (result) {
+      sendMcpResultSuccess(bridge, exec, result.content);
+    } else {
+      unmatched.push(exec);
+    }
+  }
 
-    const execClientMessage = create(ExecClientMessageSchema, {
-      id: exec.execMsgId,
-      execId: exec.execId,
-      message: {
-        case: "mcpResult" as any,
-        value: mcpResult as any,
-      },
-    });
-
-    const clientMessage = create(AgentClientMessageSchema, {
-      message: { case: "execClientMessage", value: execClientMessage },
-    });
-
-    bridge.write(
-      frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)),
+  if (unmatched.length > 0) {
+    proxyLog("resume: %d matched, %d unmatched — re-emitting unmatched as tool_calls",
+      pendingExecs.length - unmatched.length, unmatched.length);
+    return emitPendingToolCalls(
+      bridge, heartbeatTimer, blobStore, mcpTools, unmatched,
+      modelId, bridgeKey, convKey, active.accessToken,
+      active.totalExecCount, active.toolCallIndex, active.resumeCount,
     );
   }
 
@@ -1998,6 +2019,62 @@ function handleToolResultResume(
     active.toolCallIndex,
     active.resumeCount,
   );
+}
+
+/** Create an SSE response that immediately emits queued tool_calls, then closes.
+ *  The bridge stays alive — server is still waiting for mcpResults for these execs. */
+function emitPendingToolCalls(
+  bridge: BridgeHandle,
+  heartbeatTimer: NodeJS.Timeout,
+  blobStore: Map<string, Uint8Array>,
+  mcpTools: McpToolDefinition[],
+  pending: PendingExec[],
+  modelId: string,
+  bridgeKey: string,
+  convKey: string,
+  accessToken: string,
+  totalExecCount: number,
+  toolCallIndex: number,
+  resumeCount: number,
+): Response {
+  const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
+  const created = Math.floor(Date.now() / 1000);
+  const encoder = new TextEncoder();
+
+  const makeChunk = (delta: Record<string, unknown>, finishReason: string | null = null) => ({
+    id: completionId, object: "chat.completion.chunk", created, model: modelId,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  });
+
+  const chunks: string[] = [];
+  for (let i = 0; i < pending.length; i++) {
+    const exec = pending[i]!;
+    chunks.push(`data: ${JSON.stringify(makeChunk({
+      tool_calls: [{
+        index: toolCallIndex + i,
+        id: exec.toolCallId,
+        type: "function",
+        function: { name: exec.toolName, arguments: exec.decodedArgs },
+      }],
+    }))}\n\n`);
+  }
+  chunks.push(`data: ${JSON.stringify(makeChunk({}, "tool_calls"))}\n\n`);
+  chunks.push("data: [DONE]\n\n");
+
+  const newToolCallIndex = toolCallIndex + pending.length;
+
+  clearBridgeInactivityTimer(bridgeKey);
+  activeBridges.set(bridgeKey, {
+    bridge, heartbeatTimer, blobStore, mcpTools,
+    pendingExecs: pending,
+    convKey, totalExecCount,
+    toolCallIndex: newToolCallIndex,
+    accessToken,
+    resumeCount,
+  });
+
+  const body = encoder.encode(chunks.join(""));
+  return new Response(body, { headers: SSE_HEADERS });
 }
 
 async function handleNonStreamingResponse(
