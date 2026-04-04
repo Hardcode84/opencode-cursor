@@ -20,7 +20,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "bundle": "bun build src/index.ts --outfile dist/index.js --target bun --external @opencode-ai/plugin && bun build src/sdk-wrapper.ts --outfile dist/sdk-wrapper.js --target bun",
-    "deploy": "bun run bundle && rm -rf \"$HOME/.config/opencode/node_modules/opencode-cursor-oauth\" && mkdir -p \"$HOME/.config/opencode/node_modules/opencode-cursor-oauth/dist\" && cp package.json \"$HOME/.config/opencode/node_modules/opencode-cursor-oauth/\" && cp dist/index.js dist/sdk-wrapper.js \"$HOME/.config/opencode/node_modules/opencode-cursor-oauth/dist/\"",
+    "deploy": "bun run bundle && mkdir -p \"$HOME/.config/opencode/plugins\" && cp dist/index.js \"$HOME/.config/opencode/plugins/opencode-cursor-oauth.js\" && cp dist/sdk-wrapper.js \"$HOME/.config/opencode/plugins/opencode-cursor-sdk.js\"",
     "test": "bun test/smoke.ts",
     "prepublishOnly": "npm run build"
   },
@@ -32,6 +32,7 @@
   "bugs": {
     "url": "https://github.com/ephraimduncan/opencode-cursor/issues"
   },
+  "oc-plugin": ["server"],
   "keywords": [
     "opencode",
     "opencode-plugin",

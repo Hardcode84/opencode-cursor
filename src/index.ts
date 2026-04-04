@@ -17,7 +17,7 @@ import {
 import { getCursorModels, type CursorModel } from "./models";
 import { startProxy } from "./proxy";
 
-const SDK_WRAPPER_PATH = `file://${resolve(dirname(fileURLToPath(import.meta.url)), "sdk-wrapper.js")}`;
+const SDK_WRAPPER_PATH = `file://${resolve(dirname(fileURLToPath(import.meta.url)), "opencode-cursor-sdk.js")}`;
 
 const CURSOR_PROVIDER_ID = "cursor";
 
@@ -293,3 +293,4 @@ function estimateModelCost(modelId: string): ModelCost {
 }
 
 export default CursorAuthPlugin;
+export const server = CursorAuthPlugin;
