@@ -1499,8 +1499,12 @@ function nativeToMcpRedirect(execCase: string, execMsg: ExecServerMessage): Nati
     };
   }
   if (execCase === "grepArgs") {
-    const mcpArgs: Record<string, any> = { pattern: args.regex ?? args.query ?? "" };
+    const mcpArgs: Record<string, any> = { pattern: args.pattern ?? "" };
     if (args.path) mcpArgs.path = args.path;
+    if (args.glob) mcpArgs.glob = args.glob;
+    if (args.outputMode) mcpArgs.output_mode = args.outputMode;
+    if (args.contextBefore != null) mcpArgs["-B"] = args.contextBefore;
+    if (args.contextAfter != null) mcpArgs["-A"] = args.contextAfter;
     return {
       toolCallId,
       toolName: "grep",
