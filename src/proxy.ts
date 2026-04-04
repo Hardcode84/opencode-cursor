@@ -57,6 +57,12 @@ import {
   SetBlobResultSchema,
   ShellRejectedSchema,
   ShellResultSchema,
+  ShellSuccessSchema,
+  ShellStreamSchema,
+  ShellStreamStartSchema,
+  ShellStreamStdoutSchema,
+  ShellStreamStderrSchema,
+  ShellStreamExitSchema,
   ResumeActionSchema,
   UserMessageActionSchema,
   UserMessageSchema,
@@ -154,7 +160,7 @@ interface CursorRequestPayload {
 }
 
 /** Native exec types we redirect through MCP instead of rejecting. */
-type NativeResultType = "readResult" | "writeResult" | "deleteResult" | "fetchResult";
+type NativeResultType = "readResult" | "writeResult" | "deleteResult" | "fetchResult" | "shellResult" | "shellStreamResult" | "lsResult" | "grepResult";
 
 /** A pending tool execution waiting for results from the caller. */
 interface PendingExec {
@@ -1469,6 +1475,40 @@ function nativeToMcpRedirect(execCase: string, execMsg: ExecServerMessage): Nati
       nativeArgs: { url: args.url },
     };
   }
+  if (execCase === "shellArgs" || execCase === "shellStreamArgs") {
+    const cmd = args.command ?? "";
+    const cwd = args.workingDirectory || undefined;
+    const mcpArgs: Record<string, any> = { command: cmd, description: args.description || "Execute command" };
+    if (cwd) mcpArgs.working_directory = cwd;
+    if (args.timeout != null && args.timeout > 0) mcpArgs.timeout = args.timeout;
+    return {
+      toolCallId,
+      toolName: "bash",
+      decodedArgs: JSON.stringify(mcpArgs),
+      nativeResultType: execCase === "shellStreamArgs" ? "shellStreamResult" : "shellResult",
+      nativeArgs: { command: cmd },
+    };
+  }
+  if (execCase === "lsArgs") {
+    return {
+      toolCallId,
+      toolName: "glob",
+      decodedArgs: JSON.stringify({ pattern: "*", path: args.path }),
+      nativeResultType: "lsResult",
+      nativeArgs: { path: args.path },
+    };
+  }
+  if (execCase === "grepArgs") {
+    const mcpArgs: Record<string, any> = { pattern: args.regex ?? args.query ?? "" };
+    if (args.path) mcpArgs.path = args.path;
+    return {
+      toolCallId,
+      toolName: "grep",
+      decodedArgs: JSON.stringify(mcpArgs),
+      nativeResultType: "grepResult",
+      nativeArgs: {},
+    };
+  }
   return null;
 }
 
@@ -1544,39 +1584,7 @@ function handleExecMessage(
   proxyLog("reject native exec: %s (id=%d)", execCase, execMsg.id);
   const REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
 
-  if (execCase === "lsArgs") {
-    const args = execMsg.message.value;
-    const result = create(LsResultSchema, {
-      result: { case: "rejected", value: create(LsRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
-    });
-    sendExecResult(execMsg, "lsResult", result, sendFrame);
-    return;
-  }
-
-  if (execCase === "shellArgs" || execCase === "shellStreamArgs") {
-    const args = execMsg.message.value;
-    const result = create(ShellResultSchema, {
-      result: {
-        case: "rejected",
-        value: create(ShellRejectedSchema, {
-          command: args.command ?? "",
-          workingDirectory: args.workingDirectory ?? "",
-          reason: REJECT_REASON,
-          isReadonly: false,
-        }),
-      },
-    });
-    sendExecResult(execMsg, "shellResult", result, sendFrame);
-    return;
-  }
-
-  if (execCase === "grepArgs") {
-    const result = create(GrepResultSchema, {
-      result: { case: "error", value: create(GrepErrorSchema, { error: REJECT_REASON }) },
-    });
-    sendExecResult(execMsg, "grepResult", result, sendFrame);
-    return;
-  }
+  // lsArgs, shellArgs, shellStreamArgs, grepArgs are now redirected above
 
   if (execCase === "backgroundShellSpawnArgs") {
     const args = execMsg.message.value;
@@ -2194,6 +2202,47 @@ function sendNativeResult(bridge: BridgeHandle, exec: PendingExec, content: stri
       });
       resultCase = "fetchResult";
       break;
+    }
+    case "shellResult": {
+      resultValue = create(ShellResultSchema, {
+        result: {
+          case: "success",
+          value: create(ShellSuccessSchema, {
+            command: args.command ?? "",
+            workingDirectory: "",
+            exitCode: 0,
+            signal: "",
+            stdout: content,
+            stderr: "",
+          }),
+        },
+      });
+      resultCase = "shellResult";
+      break;
+    }
+    case "shellStreamResult": {
+      const sendStreamEvent = (event: any) => {
+        const msg = create(ExecClientMessageSchema, {
+          id: exec.execMsgId,
+          execId: exec.execId,
+          message: { case: "shellStream" as any, value: create(ShellStreamSchema, { event }) as any },
+        });
+        bridge.write(
+          frameConnectMessage(
+            toBinary(AgentClientMessageSchema,
+              create(AgentClientMessageSchema, {
+                message: { case: "execClientMessage", value: msg },
+              }),
+            ),
+          ),
+        );
+      };
+      sendStreamEvent({ case: "start", value: create(ShellStreamStartSchema, {}) });
+      if (content) {
+        sendStreamEvent({ case: "stdout", value: create(ShellStreamStdoutSchema, { data: content }) });
+      }
+      sendStreamEvent({ case: "exit", value: create(ShellStreamExitSchema, { code: 0 }) });
+      return;
     }
     default:
       proxyLog("sendNativeResult: unknown type %s, falling back to MCP", exec.nativeResultType);

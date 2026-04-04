@@ -28,11 +28,14 @@ const CURSOR_PROVIDER_ID = "cursor";
 export const CursorAuthPlugin: Plugin = async (
   input: PluginInput,
 ): Promise<Hooks> => {
+  let proxyPort: number | null = null;
+  let cursorModelList: CursorModel[] | null = null;
+
   return {
     auth: {
       provider: CURSOR_PROVIDER_ID,
 
-      async loader(getAuth, provider) {
+      async loader(getAuth) {
         const auth = await getAuth();
         if (!auth || auth.type !== "oauth") return {};
 
@@ -77,9 +80,8 @@ export const CursorAuthPlugin: Plugin = async (
           return currentAuth.access;
         }, models);
 
-        if (provider) {
-          (provider as any).models = buildCursorProviderModels(models, port);
-        }
+        proxyPort = port;
+        cursorModelList = models;
 
         return {
           baseURL: `http://localhost:${port}/v1`,
@@ -141,7 +143,15 @@ export const CursorAuthPlugin: Plugin = async (
         },
       ],
     },
-  };
+
+    provider: {
+      id: CURSOR_PROVIDER_ID,
+      async models() {
+        if (!proxyPort || !cursorModelList) return {};
+        return buildCursorProviderModels(cursorModelList, proxyPort);
+      },
+    },
+  } as Hooks;
 };
 
 function buildCursorProviderModels(
