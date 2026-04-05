@@ -1078,6 +1078,40 @@ function decodeMcpArgsMap(args: Record<string, Uint8Array>): Record<string, unkn
   return decoded;
 }
 
+/** Fix common argument name mismatches between Cursor native tools and OpenCode MCP tools.
+ *  Cursor's model sometimes uses native arg names (e.g. `path`) instead of
+ *  the MCP schema names (e.g. `filePath`). Mutates `args` in place. */
+function fixMcpArgNames(toolName: string, args: Record<string, unknown>): void {
+  if (toolName === "read") {
+    if (args.filePath == null && args.path != null) {
+      args.filePath = args.path;
+      delete args.path;
+    }
+  } else if (toolName === "write" || toolName === "edit") {
+    if (args.filePath == null && args.path != null) {
+      args.filePath = args.path;
+      delete args.path;
+    }
+    if (toolName === "write" && args.content == null && args.file_content != null) {
+      args.content = args.file_content;
+      delete args.file_content;
+    }
+  } else if (toolName === "glob") {
+    if (args.pattern == null && args.glob_pattern != null) {
+      args.pattern = args.glob_pattern;
+      delete args.glob_pattern;
+    }
+    if (args.path == null && args.target_directory != null) {
+      args.path = args.target_directory;
+      delete args.target_directory;
+    }
+  } else if (toolName === "grep") {
+    if (args.pattern == null) {
+      args.pattern = ".";
+    }
+  }
+}
+
 function buildCursorRequest(
   modelId: string,
   systemPrompt: string,
@@ -1749,9 +1783,7 @@ function handleExecMessage(
     const mcpArgs = execMsg.message.value;
     const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
     const resolvedToolName = mcpArgs.toolName || mcpArgs.name;
-    if (/grep/i.test(resolvedToolName) && !decoded.pattern) {
-      console.error(`[proxy] mcpArgs grep: missing pattern (tool=%s keys=%s)`, resolvedToolName, Object.keys(decoded).join(","));
-    }
+    fixMcpArgNames(resolvedToolName, decoded);
     onMcpExec({
       execId: execMsg.execId,
       execMsgId: execMsg.id,
