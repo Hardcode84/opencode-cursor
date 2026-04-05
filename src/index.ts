@@ -15,6 +15,7 @@ import {
   refreshCursorToken,
 } from "./auth";
 import { getCursorModels, type CursorModel } from "./models";
+import { configureLogger } from "./logger";
 import { startProxy } from "./proxy";
 
 const SDK_WRAPPER_PATH = `file://${resolve(dirname(fileURLToPath(import.meta.url)), "opencode-cursor-sdk.js")}`;
@@ -28,6 +29,7 @@ const CURSOR_PROVIDER_ID = "cursor";
 export const CursorAuthPlugin: Plugin = async (
   input: PluginInput,
 ): Promise<Hooks> => {
+  configureLogger(input);
   let proxyPort: number | null = null;
   let cursorModelList: CursorModel[] | null = null;
 

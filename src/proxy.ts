@@ -92,6 +92,7 @@ import {
   type KvServerMessage,
   type McpToolDefinition,
 } from "./proto/agent_pb";
+import { logDebug, logInfo, logWarn, logError, errorDetails } from "./logger";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -104,11 +105,10 @@ import { connect as h2Connect, type ClientHttp2Session, type ClientHttp2Stream }
 
 const CURSOR_CLIENT_VERSION = "cli-2026.03.30-a5d3e17";
 
-const DEBUG = process.env.CURSOR_PROXY_DEBUG === "1";
 function proxyLog(msg: string, ...args: unknown[]): void {
-  if (!DEBUG) return;
-  const ts = new Date().toISOString().slice(11, 23);
-  console.error(`[proxy ${ts}] ${msg}`, ...args);
+  let i = 0;
+  const formatted = msg.replace(/%[sdj]/g, () => String(args[i++] ?? ""));
+  logDebug(formatted);
 }
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
@@ -218,7 +218,7 @@ function setBridgeInactivityTimer(
   const timeoutMs = phase === "thinking" ? THINKING_TIMEOUT_MS : STREAMING_TIMEOUT_MS;
   clearBridgeInactivityTimer(bridgeKey);
   bridgeInactivityTimers.set(bridgeKey, setTimeout(() => {
-    proxyLog("TIMEOUT [%s]: no data for %ds (phase=%s)", bridgeKey.slice(0, 8), timeoutMs / 1000, phase);
+    logWarn("inactivity timeout", { bridgeKey: bridgeKey.slice(0, 8), timeoutSec: timeoutMs / 1000, phase });
     bridgeInactivityTimers.delete(bridgeKey);
     const keepAlive = onTimeout();
     if (keepAlive) return;
@@ -424,7 +424,7 @@ function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
   h2Session = h2Connect(connectUrl);
 
   h2Session.on("error", (err) => {
-    proxyLog("bridge: h2 session error: %s", err?.message ?? err);
+    logError("bridge: h2 session error", { error: err?.message ?? err });
     closeTransport();
     finish(1);
   });
@@ -463,7 +463,7 @@ function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
     finish(0);
   });
   h2Stream.on("error", (err) => {
-    proxyLog("bridge: stream error: %s", err?.message ?? err);
+    logError("bridge: stream error", { error: err?.message ?? err });
     closeTransport();
     finish(1);
   });
@@ -632,6 +632,7 @@ export async function startProxy(
           const agentKey = req.headers.get("x-opencode-agent") ?? undefined;
           return handleChatCompletion(body, accessToken, sessionId, agentKey);
         } catch (err) {
+          logError("chat completion failed", errorDetails(err));
           const message = err instanceof Error ? err.message : String(err);
           return new Response(
             JSON.stringify({
@@ -751,7 +752,7 @@ async function handleTitleGenerationRequest(
     title = deriveFallbackTitle(sourceText);
   }
   title = title || "Untitled Session";
-  proxyLog("title: %s", title);
+  logInfo("title generated", { title });
 
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -792,7 +793,7 @@ function handleChatCompletion(
   if (detectTitleRequest(body)) {
     const sourceText = buildTitleSourceText(body.messages);
     if (sourceText) {
-      proxyLog("title request detected, source=%d chars", sourceText.length);
+      logInfo("title request detected", { sourceLen: sourceText.length });
       return handleTitleGenerationRequest(sourceText, accessToken, body.model, body.stream !== false);
     }
   }
@@ -874,16 +875,18 @@ function handleChatCompletion(
   payload.mcpTools = mcpTools;
 
   const turnsChars = turns.reduce((s, t) => s + t.userText.length + t.assistantText.length, 0);
-  proxyLog("request: model=%s stream=%s tools=%d userText=%d chars checkpoint=%s msgs=%d turns=%d turnsChars=%d blobs=%d",
-    modelId, body.stream !== false, tools.length, effectiveUserText.length, !!stored.checkpoint,
-    body.messages.length, turns.length, turnsChars, stored.blobStore.size);
+  logInfo("chat completion request", {
+    model: modelId, stream: body.stream !== false, tools: tools.length,
+    userTextLen: effectiveUserText.length, hasCheckpoint: !!stored.checkpoint,
+    messages: body.messages.length, turns: turns.length, turnsChars, blobs: stored.blobStore.size,
+  });
 
   if (body.stream === false) {
     return handleNonStreamingResponse(payload, accessToken, modelId, convKey);
   }
 
   return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, () => {
-    proxyLog("Blob not found — soft retry: nulling checkpoint, keeping conversationId + blobStore");
+    logWarn("blob not found — soft retry: nulling checkpoint", { convKey });
     const stored2 = resolveConversationState(convKey);
     stored2.checkpoint = null;
     persistConversation(convKey, stored2);
@@ -895,7 +898,7 @@ function handleChatCompletion(
     proxyLog("soft retry: turns=%d turnsChars=%d blobs=%d",
       turns.length, turnsChars, stored2.blobStore.size);
     return handleStreamingResponse(softPayload, accessToken, modelId, bridgeKey, convKey, () => {
-      proxyLog("Blob not found again — hard retry: full invalidation");
+      logWarn("blob not found again — hard retry: full invalidation", { convKey });
       invalidateConversationState(convKey);
       const fresh = resolveConversationState(convKey);
       const hardPayload = buildCursorRequest(
@@ -1872,11 +1875,11 @@ function sendUnknownExecResult(
     (f) => f.wireType === 2 && f.no !== 1 && f.no !== 15 && f.no !== 19,
   );
   if (!argsField) {
-    proxyLog("UNHANDLED exec: case=%s id=%d (no recoverable field number)", execMsg.message.case, execMsg.id);
+    logWarn("unhandled exec: no recoverable field number", { case: execMsg.message.case, id: execMsg.id });
     return;
   }
   const resultFieldNo = argsField.no;
-  proxyLog("UNHANDLED exec: field=%d id=%d — sending empty result", resultFieldNo, execMsg.id);
+  logWarn("unhandled exec: sending empty result", { field: resultFieldNo, id: execMsg.id });
   const execClientMsg = create(ExecClientMessageSchema, {
     id: execMsg.id,
     execId: execMsg.execId,
@@ -2042,14 +2045,14 @@ function createBridgeStreamResponse(
         if (phase) timerPhase = phase;
         setBridgeInactivityTimer(bridgeKey, bridge, heartbeatTimer, () => {
           if (state.pendingExecs.length > 0 && !closed) {
-            proxyLog("TIMEOUT: flushing %d pending execs after silence", state.pendingExecs.length);
+            logWarn("timeout: flushing pending execs after silence", { pending: state.pendingExecs.length });
             flushPendingExecs();
             return true;
           }
           const timeoutSec = (timerPhase === "thinking" ? THINKING_TIMEOUT_MS : STREAMING_TIMEOUT_MS) / 1000;
           const stored = conversationStates.get(convKey);
           if (accessToken && stored?.checkpoint && resumeCount < MAX_AUTO_RESUMES) {
-            proxyLog("TIMEOUT after %d execs (%d MCP calls) — auto-resuming via ResumeAction (attempt %d/%d)", state.totalExecCount, state.toolCallIndex, resumeCount + 1, MAX_AUTO_RESUMES);
+            logWarn("timeout — auto-resuming", { execs: state.totalExecCount, mcpCalls: state.toolCallIndex, attempt: resumeCount + 1, max: MAX_AUTO_RESUMES });
             sendSSE(makeChunk({ content: `\n[Cursor server timed out after ${timeoutSec}s — auto-resuming (attempt ${resumeCount + 1}/${MAX_AUTO_RESUMES})]\n` }));
             autoResumeRetry = () => {
               const resumePayload = buildResumeRequest(
@@ -2136,16 +2139,16 @@ function createBridgeStreamResponse(
               },
             );
           } catch (err) {
-            proxyLog("processChunk error: %s (msgBytes=%d)", String(err), messageBytes.length);
+            logError("processChunk error", { error: String(err), msgBytes: messageBytes.length });
           }
         },
         onEndStream(endStreamBytes) {
           state.endStreamSeen = true;
           const endError = parseConnectEndStream(endStreamBytes);
           if (endError) {
-            proxyLog("endStream ERROR: %s", endError.message);
+            logError("endStream error", { error: endError.message });
             if (onBlobNotFound && /blob not found/i.test(endError.message)) {
-              proxyLog("Blob not found — killing bridge, will retry with fresh state");
+              logWarn("blob not found in stream — killing bridge for retry");
               clearInterval(heartbeatTimer);
               bridge.end();
               blobNotFoundRetry = onBlobNotFound;
@@ -2153,7 +2156,7 @@ function createBridgeStreamResponse(
             }
             const stored = conversationStates.get(convKey);
             if (/resource_exhausted/i.test(endError.message) && accessToken && stored?.checkpoint && resumeCount < MAX_AUTO_RESUMES) {
-              proxyLog("resource_exhausted with checkpoint — will auto-resume (attempt %d/%d)", resumeCount + 1, MAX_AUTO_RESUMES);
+              logWarn("resource_exhausted — will auto-resume", { attempt: resumeCount + 1, max: MAX_AUTO_RESUMES });
               autoResumeRetry = () => {
                 const resumePayload = buildResumeRequest(
                   modelId, stored.conversationId, stored.checkpoint,
@@ -2225,7 +2228,7 @@ function createBridgeStreamResponse(
 
         // Connection lost unexpectedly — could we resume?
         if (code !== 0 && !state.endStreamSeen && hasCheckpoint && accessToken) {
-          proxyLog("bridge.onClose → connection lost (code=%d), could resume but NOT IMPLEMENTED YET", code);
+          logWarn("bridge.onClose → connection lost, resume not implemented", { code });
         }
 
         if (stored) {
