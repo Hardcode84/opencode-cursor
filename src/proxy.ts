@@ -799,7 +799,7 @@ function handleChatCompletion(
 
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
-  const tools = body.tools ?? [];
+  const tools = selectToolsForChoice(body.tools ?? [], body.tool_choice);
 
   if (!userText && toolResults.length === 0) {
     return new Response(
@@ -1019,6 +1019,22 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   }
 
   return { systemPrompt, userText: lastUserText, turns: pairs, toolResults };
+}
+
+/** Filter tools according to OpenAI tool_choice semantics. */
+function selectToolsForChoice(tools: OpenAIToolDef[], toolChoice: unknown): OpenAIToolDef[] {
+  if (!tools.length) return [];
+  if (toolChoice === undefined || toolChoice === null || toolChoice === "auto" || toolChoice === "required") {
+    return tools;
+  }
+  if (toolChoice === "none") return [];
+  if (typeof toolChoice === "object" && toolChoice !== null) {
+    const choice = toolChoice as { type?: unknown; function?: { name?: unknown } };
+    if (choice.type === "function" && typeof choice.function?.name === "string") {
+      return tools.filter(t => t.function.name === choice.function!.name);
+    }
+  }
+  return tools;
 }
 
 /** Convert OpenAI tool definitions to Cursor's MCP tool protobuf format. */
