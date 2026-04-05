@@ -1517,7 +1517,7 @@ function nativeToMcpRedirect(execCase: string, execMsg: ExecServerMessage): Nati
     return {
       toolCallId,
       toolName: "glob",
-      decodedArgs: JSON.stringify({ glob_pattern: "*", target_directory: args.path }),
+      decodedArgs: JSON.stringify({ pattern: "*", path: args.path }),
       nativeResultType: "lsResult",
       nativeArgs: { path: args.path },
     };
@@ -1529,7 +1529,7 @@ function nativeToMcpRedirect(execCase: string, execMsg: ExecServerMessage): Nati
       return {
         toolCallId,
         toolName: "glob",
-        decodedArgs: JSON.stringify({ glob_pattern: args.glob, target_directory: args.path || undefined }),
+        decodedArgs: JSON.stringify({ pattern: args.glob, path: args.path || undefined }),
         nativeResultType: "grepResult",
         nativeArgs: {},
       };
