@@ -628,7 +628,9 @@ export async function startProxy(
             throw new Error("Cursor proxy access token provider not configured");
           }
           const accessToken = await proxyAccessTokenProvider();
-          return handleChatCompletion(body, accessToken);
+          const sessionId = req.headers.get("x-session-id") ?? undefined;
+          const agentKey = req.headers.get("x-opencode-agent") ?? undefined;
+          return handleChatCompletion(body, accessToken, sessionId, agentKey);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           return new Response(
@@ -784,6 +786,8 @@ async function handleTitleGenerationRequest(
 function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
+  sessionId?: string,
+  agentKey?: string,
 ): Response | Promise<Response> {
   if (detectTitleRequest(body)) {
     const sourceText = buildTitleSourceText(body.messages);
@@ -811,8 +815,8 @@ function handleChatCompletion(
 
   // bridgeKey: model-specific, for active tool-call bridges
   // convKey: model-independent, for conversation state that survives model switches
-  const bridgeKey = deriveBridgeKey(modelId, body.messages);
-  const convKey = deriveConversationKey(body.messages);
+  const bridgeKey = deriveBridgeKey(modelId, body.messages, sessionId, agentKey);
+  const convKey = deriveConversationKey(body.messages, sessionId, agentKey);
   const activeBridge = activeBridges.get(bridgeKey);
 
   if (activeBridge && toolResults.length > 0) {
@@ -1869,26 +1873,28 @@ function sendUnknownExecResult(
   sendExecStreamClose(execMsg.id, sendFrame);
 }
 
-/** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
-function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
+/** Derive a key for active bridge lookup (tool-call continuations). Model-specific.
+ *  Combines session/agent headers (when available) with content for collision resistance. */
+function deriveBridgeKey(modelId: string, messages: OpenAIMessage[], sessionId?: string, agentKey?: string): string {
+  const agent = agentKey?.trim() || "default";
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   return createHash("sha256")
-    .update(`bridge:${modelId}:${firstUserText.slice(0, 200)}`)
+    .update(`bridge:${sessionId ?? ""}:${agent}:${modelId}:${firstUserText.slice(0, 200)}`)
     .digest("hex")
     .slice(0, 16);
 }
 
 /** Derive a key for conversation state. Model-independent so context survives model switches.
- *  Uses system prompt hash — stable across all messages in the same session,
- *  unlike first-user-message which changes every turn when the client sends only [system, latest_user]. */
-function deriveConversationKey(messages: OpenAIMessage[]): string {
+ *  Combines session/agent headers with system prompt hash for stability across turns. */
+function deriveConversationKey(messages: OpenAIMessage[], sessionId?: string, agentKey?: string): string {
+  const agent = agentKey?.trim() || "default";
   const systemParts = messages
     .filter((m) => m.role === "system")
     .map((m) => textContent(m.content));
   const systemText = systemParts.join("\n");
   return createHash("sha256")
-    .update(`conv:${systemText.slice(0, 2000)}`)
+    .update(`conv:${sessionId ?? ""}:${agent}:${systemText.slice(0, 2000)}`)
     .digest("hex")
     .slice(0, 16);
 }
