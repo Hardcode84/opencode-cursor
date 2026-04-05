@@ -628,9 +628,9 @@ export async function startProxy(
             throw new Error("Cursor proxy access token provider not configured");
           }
           const accessToken = await proxyAccessTokenProvider();
-          const sessionId = req.headers.get("x-session-id") ?? undefined;
-          const agentKey = req.headers.get("x-opencode-agent") ?? undefined;
-          return handleChatCompletion(body, accessToken, sessionId, agentKey);
+          const sessionId = req.headers.get("x-session-affinity") ?? undefined;
+          const parentSessionId = req.headers.get("x-parent-session-id") ?? undefined;
+          return handleChatCompletion(body, accessToken, sessionId, parentSessionId);
         } catch (err) {
           logError("chat completion failed", errorDetails(err));
           const message = err instanceof Error ? err.message : String(err);
@@ -788,7 +788,7 @@ function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
   sessionId?: string,
-  agentKey?: string,
+  parentSessionId?: string,
 ): Response | Promise<Response> {
   if (detectTitleRequest(body)) {
     const sourceText = buildTitleSourceText(body.messages);
@@ -816,8 +816,8 @@ function handleChatCompletion(
 
   // bridgeKey: model-specific, for active tool-call bridges
   // convKey: model-independent, for conversation state that survives model switches
-  const bridgeKey = deriveBridgeKey(modelId, body.messages, sessionId, agentKey);
-  const convKey = deriveConversationKey(body.messages, sessionId, agentKey);
+  const bridgeKey = deriveBridgeKey(modelId, body.messages, sessionId, parentSessionId);
+  const convKey = deriveConversationKey(body.messages, sessionId, parentSessionId);
   const activeBridge = activeBridges.get(bridgeKey);
 
   if (activeBridge && toolResults.length > 0) {
@@ -1893,27 +1893,27 @@ function sendUnknownExecResult(
 }
 
 /** Derive a key for active bridge lookup (tool-call continuations). Model-specific.
- *  Combines session/agent headers (when available) with content for collision resistance. */
-function deriveBridgeKey(modelId: string, messages: OpenAIMessage[], sessionId?: string, agentKey?: string): string {
-  const agent = agentKey?.trim() || "default";
+ *  Uses x-session-affinity (sessionId) when available; falls back to content hash.
+ *  parentSessionId distinguishes subagent bridges from the main session. */
+function deriveBridgeKey(modelId: string, messages: OpenAIMessage[], sessionId?: string, parentSessionId?: string): string {
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   return createHash("sha256")
-    .update(`bridge:${sessionId ?? ""}:${agent}:${modelId}:${firstUserText.slice(0, 200)}`)
+    .update(`bridge:${sessionId ?? ""}:${parentSessionId ?? ""}:${modelId}:${firstUserText.slice(0, 200)}`)
     .digest("hex")
     .slice(0, 16);
 }
 
 /** Derive a key for conversation state. Model-independent so context survives model switches.
- *  Combines session/agent headers with system prompt hash for stability across turns. */
-function deriveConversationKey(messages: OpenAIMessage[], sessionId?: string, agentKey?: string): string {
-  const agent = agentKey?.trim() || "default";
+ *  Uses x-session-affinity for session isolation; falls back to system prompt hash.
+ *  parentSessionId scopes subagent conversations separately from the main session. */
+function deriveConversationKey(messages: OpenAIMessage[], sessionId?: string, parentSessionId?: string): string {
   const systemParts = messages
     .filter((m) => m.role === "system")
     .map((m) => textContent(m.content));
   const systemText = systemParts.join("\n");
   return createHash("sha256")
-    .update(`conv:${sessionId ?? ""}:${agent}:${systemText.slice(0, 2000)}`)
+    .update(`conv:${sessionId ?? ""}:${parentSessionId ?? ""}:${systemText.slice(0, 2000)}`)
     .digest("hex")
     .slice(0, 16);
 }
