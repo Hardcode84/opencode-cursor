@@ -210,17 +210,18 @@ function setBridgeInactivityTimer(
   bridgeKey: string,
   bridge: BridgeHandle,
   heartbeatTimer: NodeJS.Timeout,
-  onTimeout: () => void,
+  onTimeout: () => boolean | void,
   phase: "thinking" | "streaming" = "thinking",
 ): void {
   const timeoutMs = phase === "thinking" ? THINKING_TIMEOUT_MS : STREAMING_TIMEOUT_MS;
   clearBridgeInactivityTimer(bridgeKey);
   bridgeInactivityTimers.set(bridgeKey, setTimeout(() => {
-    proxyLog("TIMEOUT [%s]: no data for %ds (phase=%s), killing bridge", bridgeKey.slice(0, 8), timeoutMs / 1000, phase);
+    proxyLog("TIMEOUT [%s]: no data for %ds (phase=%s)", bridgeKey.slice(0, 8), timeoutMs / 1000, phase);
     bridgeInactivityTimers.delete(bridgeKey);
+    const keepAlive = onTimeout();
+    if (keepAlive) return;
     activeBridges.delete(bridgeKey);
     clearInterval(heartbeatTimer);
-    onTimeout();
     bridge.end();
   }, timeoutMs));
 }
@@ -1203,6 +1204,9 @@ interface StreamState {
   totalTokens: number;
   /** Set when the server sends an endStream frame (clean close or error). */
   endStreamSeen: boolean;
+  /** Set when a checkpoint arrives while there are unflushed pending execs.
+   *  Signals that the server has finished emitting tool call execs for this batch. */
+  checkpointAfterExec: boolean;
   /** Tracks last delta type for debug logging transitions. */
   lastDeltaType: string | null;
 }
@@ -1248,6 +1252,7 @@ function processServerMessage(
     if (stateStructure.tokenDetails) {
       state.totalTokens = stateStructure.tokenDetails.usedTokens;
     }
+    proxyLog("checkpoint: tokens=%d pending=%d", state.totalTokens, state.pendingExecs.length);
     if (onCheckpoint) {
       onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
     }
@@ -1293,8 +1298,26 @@ function handleInteractionUpdate(
     }
   } else if (updateCase === "tokenDelta") {
     state.outputTokens += update.message.value.tokens ?? 0;
+  } else if (updateCase === "toolCallStarted") {
+    const val = update.message.value;
+    proxyLog("toolCallStarted: callId=%s modelCallId=%s pending=%d", val?.callId ?? "", val?.modelCallId ?? "", state.pendingExecs.length);
+    if (state.pendingExecs.length > 0) {
+      state.checkpointAfterExec = true;
+    }
+  } else if (updateCase === "toolCallCompleted") {
+    proxyLog("toolCallCompleted: callId=%s", update.message.value?.callId ?? "");
   } else if (updateCase === "turnEnded") {
-    proxyLog("turnEnded received");
+    proxyLog("turnEnded received (pending=%d)", state.pendingExecs.length);
+    if (state.pendingExecs.length > 0) {
+      state.checkpointAfterExec = true;
+    }
+  } else if (updateCase === "heartbeat") {
+    if (state.pendingExecs.length > 0) {
+      proxyLog("heartbeat while %d execs pending → signaling batch complete", state.pendingExecs.length);
+      state.checkpointAfterExec = true;
+    }
+  } else if (updateCase && updateCase !== "toolCallDelta" && updateCase !== "partialToolCall") {
+    proxyLog("interactionUpdate: unhandled type=%s (pending=%d)", updateCase, state.pendingExecs.length);
   }
 }
 
@@ -1494,18 +1517,34 @@ function nativeToMcpRedirect(execCase: string, execMsg: ExecServerMessage): Nati
     return {
       toolCallId,
       toolName: "glob",
-      decodedArgs: JSON.stringify({ pattern: "*", path: args.path }),
+      decodedArgs: JSON.stringify({ glob_pattern: "*", target_directory: args.path }),
       nativeResultType: "lsResult",
       nativeArgs: { path: args.path },
     };
   }
   if (execCase === "grepArgs") {
-    const mcpArgs: Record<string, any> = { pattern: args.pattern ?? "" };
+    const pattern = args.pattern ?? "";
+    if (!pattern && args.glob) {
+      proxyLog("grepArgs: empty pattern with glob=%s → redirecting to glob tool", args.glob);
+      return {
+        toolCallId,
+        toolName: "glob",
+        decodedArgs: JSON.stringify({ glob_pattern: args.glob, target_directory: args.path || undefined }),
+        nativeResultType: "grepResult",
+        nativeArgs: {},
+      };
+    }
+    const mcpArgs: Record<string, any> = { pattern: pattern || "." };
     if (args.path) mcpArgs.path = args.path;
     if (args.glob) mcpArgs.glob = args.glob;
     if (args.outputMode) mcpArgs.output_mode = args.outputMode;
     if (args.contextBefore != null) mcpArgs["-B"] = args.contextBefore;
     if (args.contextAfter != null) mcpArgs["-A"] = args.contextAfter;
+    if (args.context != null) mcpArgs["-C"] = args.context;
+    if (args.caseInsensitive != null) mcpArgs["-i"] = args.caseInsensitive;
+    if (args.type) mcpArgs.type = args.type;
+    if (args.headLimit != null) mcpArgs.head_limit = args.headLimit;
+    if (args.multiline != null) mcpArgs.multiline = args.multiline;
     return {
       toolCallId,
       toolName: "grep",
@@ -1527,6 +1566,10 @@ function handleExecMessage(
   const execCase = execMsg.message.case;
 
   if (execCase === "requestContextArgs") {
+    if (state && state.pendingExecs.length > 0) {
+      proxyLog("exec: requestContextArgs while %d execs pending → signaling batch complete", state.pendingExecs.length);
+      state.checkpointAfterExec = true;
+    }
     proxyLog("exec: requestContextArgs (providing %d MCP tools)", mcpTools.length);
     const requestContext = create(RequestContextSchema, {
       rules: [],
@@ -1558,11 +1601,15 @@ function handleExecMessage(
     if (state) state.totalExecCount++;
     const mcpArgs = execMsg.message.value;
     const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
+    const resolvedToolName = mcpArgs.toolName || mcpArgs.name;
+    if (/grep/i.test(resolvedToolName) && !decoded.pattern) {
+      console.error(`[proxy] mcpArgs grep: missing pattern (tool=%s keys=%s)`, resolvedToolName, Object.keys(decoded).join(","));
+    }
     onMcpExec({
       execId: execMsg.execId,
       execMsgId: execMsg.id,
       toolCallId: mcpArgs.toolCallId || crypto.randomUUID(),
-      toolName: mcpArgs.toolName || mcpArgs.name,
+      toolName: resolvedToolName,
       decodedArgs: JSON.stringify(decoded),
     });
     return;
@@ -1819,6 +1866,7 @@ function createBridgeStreamResponse(
         outputTokens: 0,
         totalTokens: 0,
         endStreamSeen: false,
+        checkpointAfterExec: false,
         lastDeltaType: null,
       };
       const tagFilter = createThinkingTagFilter();
@@ -1829,9 +1877,34 @@ function createBridgeStreamResponse(
       let autoResumeRetry: (() => Response) | undefined;
       let timerPhase: "thinking" | "streaming" = "thinking";
 
+      const flushPendingExecs = () => {
+        const flushed = tagFilter.flush();
+        if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+        if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+
+        clearBridgeInactivityTimer(bridgeKey);
+        activeBridges.set(bridgeKey, {
+          bridge, heartbeatTimer, blobStore, mcpTools,
+          pendingExecs: state.pendingExecs, convKey,
+          totalExecCount: state.totalExecCount,
+          toolCallIndex: state.toolCallIndex,
+          accessToken: accessToken || "", resumeCount,
+        });
+
+        sendUsageIfChanged();
+        sendSSE(makeChunk({}, "tool_calls"));
+        sendDone();
+        closeController();
+      };
+
       const resetTimer = (phase?: "thinking" | "streaming") => {
         if (phase) timerPhase = phase;
         setBridgeInactivityTimer(bridgeKey, bridge, heartbeatTimer, () => {
+          if (state.pendingExecs.length > 0 && !closed) {
+            proxyLog("TIMEOUT: flushing %d pending execs after silence", state.pendingExecs.length);
+            flushPendingExecs();
+            return true;
+          }
           const timeoutSec = (timerPhase === "thinking" ? THINKING_TIMEOUT_MS : STREAMING_TIMEOUT_MS) / 1000;
           const stored = conversationStates.get(convKey);
           if (accessToken && stored?.checkpoint && resumeCount < MAX_AUTO_RESUMES) {
@@ -1912,6 +1985,9 @@ function createBridgeStreamResponse(
                   stored.lastAccessMs = Date.now();
                   persistConversation(convKey, stored);
                 }
+                if (state.pendingExecs.length > 0) {
+                  state.checkpointAfterExec = true;
+                }
                 sendUsageIfChanged();
               },
               (note) => {
@@ -1949,32 +2025,16 @@ function createBridgeStreamResponse(
             sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
           } else {
             proxyLog("endStream: clean close (execs=%d mcpCalls=%d)", state.totalExecCount, state.toolCallIndex);
+            if (state.pendingExecs.length > 0 && !state.checkpointAfterExec) {
+              proxyLog("endStream: forcing flush of %d pending execs (no checkpoint received)", state.pendingExecs.length);
+              state.checkpointAfterExec = true;
+            }
           }
         },
         afterParse() {
-          if (state.pendingExecs.length > 0 && !closed) {
-            const flushed = tagFilter.flush();
-            if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-            if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
-
-            clearBridgeInactivityTimer(bridgeKey);
-            activeBridges.set(bridgeKey, {
-              bridge,
-              heartbeatTimer,
-              blobStore,
-              mcpTools,
-              pendingExecs: state.pendingExecs,
-              convKey,
-              totalExecCount: state.totalExecCount,
-              toolCallIndex: state.toolCallIndex,
-              accessToken: accessToken || "",
-              resumeCount,
-            });
-
-            sendUsageIfChanged();
-            sendSSE(makeChunk({}, "tool_calls"));
-            sendDone();
-            closeController();
+          if (state.pendingExecs.length > 0 && !closed && state.checkpointAfterExec && !blobNotFoundRetry && !autoResumeRetry) {
+            proxyLog("afterParse: flushing %d pending execs", state.pendingExecs.length);
+            flushPendingExecs();
           }
         },
       });
@@ -2458,6 +2518,7 @@ async function collectFullResponse(
     outputTokens: 0,
     totalTokens: 0,
     endStreamSeen: false,
+    checkpointAfterExec: false,
     lastDeltaType: null,
   };
   const tagFilter = createThinkingTagFilter();
