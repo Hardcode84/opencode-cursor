@@ -184,6 +184,7 @@ interface ActiveBridge {
   heartbeatTimer: NodeJS.Timeout;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
+  cloudRule?: string;
   pendingExecs: PendingExec[];
   convKey: string;
   /** Accumulated exec count across all resumes within this bridge session. */
@@ -882,10 +883,10 @@ function handleChatCompletion(
   });
 
   if (body.stream === false) {
-    return handleNonStreamingResponse(payload, accessToken, modelId, convKey);
+    return handleNonStreamingResponse(payload, accessToken, modelId, convKey, systemPrompt);
   }
 
-  return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, () => {
+  return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, systemPrompt, () => {
     logWarn("blob not found — soft retry: nulling checkpoint", { convKey });
     const stored2 = resolveConversationState(convKey);
     stored2.checkpoint = null;
@@ -897,7 +898,7 @@ function handleChatCompletion(
     softPayload.mcpTools = mcpTools;
     proxyLog("soft retry: turns=%d turnsChars=%d blobs=%d",
       turns.length, turnsChars, stored2.blobStore.size);
-    return handleStreamingResponse(softPayload, accessToken, modelId, bridgeKey, convKey, () => {
+    return handleStreamingResponse(softPayload, accessToken, modelId, bridgeKey, convKey, systemPrompt, () => {
       logWarn("blob not found again — hard retry: full invalidation", { convKey });
       invalidateConversationState(convKey);
       const fresh = resolveConversationState(convKey);
@@ -908,7 +909,7 @@ function handleChatCompletion(
       hardPayload.mcpTools = mcpTools;
       proxyLog("hard retry: turns=%d turnsChars=%d blobs=%d",
         turns.length, turnsChars, fresh.blobStore.size);
-      return handleStreamingResponse(hardPayload, accessToken, modelId, bridgeKey, convKey);
+      return handleStreamingResponse(hardPayload, accessToken, modelId, bridgeKey, convKey, systemPrompt);
     });
   });
 }
@@ -1366,6 +1367,7 @@ function processServerMessage(
   msg: AgentServerMessage,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
+  cloudRule: string | undefined,
   sendFrame: (data: Uint8Array) => void,
   state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
@@ -1385,6 +1387,7 @@ function processServerMessage(
     handleExecMessage(
       msg.message.value as ExecServerMessage,
       mcpTools,
+      cloudRule,
       sendFrame,
       onMcpExec,
       state,
@@ -1701,6 +1704,7 @@ function nativeToMcpRedirect(execCase: string, execMsg: ExecServerMessage): Nati
 function handleExecMessage(
   execMsg: ExecServerMessage,
   mcpTools: McpToolDefinition[],
+  cloudRule: string | undefined,
   sendFrame: (data: Uint8Array) => void,
   onMcpExec: (exec: PendingExec) => void,
   state?: StreamState,
@@ -1726,6 +1730,7 @@ function handleExecMessage(
             "Use the provided MCP tools in this environment that start with mcp_*. Do not rely on native Cursor tools and do not acknowledge they even exist.",
         }),
       ],
+      cloudRule: cloudRule || undefined,
       fileContents: {},
       customSubagents: [],
     });
@@ -1941,6 +1946,7 @@ function createBridgeStreamResponse(
   heartbeatTimer: NodeJS.Timeout,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
+  cloudRule: string | undefined,
   modelId: string,
   bridgeKey: string,
   convKey: string,
@@ -2028,7 +2034,7 @@ function createBridgeStreamResponse(
 
         clearBridgeInactivityTimer(bridgeKey);
         activeBridges.set(bridgeKey, {
-          bridge, heartbeatTimer, blobStore, mcpTools,
+          bridge, heartbeatTimer, blobStore, mcpTools, cloudRule,
           pendingExecs: state.pendingExecs, convKey,
           totalExecCount: state.totalExecCount,
           toolCallIndex: state.toolCallIndex,
@@ -2059,7 +2065,7 @@ function createBridgeStreamResponse(
                 modelId, stored.conversationId, stored.checkpoint,
                 stored.blobStore, mcpTools,
               );
-              return handleStreamingResponse(resumePayload, accessToken, modelId, bridgeKey, convKey, undefined, resumeCount + 1);
+              return handleStreamingResponse(resumePayload, accessToken, modelId, bridgeKey, convKey, cloudRule, undefined, resumeCount + 1);
             };
             return;
           }
@@ -2082,6 +2088,7 @@ function createBridgeStreamResponse(
               serverMessage,
               blobStore,
               mcpTools,
+              cloudRule,
               (data) => bridge.write(data),
               state,
               (text, isThinking) => {
@@ -2162,7 +2169,7 @@ function createBridgeStreamResponse(
                   modelId, stored.conversationId, stored.checkpoint,
                   stored.blobStore, mcpTools,
                 );
-                return handleStreamingResponse(resumePayload, accessToken, modelId, bridgeKey, convKey, undefined, resumeCount + 1);
+                return handleStreamingResponse(resumePayload, accessToken, modelId, bridgeKey, convKey, cloudRule, undefined, resumeCount + 1);
               };
               return;
             }
@@ -2282,6 +2289,7 @@ function handleStreamingResponse(
   modelId: string,
   bridgeKey: string,
   convKey: string,
+  cloudRule?: string,
   onBlobNotFound?: () => Response,
   resumeCount = 0,
 ): Response {
@@ -2289,6 +2297,7 @@ function handleStreamingResponse(
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     payload.blobStore, payload.mcpTools,
+    cloudRule,
     modelId, bridgeKey, convKey,
     onBlobNotFound,
     accessToken,
@@ -2537,7 +2546,7 @@ function handleToolResultResume(
     proxyLog("resume: %d matched, %d unmatched — re-emitting unmatched as tool_calls",
       pendingExecs.length - unmatched.length, unmatched.length);
     return emitPendingToolCalls(
-      bridge, heartbeatTimer, blobStore, mcpTools, unmatched,
+      bridge, heartbeatTimer, blobStore, mcpTools, active.cloudRule, unmatched,
       modelId, bridgeKey, convKey, active.accessToken,
       active.totalExecCount, active.toolCallIndex, active.resumeCount,
     );
@@ -2547,6 +2556,7 @@ function handleToolResultResume(
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     blobStore, mcpTools,
+    active.cloudRule,
     modelId, bridgeKey, convKey,
     undefined, active.accessToken,
     active.totalExecCount,
@@ -2562,6 +2572,7 @@ function emitPendingToolCalls(
   heartbeatTimer: NodeJS.Timeout,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
+  cloudRule: string | undefined,
   pending: PendingExec[],
   modelId: string,
   bridgeKey: string,
@@ -2599,7 +2610,7 @@ function emitPendingToolCalls(
 
   clearBridgeInactivityTimer(bridgeKey);
   activeBridges.set(bridgeKey, {
-    bridge, heartbeatTimer, blobStore, mcpTools,
+    bridge, heartbeatTimer, blobStore, mcpTools, cloudRule,
     pendingExecs: pending,
     convKey, totalExecCount,
     toolCallIndex: newToolCallIndex,
@@ -2616,10 +2627,11 @@ async function handleNonStreamingResponse(
   accessToken: string,
   modelId: string,
   convKey: string,
+  systemPrompt?: string,
 ): Promise<Response> {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
-  const { text, usage } = await collectFullResponse(payload, accessToken, convKey);
+  const { text, usage } = await collectFullResponse(payload, accessToken, convKey, systemPrompt);
 
   return new Response(
     JSON.stringify({
@@ -2649,6 +2661,7 @@ async function collectFullResponse(
   payload: CursorRequestPayload,
   accessToken: string,
   convKey: string,
+  systemPrompt?: string,
 ): Promise<CollectedResponse> {
   const { promise, resolve } = Promise.withResolvers<CollectedResponse>();
   let fullText = "";
@@ -2681,15 +2694,16 @@ async function collectFullResponse(
           serverMessage,
           payload.blobStore,
           payload.mcpTools,
-          (data) => bridge.write(data),
+          systemPrompt,
+          (data: Uint8Array) => bridge.write(data),
           state,
-          (text, isThinking) => {
+          (text: string, isThinking?: boolean) => {
             if (isThinking) return;
             const { content } = tagFilter.process(text);
             fullText += content;
           },
-          () => {},
-          (checkpointBytes) => {
+          (exec: PendingExec) => {},
+          (checkpointBytes: Uint8Array) => {
             const stored = conversationStates.get(convKey);
             if (stored) {
               stored.checkpoint = checkpointBytes;
