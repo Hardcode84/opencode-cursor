@@ -1204,8 +1204,10 @@ interface StreamState {
   totalTokens: number;
   /** Set when the server sends an endStream frame (clean close or error). */
   endStreamSeen: boolean;
-  /** Set when a checkpoint arrives while there are unflushed pending execs.
-   *  Signals that the server has finished emitting tool call execs for this batch. */
+  /** Set by batch-complete signals (checkpoint, stepCompleted, turnEnded,
+   *  requestContextArgs) to indicate pending execs should be flushed.
+   *  NOT set by toolCallStarted (which means more tools are coming)
+   *  or heartbeat (which is just a keepalive). */
   checkpointAfterExec: boolean;
   /** Tracks last delta type for debug logging transitions. */
   lastDeltaType: string | null;
@@ -1301,9 +1303,6 @@ function handleInteractionUpdate(
   } else if (updateCase === "toolCallStarted") {
     const val = update.message.value;
     proxyLog("toolCallStarted: callId=%s modelCallId=%s pending=%d", val?.callId ?? "", val?.modelCallId ?? "", state.pendingExecs.length);
-    if (state.pendingExecs.length > 0) {
-      state.checkpointAfterExec = true;
-    }
   } else if (updateCase === "toolCallCompleted") {
     proxyLog("toolCallCompleted: callId=%s", update.message.value?.callId ?? "");
   } else if (updateCase === "turnEnded") {
@@ -1311,11 +1310,13 @@ function handleInteractionUpdate(
     if (state.pendingExecs.length > 0) {
       state.checkpointAfterExec = true;
     }
-  } else if (updateCase === "heartbeat") {
+  } else if (updateCase === "stepCompleted") {
+    proxyLog("stepCompleted (pending=%d)", state.pendingExecs.length);
     if (state.pendingExecs.length > 0) {
-      proxyLog("heartbeat while %d execs pending → signaling batch complete", state.pendingExecs.length);
       state.checkpointAfterExec = true;
     }
+  } else if (updateCase === "heartbeat") {
+    // heartbeat is just a keepalive — not a batch delimiter
   } else if (updateCase && updateCase !== "toolCallDelta" && updateCase !== "partialToolCall") {
     proxyLog("interactionUpdate: unhandled type=%s (pending=%d)", updateCase, state.pendingExecs.length);
   }
