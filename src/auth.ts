@@ -3,8 +3,7 @@ import { generatePKCE } from "./pkce";
 const CURSOR_LOGIN_URL = "https://cursor.com/loginDeepControl";
 const CURSOR_POLL_URL = "https://api2.cursor.sh/auth/poll";
 const CURSOR_REFRESH_URL =
-  process.env.CURSOR_REFRESH_URL ??
-  "https://api2.cursor.sh/auth/exchange_user_api_key";
+  process.env.CURSOR_REFRESH_URL ?? "https://api2.cursor.sh/auth/exchange_user_api_key";
 
 const POLL_MAX_ATTEMPTS = 150;
 const POLL_BASE_DELAY = 1000;
@@ -23,7 +22,6 @@ export interface CursorCredentials {
   refresh: string;
   expires: number;
 }
-
 
 export async function generateCursorAuthParams(): Promise<CursorAuthParams> {
   const { verifier, challenge } = await generatePKCE();
@@ -51,9 +49,7 @@ export async function pollCursorAuth(
     await Bun.sleep(delay);
 
     try {
-      const response = await fetch(
-        `${CURSOR_POLL_URL}?uuid=${uuid}&verifier=${verifier}`,
-      );
+      const response = await fetch(`${CURSOR_POLL_URL}?uuid=${uuid}&verifier=${verifier}`);
 
       if (response.status === 404) {
         consecutiveErrors = 0;
@@ -76,9 +72,7 @@ export async function pollCursorAuth(
     } catch {
       consecutiveErrors++;
       if (consecutiveErrors >= 3) {
-        throw new Error(
-          "Too many consecutive errors during Cursor auth polling",
-        );
+        throw new Error("Too many consecutive errors during Cursor auth polling");
       }
     }
   }
@@ -86,9 +80,7 @@ export async function pollCursorAuth(
   throw new Error("Cursor authentication polling timeout");
 }
 
-export async function refreshCursorToken(
-  refreshToken: string,
-): Promise<CursorCredentials> {
+export async function refreshCursorToken(refreshToken: string): Promise<CursorCredentials> {
   const response = await fetch(CURSOR_REFRESH_URL, {
     method: "POST",
     headers: {
@@ -115,7 +107,6 @@ export async function refreshCursorToken(
   };
 }
 
-
 /**
  * Extract JWT expiry with 5-minute safety margin.
  * Falls back to 1 hour from now if token can't be parsed.
@@ -126,17 +117,10 @@ export function getTokenExpiry(token: string): number {
     if (parts.length !== 3 || !parts[1]) {
       return Date.now() + 3600 * 1000;
     }
-    const decoded = JSON.parse(
-      atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")),
-    );
-    if (
-      decoded &&
-      typeof decoded === "object" &&
-      typeof decoded.exp === "number"
-    ) {
+    const decoded = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+    if (decoded && typeof decoded === "object" && typeof decoded.exp === "number") {
       return decoded.exp * 1000 - 5 * 60 * 1000;
     }
-  } catch {
-  }
+  } catch {}
   return Date.now() + 3600 * 1000;
 }

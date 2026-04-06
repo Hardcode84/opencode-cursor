@@ -23,7 +23,9 @@ export function createConnectFrameParser(
         pending = Buffer.alloc(0);
         onEndStream(
           new TextEncoder().encode(
-            JSON.stringify({ error: { code: "frame_too_large", message: `Frame size ${msgLen} exceeds limit` } }),
+            JSON.stringify({
+              error: { code: "frame_too_large", message: `Frame size ${msgLen} exceeds limit` },
+            }),
           ),
         );
         return;

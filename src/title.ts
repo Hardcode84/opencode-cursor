@@ -1,7 +1,7 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
-import { NameAgentRequestSchema, NameAgentResponseSchema } from "./proto/agent_pb";
-import { logInfo } from "./logger";
 import { callCursorUnaryRpc } from "./cursor-session";
+import { logInfo } from "./logger";
+import { NameAgentRequestSchema, NameAgentResponseSchema } from "./proto/agent_pb";
 
 const TITLE_REQUEST_MARKER = "Generate a title for this conversation:";
 
@@ -27,14 +27,14 @@ function textContent(content: TitleCheckMessage["content"]): string {
 
 export function detectTitleRequest(body: TitleCheckBody): boolean {
   if ((body.tools?.length ?? 0) > 0) return false;
-  const firstUser = body.messages.find(m => m.role === "user");
+  const firstUser = body.messages.find((m) => m.role === "user");
   return !!firstUser && textContent(firstUser.content).trim() === TITLE_REQUEST_MARKER;
 }
 
 export function buildTitleSourceText(messages: TitleCheckMessage[]): string {
   return messages
-    .filter(m => m.role !== "system")
-    .map(m => {
+    .filter((m) => m.role !== "system")
+    .map((m) => {
       const text = textContent(m.content).trim();
       return text === TITLE_REQUEST_MARKER ? "" : text;
     })
@@ -62,7 +62,7 @@ function deriveFallbackTitle(text: string): string {
     .trim();
   if (!cleaned) return "";
   const words = cleaned.split(" ").filter(Boolean).slice(0, 6);
-  return finalizeTitle(words.map(w => w[0]!.toUpperCase() + w.slice(1)).join(" "));
+  return finalizeTitle(words.map((w) => w[0]!.toUpperCase() + w.slice(1)).join(" "));
 }
 
 const SSE_HEADERS = {
@@ -108,23 +108,46 @@ export async function handleTitleGenerationRequest(
   const usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
 
   if (stream) {
-    const chunks = [
-      { id: completionId, object: "chat.completion.chunk", created, model: modelId,
-        choices: [{ index: 0, delta: { content: title }, finish_reason: null }] },
-      { id: completionId, object: "chat.completion.chunk", created, model: modelId,
-        choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
-      { id: completionId, object: "chat.completion.chunk", created, model: modelId,
-        choices: [], usage },
-    ].map(c => `data: ${JSON.stringify(c)}\n\n`).join("") + "data: [DONE]\n\n";
+    const chunks = `${[
+      {
+        id: completionId,
+        object: "chat.completion.chunk",
+        created,
+        model: modelId,
+        choices: [{ index: 0, delta: { content: title }, finish_reason: null }],
+      },
+      {
+        id: completionId,
+        object: "chat.completion.chunk",
+        created,
+        model: modelId,
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      },
+      {
+        id: completionId,
+        object: "chat.completion.chunk",
+        created,
+        model: modelId,
+        choices: [],
+        usage,
+      },
+    ]
+      .map((c) => `data: ${JSON.stringify(c)}\n\n`)
+      .join("")}data: [DONE]\n\n`;
     return new Response(chunks, { headers: SSE_HEADERS });
   }
 
-  return new Response(JSON.stringify({
-    id: completionId,
-    object: "chat.completion",
-    created,
-    model: modelId,
-    choices: [{ index: 0, message: { role: "assistant", content: title }, finish_reason: "stop" }],
-    usage,
-  }), { headers: { "Content-Type": "application/json" } });
+  return new Response(
+    JSON.stringify({
+      id: completionId,
+      object: "chat.completion",
+      created,
+      model: modelId,
+      choices: [
+        { index: 0, message: { role: "assistant", content: title }, finish_reason: "stop" },
+      ],
+      usage,
+    }),
+    { headers: { "Content-Type": "application/json" } },
+  );
 }

@@ -1,6 +1,6 @@
-import type { CursorSession, SessionEvent, RetryHint } from "./cursor-session";
-import { createThinkingTagFilter } from "./thinking-filter";
 import { randomUUID } from "node:crypto";
+import type { CursorSession, RetryHint, SessionEvent } from "./cursor-session";
+import { createThinkingTagFilter } from "./thinking-filter";
 
 export const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
@@ -76,10 +76,7 @@ export type PumpResult =
  * For retryable errors, returns 'retry' without writing stop/DONE — the
  * caller can create a new session and call pumpSession again on the same ctx.
  */
-export async function pumpSession(
-  session: CursorSession,
-  ctx: SSECtx,
-): Promise<PumpResult> {
+export async function pumpSession(session: CursorSession, ctx: SSECtx): Promise<PumpResult> {
   const tagFilter = createThinkingTagFilter();
   let hasNativeThinking = false;
   let toolCallIndex = 0;
@@ -196,9 +193,7 @@ export async function collectNonStreamingResponse(
       object: "chat.completion",
       created: Math.floor(Date.now() / 1000),
       model: modelId,
-      choices: [
-        { index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" },
-      ],
+      choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     }),
     { headers: { "Content-Type": "application/json" } },

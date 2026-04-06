@@ -6,6 +6,7 @@
  * format them as the native Cursor protobuf types the server expects.
  */
 import { create, toBinary } from "@bufbuild/protobuf";
+import { logDebug } from "./logger";
 import {
   AgentClientMessageSchema,
   DeleteResultSchema,
@@ -13,6 +14,7 @@ import {
   ExecClientControlMessageSchema,
   ExecClientMessageSchema,
   ExecClientStreamCloseSchema,
+  type ExecServerMessage,
   FetchResultSchema,
   FetchSuccessSchema,
   McpResultSchema,
@@ -25,15 +27,12 @@ import {
   ShellStreamExitSchema,
   ShellStreamSchema,
   ShellStreamStartSchema,
-  ShellStreamStderrSchema,
   ShellStreamStdoutSchema,
   ShellSuccessSchema,
   WriteResultSchema,
   WriteSuccessSchema,
-  type ExecServerMessage,
 } from "./proto/agent_pb";
 import { frameConnectMessage } from "./protocol";
-import { logDebug } from "./logger";
 
 function proxyLog(msg: string, ...args: unknown[]): void {
   let i = 0;
@@ -43,8 +42,14 @@ function proxyLog(msg: string, ...args: unknown[]): void {
 // ── Types ──
 
 export type NativeResultType =
-  | "readResult" | "writeResult" | "deleteResult" | "fetchResult"
-  | "shellResult" | "shellStreamResult" | "lsResult" | "grepResult";
+  | "readResult"
+  | "writeResult"
+  | "deleteResult"
+  | "fetchResult"
+  | "shellResult"
+  | "shellStreamResult"
+  | "lsResult"
+  | "grepResult";
 
 export interface PendingExec {
   execId: string;
@@ -109,7 +114,10 @@ export function fixMcpArgNames(toolName: string, args: Record<string, unknown>):
 
 // ── Native → MCP redirection ──
 
-export function nativeToMcpRedirect(execCase: string, execMsg: ExecServerMessage): NativeRedirectInfo | null {
+export function nativeToMcpRedirect(
+  execCase: string,
+  execMsg: ExecServerMessage,
+): NativeRedirectInfo | null {
   const args = execMsg.message.value as any;
   const toolCallId = args?.toolCallId || crypto.randomUUID();
 
@@ -126,9 +134,8 @@ export function nativeToMcpRedirect(execCase: string, execMsg: ExecServerMessage
     };
   }
   if (execCase === "writeArgs") {
-    const fileContent = args.fileBytes?.length > 0
-      ? new TextDecoder().decode(args.fileBytes)
-      : (args.fileText ?? "");
+    const fileContent =
+      args.fileBytes?.length > 0 ? new TextDecoder().decode(args.fileBytes) : (args.fileText ?? "");
     return {
       toolCallId,
       toolName: "write",
@@ -142,7 +149,10 @@ export function nativeToMcpRedirect(execCase: string, execMsg: ExecServerMessage
     return {
       toolCallId,
       toolName: "bash",
-      decodedArgs: JSON.stringify({ command: `rm -f -- '${safePath}'`, description: "Delete file" }),
+      decodedArgs: JSON.stringify({
+        command: `rm -f -- '${safePath}'`,
+        description: "Delete file",
+      }),
       nativeResultType: "deleteResult",
       nativeArgs: { path: args.path },
     };
@@ -159,7 +169,10 @@ export function nativeToMcpRedirect(execCase: string, execMsg: ExecServerMessage
   if (execCase === "shellArgs" || execCase === "shellStreamArgs") {
     const cmd = args.command ?? "";
     const cwd = args.workingDirectory || undefined;
-    const mcpArgs: Record<string, any> = { command: cmd, description: args.description || "Execute command" };
+    const mcpArgs: Record<string, any> = {
+      command: cmd,
+      description: args.description || "Execute command",
+    };
     if (cwd) mcpArgs.working_directory = cwd;
     if (args.timeout != null && args.timeout > 0) mcpArgs.timeout = args.timeout;
     return {
@@ -216,7 +229,11 @@ export function nativeToMcpRedirect(execCase: string, execMsg: ExecServerMessage
 // ── Result formatting ──
 
 /** Send a single mcpResult (success) on the bridge for a matched exec. */
-export function sendMcpResultSuccess(bridge: BridgeWriter, exec: PendingExec, content: string): void {
+export function sendMcpResultSuccess(
+  bridge: BridgeWriter,
+  exec: PendingExec,
+  content: string,
+): void {
   const mcpResult = create(McpResultSchema, {
     result: {
       case: "success",
@@ -242,7 +259,8 @@ export function sendMcpResultSuccess(bridge: BridgeWriter, exec: PendingExec, co
 
   bridge.write(
     frameConnectMessage(
-      toBinary(AgentClientMessageSchema,
+      toBinary(
+        AgentClientMessageSchema,
         create(AgentClientMessageSchema, {
           message: { case: "execClientMessage", value: execClientMessage },
         }),
@@ -258,7 +276,8 @@ export function sendMcpResultSuccess(bridge: BridgeWriter, exec: PendingExec, co
   });
   bridge.write(
     frameConnectMessage(
-      toBinary(AgentClientMessageSchema,
+      toBinary(
+        AgentClientMessageSchema,
         create(AgentClientMessageSchema, {
           message: { case: "execClientControlMessage", value: controlMsg },
         }),
@@ -351,9 +370,7 @@ export function sendNativeResult(bridge: BridgeWriter, exec: PendingExec, conten
       const writeFrame = (msg: any) => {
         bridge.write(
           frameConnectMessage(
-            toBinary(AgentClientMessageSchema,
-              create(AgentClientMessageSchema, { message: msg }),
-            ),
+            toBinary(AgentClientMessageSchema, create(AgentClientMessageSchema, { message: msg })),
           ),
         );
       };
@@ -363,25 +380,32 @@ export function sendNativeResult(bridge: BridgeWriter, exec: PendingExec, conten
           value: create(ExecClientMessageSchema, {
             id: exec.execMsgId,
             execId: exec.execId,
-            message: { case: "shellStream" as any, value: create(ShellStreamSchema, { event }) as any },
+            message: {
+              case: "shellStream" as any,
+              value: create(ShellStreamSchema, { event }) as any,
+            },
           }),
         });
       };
       sendStreamEvent({ case: "start", value: create(ShellStreamStartSchema, {}) });
       if (content) {
-        sendStreamEvent({ case: "stdout", value: create(ShellStreamStdoutSchema, { data: content }) });
+        sendStreamEvent({
+          case: "stdout",
+          value: create(ShellStreamStdoutSchema, { data: content }),
+        });
       }
       sendStreamEvent({ case: "exit", value: create(ShellStreamExitSchema, { code: 0 }) });
       writeFrame({
         case: "execClientControlMessage",
         value: create(ExecClientControlMessageSchema, {
-          message: { case: "streamClose", value: create(ExecClientStreamCloseSchema, { id: exec.execMsgId }) },
+          message: {
+            case: "streamClose",
+            value: create(ExecClientStreamCloseSchema, { id: exec.execMsgId }),
+          },
         }),
       });
       return;
     }
-    case "grepResult":
-    case "lsResult":
     default:
       if (exec.nativeResultType === "grepResult" || exec.nativeResultType === "lsResult") {
         proxyLog("sendNativeResult: %s → MCP text fallback (complex proto)", exec.nativeResultType);
@@ -400,7 +424,8 @@ export function sendNativeResult(bridge: BridgeWriter, exec: PendingExec, conten
 
   bridge.write(
     frameConnectMessage(
-      toBinary(AgentClientMessageSchema,
+      toBinary(
+        AgentClientMessageSchema,
         create(AgentClientMessageSchema, {
           message: { case: "execClientMessage", value: execClientMessage },
         }),
@@ -416,7 +441,8 @@ export function sendNativeResult(bridge: BridgeWriter, exec: PendingExec, conten
   });
   bridge.write(
     frameConnectMessage(
-      toBinary(AgentClientMessageSchema,
+      toBinary(
+        AgentClientMessageSchema,
         create(AgentClientMessageSchema, {
           message: { case: "execClientControlMessage", value: controlMsg },
         }),

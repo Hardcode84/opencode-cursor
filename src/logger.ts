@@ -85,7 +85,11 @@ function writeConsoleLog(level: LogLevel, message: string, extra: Record<string,
   else console.warn(`${prefix}${suffix}`);
 }
 
-function serializeValue(value: unknown, depth: number, seen: WeakSet<object> = new WeakSet()): unknown {
+function serializeValue(
+  value: unknown,
+  depth: number,
+  seen: WeakSet<object> = new WeakSet(),
+): unknown {
   if (value === null || value === undefined) return value;
   if (typeof value === "string") return truncateString(value);
   if (typeof value === "number" || typeof value === "boolean") return value;
@@ -105,14 +109,16 @@ function serializeValue(value: unknown, depth: number, seen: WeakSet<object> = n
   if (value instanceof Uint8Array) return serializeBinary(value);
   if (Array.isArray(value)) {
     if (depth >= 3) return `[array(${value.length})]`;
-    return value.slice(0, MAX_ARRAY_LENGTH).map(entry => serializeValue(entry, depth + 1, seen));
+    return value.slice(0, MAX_ARRAY_LENGTH).map((entry) => serializeValue(entry, depth + 1, seen));
   }
   if (typeof value === "object") {
     if (seen.has(value)) return "[circular]";
     seen.add(value);
     if (depth >= 3) return `[object ${value.constructor?.name || "Object"}]`;
     const entries = Object.entries(value as Record<string, unknown>).slice(0, MAX_OBJECT_KEYS);
-    return Object.fromEntries(entries.map(([key, entry]) => [key, serializeValue(entry, depth + 1, seen)]));
+    return Object.fromEntries(
+      entries.map(([key, entry]) => [key, serializeValue(entry, depth + 1, seen)]),
+    );
   }
   return String(value);
 }
@@ -121,7 +127,11 @@ function serializeBinary(value: Uint8Array): Record<string, unknown> {
   const text = new TextDecoder().decode(value);
   const printable = /^[\x09\x0a\x0d\x20-\x7e]*$/.test(text);
   if (printable) return { type: "uint8array", length: value.length, text: truncateString(text) };
-  return { type: "uint8array", length: value.length, base64: truncateString(Buffer.from(value).toString("base64")) };
+  return {
+    type: "uint8array",
+    length: value.length,
+    base64: truncateString(Buffer.from(value).toString("base64")),
+  };
 }
 
 function truncateString(value?: string): string | undefined {

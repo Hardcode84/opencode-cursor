@@ -6,10 +6,7 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { z } from "zod";
 import { callCursorUnaryRpc } from "./cursor-session";
-import {
-  GetUsableModelsRequestSchema,
-  GetUsableModelsResponseSchema,
-} from "./proto/agent_pb";
+import { GetUsableModelsRequestSchema, GetUsableModelsResponseSchema } from "./proto/agent_pb";
 
 // TODO: switch to aiserver.v1.AvailableModels which returns per-model
 // context_token_limit and context_token_limit_for_max_mode fields.
@@ -21,22 +18,22 @@ const DEFAULT_MAX_TOKENS = 64_000;
 
 const MODEL_LIMITS: Record<string, { context?: number; maxTokens?: number }> = {
   // Claude — 1M variants
-  "claude-4-sonnet-1m":         { context: 1_000_000 },
-  "claude-4.5-opus":            { context: 200_000, maxTokens: 128_000 },
-  "claude-4.6-opus":            { context: 200_000, maxTokens: 128_000 },
-  "claude-4.6-opus-fast":       { context: 200_000, maxTokens: 128_000 },
-  "claude-4.6-opus-high":       { context: 200_000, maxTokens: 128_000 },
+  "claude-4-sonnet-1m": { context: 1_000_000 },
+  "claude-4.5-opus": { context: 200_000, maxTokens: 128_000 },
+  "claude-4.6-opus": { context: 200_000, maxTokens: 128_000 },
+  "claude-4.6-opus-fast": { context: 200_000, maxTokens: 128_000 },
+  "claude-4.6-opus-high": { context: 200_000, maxTokens: 128_000 },
   // GPT — larger contexts
-  "gpt-5.2":                    { context: 400_000, maxTokens: 128_000 },
-  "gpt-5.2-codex":              { context: 400_000, maxTokens: 128_000 },
-  "gpt-5.3-codex":              { context: 400_000, maxTokens: 128_000 },
-  "gpt-5.4":                    { context: 272_000, maxTokens: 128_000 },
-  "gpt-5.4-medium":             { context: 272_000, maxTokens: 128_000 },
+  "gpt-5.2": { context: 400_000, maxTokens: 128_000 },
+  "gpt-5.2-codex": { context: 400_000, maxTokens: 128_000 },
+  "gpt-5.3-codex": { context: 400_000, maxTokens: 128_000 },
+  "gpt-5.4": { context: 272_000, maxTokens: 128_000 },
+  "gpt-5.4-medium": { context: 272_000, maxTokens: 128_000 },
   // Gemini — 1M+
-  "gemini-3-pro":               { context: 1_000_000 },
-  "gemini-3.1-pro":             { context: 1_000_000 },
-  "gemini-3-flash":             { context: 1_000_000 },
-  "gemini-2.5-flash":           { context: 1_000_000 },
+  "gemini-3-pro": { context: 1_000_000 },
+  "gemini-3.1-pro": { context: 1_000_000 },
+  "gemini-3-flash": { context: 1_000_000 },
+  "gemini-2.5-flash": { context: 1_000_000 },
 };
 
 const CursorModelDetailsSchema = z.object({
@@ -49,9 +46,7 @@ const CursorModelDetailsSchema = z.object({
     .optional()
     .catch([])
     .transform((aliases) =>
-      (aliases ?? []).filter(
-        (alias: unknown): alias is string => typeof alias === "string",
-      ),
+      (aliases ?? []).filter((alias: unknown): alias is string => typeof alias === "string"),
     ),
   thinkingDetails: z.unknown().optional(),
   maxMode: z.boolean().optional().catch(undefined),
@@ -69,26 +64,90 @@ export interface CursorModel {
 
 const FALLBACK_MODELS: CursorModel[] = [
   // Composer models
-  { id: "composer-1", name: "Composer 1", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "composer-1.5", name: "Composer 1.5", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  {
+    id: "composer-1",
+    name: "Composer 1",
+    reasoning: true,
+    contextWindow: 200_000,
+    maxTokens: 64_000,
+  },
+  {
+    id: "composer-1.5",
+    name: "Composer 1.5",
+    reasoning: true,
+    contextWindow: 200_000,
+    maxTokens: 64_000,
+  },
   // Claude models
-  { id: "claude-4.6-opus-high", name: "Claude 4.6 Opus", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
-  { id: "claude-4.6-sonnet-medium", name: "Claude 4.6 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "claude-4.5-sonnet", name: "Claude 4.5 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  {
+    id: "claude-4.6-opus-high",
+    name: "Claude 4.6 Opus",
+    reasoning: true,
+    contextWindow: 200_000,
+    maxTokens: 128_000,
+  },
+  {
+    id: "claude-4.6-sonnet-medium",
+    name: "Claude 4.6 Sonnet",
+    reasoning: true,
+    contextWindow: 200_000,
+    maxTokens: 64_000,
+  },
+  {
+    id: "claude-4.5-sonnet",
+    name: "Claude 4.5 Sonnet",
+    reasoning: true,
+    contextWindow: 200_000,
+    maxTokens: 64_000,
+  },
   // GPT models
-  { id: "gpt-5.4-medium", name: "GPT-5.4", reasoning: true, contextWindow: 272_000, maxTokens: 128_000 },
+  {
+    id: "gpt-5.4-medium",
+    name: "GPT-5.4",
+    reasoning: true,
+    contextWindow: 272_000,
+    maxTokens: 128_000,
+  },
   { id: "gpt-5.2", name: "GPT-5.2", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
-  { id: "gpt-5.2-codex", name: "GPT-5.2 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
-  { id: "gpt-5.3-codex", name: "GPT-5.3 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
-  { id: "gpt-5.3-codex-spark-preview", name: "GPT-5.3 Codex Spark", reasoning: true, contextWindow: 128_000, maxTokens: 128_000 },
+  {
+    id: "gpt-5.2-codex",
+    name: "GPT-5.2 Codex",
+    reasoning: true,
+    contextWindow: 400_000,
+    maxTokens: 128_000,
+  },
+  {
+    id: "gpt-5.3-codex",
+    name: "GPT-5.3 Codex",
+    reasoning: true,
+    contextWindow: 400_000,
+    maxTokens: 128_000,
+  },
+  {
+    id: "gpt-5.3-codex-spark-preview",
+    name: "GPT-5.3 Codex Spark",
+    reasoning: true,
+    contextWindow: 128_000,
+    maxTokens: 128_000,
+  },
   // Other models
-  { id: "gemini-3.1-pro", name: "Gemini 3.1 Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 64_000 },
-  { id: "grok-code-fast-1", name: "Grok Code Fast 1", reasoning: false, contextWindow: 128_000, maxTokens: 64_000 },
+  {
+    id: "gemini-3.1-pro",
+    name: "Gemini 3.1 Pro",
+    reasoning: true,
+    contextWindow: 1_000_000,
+    maxTokens: 64_000,
+  },
+  {
+    id: "grok-code-fast-1",
+    name: "Grok Code Fast 1",
+    reasoning: false,
+    contextWindow: 128_000,
+    maxTokens: 64_000,
+  },
 ];
 
-async function fetchCursorUsableModels(
-  apiKey: string,
-): Promise<CursorModel[] | null> {
+async function fetchCursorUsableModels(apiKey: string): Promise<CursorModel[] | null> {
   try {
     const requestPayload = create(GetUsableModelsRequestSchema, {});
     const requestBody = toBinary(GetUsableModelsRequestSchema, requestPayload);
@@ -115,9 +174,7 @@ async function fetchCursorUsableModels(
 
 let cachedModels: CursorModel[] | null = null;
 
-export async function getCursorModels(
-  apiKey: string,
-): Promise<CursorModel[]> {
+export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
   if (cachedModels) return cachedModels;
   const discovered = await fetchCursorUsableModels(apiKey);
   cachedModels = discovered && discovered.length > 0 ? discovered : FALLBACK_MODELS;
@@ -174,9 +231,7 @@ function decodeConnectUnaryBody(payload: Uint8Array): Uint8Array | null {
   return null;
 }
 
-function normalizeCursorModels(
-  models: readonly unknown[],
-): CursorModel[] {
+function normalizeCursorModels(models: readonly unknown[]): CursorModel[] {
   if (models.length === 0) return [];
 
   const byId = new Map<string, CursorModel>();
@@ -205,7 +260,10 @@ function normalizeSingleModel(model: unknown): CursorModel | null {
   };
 }
 
-function resolveModelLimits(modelId: string, maxMode?: boolean): { context: number; maxTokens: number } {
+function resolveModelLimits(
+  modelId: string,
+  maxMode?: boolean,
+): { context: number; maxTokens: number } {
   const isMax = maxMode || /-max(?:-|$)/.test(modelId);
   const exact = MODEL_LIMITS[modelId];
   if (exact) {

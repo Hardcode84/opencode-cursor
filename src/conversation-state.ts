@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { join } from "node:path";
 
 export interface StoredConversation {
   conversationId: string;
@@ -19,7 +19,9 @@ function evictStaleConversations(): void {
   for (const [key, stored] of conversationStates) {
     if (now - stored.lastAccessMs > CONVERSATION_TTL_MS) {
       conversationStates.delete(key);
-      try { unlinkSync(convDiskPath(key)); } catch {}
+      try {
+        unlinkSync(convDiskPath(key));
+      } catch {}
     }
   }
 }
@@ -31,7 +33,9 @@ const CONV_DISK_DIR = join(
   "opencode",
   "cursor-conversations",
 );
-try { mkdirSync(CONV_DISK_DIR, { recursive: true }); } catch {}
+try {
+  mkdirSync(CONV_DISK_DIR, { recursive: true });
+} catch {}
 
 const CONV_DISK_TTL_MS = 24 * 60 * 60 * 1000; // 24h on-disk TTL
 
@@ -59,25 +63,35 @@ export function persistConversation(convKey: string, stored: StoredConversation)
       [...stored.checkpointHistory].map(([fp, cp]) => [fp, Buffer.from(cp).toString("base64")]),
     ),
   };
-  try { writeFileSync(convDiskPath(convKey), JSON.stringify(data)); } catch {}
+  try {
+    writeFileSync(convDiskPath(convKey), JSON.stringify(data));
+  } catch {}
 }
 
 function loadConversation(convKey: string): StoredConversation | null {
   try {
     const raw: SerializedConversation = JSON.parse(readFileSync(convDiskPath(convKey), "utf-8"));
     if (Date.now() - raw.savedMs > CONV_DISK_TTL_MS) {
-      try { unlinkSync(convDiskPath(convKey)); } catch {}
+      try {
+        unlinkSync(convDiskPath(convKey));
+      } catch {}
       return null;
     }
     return {
       conversationId: raw.conversationId,
       checkpoint: raw.checkpoint ? new Uint8Array(Buffer.from(raw.checkpoint, "base64")) : null,
       blobStore: new Map(
-        Object.entries(raw.blobStore).map(([k, v]) => [k, new Uint8Array(Buffer.from(v, "base64"))]),
+        Object.entries(raw.blobStore).map(([k, v]) => [
+          k,
+          new Uint8Array(Buffer.from(v, "base64")),
+        ]),
       ),
       lastAccessMs: Date.now(),
       checkpointHistory: new Map(
-        Object.entries(raw.checkpointHistory ?? {}).map(([fp, cp]) => [fp, new Uint8Array(Buffer.from(cp, "base64"))]),
+        Object.entries(raw.checkpointHistory ?? {}).map(([fp, cp]) => [
+          fp,
+          new Uint8Array(Buffer.from(cp, "base64")),
+        ]),
       ),
     };
   } catch {
@@ -101,10 +115,7 @@ function evictStaleDiskConversations(): void {
 /** Deterministic UUID derived from convKey so Cursor's server-side conversation
  *  persists across proxy restarts. Formats 16 bytes of SHA-256 as a v4-shaped UUID. */
 export function deterministicConversationId(convKey: string): string {
-  const hex = createHash("sha256")
-    .update(`cursor-conv-id:${convKey}`)
-    .digest("hex")
-    .slice(0, 32);
+  const hex = createHash("sha256").update(`cursor-conv-id:${convKey}`).digest("hex").slice(0, 32);
   return [
     hex.slice(0, 8),
     hex.slice(8, 12),
@@ -138,7 +149,9 @@ export function getConversationState(convKey: string): StoredConversation | unde
 
 export function invalidateConversationState(convKey: string): void {
   conversationStates.delete(convKey);
-  try { unlinkSync(convDiskPath(convKey)); } catch {}
+  try {
+    unlinkSync(convDiskPath(convKey));
+  } catch {}
 }
 
 export type Turn = { userText: string; assistantText: string };

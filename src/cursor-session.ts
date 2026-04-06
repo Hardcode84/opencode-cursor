@@ -1,21 +1,21 @@
+import { randomBytes, randomUUID } from "node:crypto";
+import { type ClientHttp2Session, type ClientHttp2Stream, connect as h2Connect } from "node:http2";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
-import {
-  AgentClientMessageSchema,
-  AgentServerMessageSchema,
-  ClientHeartbeatSchema,
-  type McpToolDefinition,
-} from "./proto/agent_pb";
-import { frameConnectMessage, createConnectFrameParser, parseConnectEndStream } from "./protocol";
+import { processServerMessage, type StreamState } from "./cursor-messages";
+import { logError, logWarn } from "./logger";
 import {
   type BridgeWriter,
   type PendingExec,
   sendMcpResultSuccess,
   sendNativeResult,
 } from "./native-tools";
-import { type StreamState, processServerMessage } from "./cursor-messages";
-import { logError, logWarn } from "./logger";
-import { connect as h2Connect, type ClientHttp2Session, type ClientHttp2Stream } from "node:http2";
-import { randomBytes, randomUUID } from "node:crypto";
+import {
+  AgentClientMessageSchema,
+  AgentServerMessageSchema,
+  ClientHeartbeatSchema,
+  type McpToolDefinition,
+} from "./proto/agent_pb";
+import { createConnectFrameParser, frameConnectMessage, parseConnectEndStream } from "./protocol";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CURSOR_AGENT_URL = process.env.CURSOR_AGENT_URL ?? "https://agentn.us.api5.cursor.sh";
@@ -272,8 +272,16 @@ export class CursorSession implements BridgeWriter {
   }
 
   private closeTransport(): void {
-    try { this.h2Stream?.close(); } catch { /* ignore */ }
-    try { this.h2Session?.close(); } catch { /* ignore */ }
+    try {
+      this.h2Stream?.close();
+    } catch {
+      /* ignore */
+    }
+    try {
+      this.h2Session?.close();
+    } catch {
+      /* ignore */
+    }
   }
 
   private clearInactivityTimer(): void {
@@ -355,7 +363,7 @@ export class CursorSession implements BridgeWriter {
           });
         },
         (note) => {
-          this.queue.push({ type: "text", text: "\n" + note + "\n", isThinking: false });
+          this.queue.push({ type: "text", text: `\n${note}\n`, isThinking: false });
         },
       );
       if (recognized) this.resetInactivityTimer();
@@ -428,7 +436,11 @@ export async function callCursorUnaryRpc(
     timeoutMs > 0
       ? setTimeout(() => {
           timedOut = true;
-          try { session.destroy(); } catch { /* ignore */ }
+          try {
+            session.destroy();
+          } catch {
+            /* ignore */
+          }
         }, timeoutMs)
       : undefined;
 
@@ -436,7 +448,11 @@ export async function callCursorUnaryRpc(
     if (settled) return;
     settled = true;
     if (timeout) clearTimeout(timeout);
-    try { session.close(); } catch { /* ignore */ }
+    try {
+      session.close();
+    } catch {
+      /* ignore */
+    }
     resolve({ body, exitCode: code, timedOut });
   };
 

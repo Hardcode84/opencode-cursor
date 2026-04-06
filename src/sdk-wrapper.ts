@@ -82,7 +82,7 @@ export function createCursorCompatible(options: OpenAICompatibleProviderSettings
     const model = sdk.languageModel(modelId);
     const origDoStream = model.doStream.bind(model);
 
-    model.doStream = async function (opts: any) {
+    model.doStream = async (opts: any) => {
       const result = await origDoStream(opts);
       return {
         ...result,
@@ -95,16 +95,13 @@ export function createCursorCompatible(options: OpenAICompatibleProviderSettings
     return model;
   }
 
-  const provider: any = function (modelId: string) {
-    return wrapLanguageModel(modelId);
-  };
+  const provider: any = (modelId: string) => wrapLanguageModel(modelId);
   provider.languageModel = wrapLanguageModel;
   provider.chat = wrapLanguageModel;
 
   const s = sdk as any;
   if (s.completion) provider.completion = s.completion.bind(sdk);
-  if (s.textEmbeddingModel)
-    provider.textEmbeddingModel = s.textEmbeddingModel.bind(sdk);
+  if (s.textEmbeddingModel) provider.textEmbeddingModel = s.textEmbeddingModel.bind(sdk);
   if (s.textEmbedding) provider.textEmbedding = s.textEmbedding.bind(sdk);
   if (s.image) provider.image = s.image.bind(sdk);
 

@@ -1,41 +1,41 @@
+import { createHash, randomUUID } from "node:crypto";
 import { create, fromBinary, fromJson, type JsonValue, toBinary } from "@bufbuild/protobuf";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import {
+  getConversationState,
+  invalidateConversationState,
+  persistConversation,
+  resolveConversationState,
+  turnsFingerprint,
+} from "./conversation-state";
+import { CursorSession } from "./cursor-session";
+import { errorDetails, logDebug, logError, logInfo, logWarn } from "./logger";
+import type { PumpResult } from "./openai-stream";
+import {
+  collectNonStreamingResponse,
+  createSSECtx,
+  pumpSession,
+  SSE_HEADERS,
+  type SSECtx,
+} from "./openai-stream";
+import {
   AgentClientMessageSchema,
+  AgentConversationTurnStructureSchema,
   AgentRunRequestSchema,
+  AssistantMessageSchema,
   ConversationActionSchema,
   ConversationStateStructureSchema,
   ConversationStepSchema,
-  AgentConversationTurnStructureSchema,
   ConversationTurnStructureSchema,
-  AssistantMessageSchema,
+  type McpToolDefinition,
   McpToolDefinitionSchema,
   ModelDetailsSchema,
   RequestContextSchema,
   ResumeActionSchema,
   UserMessageActionSchema,
   UserMessageSchema,
-  type McpToolDefinition,
 } from "./proto/agent_pb";
-import { logInfo, logWarn, logError, logDebug, errorDetails } from "./logger";
-import {
-  persistConversation,
-  resolveConversationState,
-  getConversationState,
-  invalidateConversationState,
-  turnsFingerprint,
-} from "./conversation-state";
-import { detectTitleRequest, buildTitleSourceText, handleTitleGenerationRequest } from "./title";
-import { CursorSession } from "./cursor-session";
-import type { PumpResult } from "./openai-stream";
-import {
-  SSE_HEADERS,
-  createSSECtx,
-  pumpSession,
-  collectNonStreamingResponse,
-  type SSECtx,
-} from "./openai-stream";
-import { createHash, randomUUID } from "node:crypto";
+import { buildTitleSourceText, detectTitleRequest, handleTitleGenerationRequest } from "./title";
 
 const MAX_BLOB_RETRIES = 2;
 const MAX_AUTO_RESUMES = 5;
@@ -261,14 +261,11 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
       if (call) {
         const argsPreview =
           call.function.arguments.length > 200
-            ? call.function.arguments.slice(0, 200) + "..."
+            ? `${call.function.arguments.slice(0, 200)}...`
             : call.function.arguments;
         const resultPreview =
           toolContent.length > 20000
-            ? toolContent.slice(0, 20000) +
-              "\n...[truncated from " +
-              toolContent.length +
-              " chars]"
+            ? `${toolContent.slice(0, 20000)}\n...[truncated from ${toolContent.length} chars]`
             : toolContent;
         pendingAssistant += `\n[Tool ${call.function.name}(${argsPreview})]\n${resultPreview}\n`;
       }
@@ -304,10 +301,7 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   return { systemPrompt, userText: lastUserText, turns: pairs, toolResults };
 }
 
-function selectToolsForChoice(
-  tools: OpenAIToolDef[],
-  toolChoice: unknown,
-): OpenAIToolDef[] {
+function selectToolsForChoice(tools: OpenAIToolDef[], toolChoice: unknown): OpenAIToolDef[] {
   if (!tools.length) return [];
   if (
     toolChoice === undefined ||
@@ -396,12 +390,10 @@ function buildCursorRequest(
 
   const systemJson = JSON.stringify({ role: "system", content: systemPrompt });
   const systemBytes = new TextEncoder().encode(systemJson);
-  const systemBlobId = new Uint8Array(
-    createHash("sha256").update(systemBytes).digest(),
-  );
+  const systemBlobId = new Uint8Array(createHash("sha256").update(systemBytes).digest());
   blobStore.set(Buffer.from(systemBlobId).toString("hex"), systemBytes);
 
-  let conversationState;
+  let conversationState: ReturnType<typeof create<typeof ConversationStateStructureSchema>>;
   if (checkpoint) {
     conversationState = fromBinary(ConversationStateStructureSchema, checkpoint);
   } else {
@@ -596,7 +588,11 @@ async function pumpWithAutoResume(
       if (isStepBoundary) {
         logDebug("step-boundary resume", { attempt: resumeCount });
       } else {
-        logWarn("auto-resume", { hint: result.retryHint, attempt: resumeCount, max: MAX_AUTO_RESUMES });
+        logWarn("auto-resume", {
+          hint: result.retryHint,
+          attempt: resumeCount,
+          max: MAX_AUTO_RESUMES,
+        });
         ctx.sendChunk({
           content: `\n[Auto-resuming (attempt ${resumeCount}/${MAX_AUTO_RESUMES})...]\n`,
         });
@@ -736,8 +732,7 @@ function handleChatCompletion(
 
   const mcpTools = buildMcpToolDefinitions(tools);
   const effectiveUserText =
-    userText ||
-    (toolResults.length > 0 ? toolResults.map((r) => r.content).join("\n") : "");
+    userText || (toolResults.length > 0 ? toolResults.map((r) => r.content).join("\n") : "");
 
   const payload = buildCursorRequest(
     modelId,

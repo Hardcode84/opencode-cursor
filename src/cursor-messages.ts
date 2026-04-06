@@ -7,47 +7,45 @@
  */
 import { create, fromBinary, toBinary, toJson } from "@bufbuild/protobuf";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
+import { logDebug, logWarn } from "./logger";
+import { fixMcpArgNames, nativeToMcpRedirect, type PendingExec } from "./native-tools";
 import {
   AgentClientMessageSchema,
+  type AgentServerMessage,
+  AskQuestionInteractionResponseSchema,
+  AskQuestionRejectedSchema,
+  AskQuestionResultSchema,
   BackgroundShellSpawnResultSchema,
+  type ConversationStateStructure,
   ConversationStateStructureSchema,
+  CreatePlanRequestResponseSchema,
   DiagnosticsResultSchema,
+  ExaFetchRequestResponseSchema,
+  ExaSearchRequestResponseSchema,
   ExecClientControlMessageSchema,
   ExecClientMessageSchema,
   ExecClientStreamCloseSchema,
+  type ExecServerControlMessage,
+  type ExecServerMessage,
   GetBlobResultSchema,
   InteractionResponseSchema,
   KvClientMessageSchema,
-  McpErrorSchema,
+  type KvServerMessage,
   McpInstructionsSchema,
   McpResultSchema,
-  McpToolDefinitionSchema,
+  type McpToolDefinition,
   RequestContextResultSchema,
   RequestContextSchema,
   RequestContextSuccessSchema,
   SetBlobResultSchema,
   ShellRejectedSchema,
-  WebSearchRequestResponseSchema,
-  WebSearchRequestResponse_ApprovedSchema,
-  ExaSearchRequestResponseSchema,
-  ExaFetchRequestResponseSchema,
-  AskQuestionInteractionResponseSchema,
-  AskQuestionResultSchema,
-  AskQuestionRejectedSchema,
   SwitchModeRequestResponseSchema,
-  CreatePlanRequestResponseSchema,
+  WebSearchRequestResponse_ApprovedSchema,
+  WebSearchRequestResponseSchema,
   WriteShellStdinErrorSchema,
   WriteShellStdinResultSchema,
-  type AgentServerMessage,
-  type ConversationStateStructure,
-  type ExecServerControlMessage,
-  type ExecServerMessage,
-  type KvServerMessage,
-  type McpToolDefinition,
 } from "./proto/agent_pb";
 import { frameConnectMessage } from "./protocol";
-import { type PendingExec, fixMcpArgNames, nativeToMcpRedirect } from "./native-tools";
-import { logDebug, logWarn } from "./logger";
 
 function proxyLog(msg: string, ...args: unknown[]): void {
   let i = 0;
@@ -187,7 +185,12 @@ function handleInteractionUpdate(
     state.outputTokens += update.message.value.tokens ?? 0;
   } else if (updateCase === "toolCallStarted") {
     const val = update.message.value;
-    proxyLog("toolCallStarted: callId=%s modelCallId=%s pending=%d", val?.callId ?? "", val?.modelCallId ?? "", state.pendingExecs.length);
+    proxyLog(
+      "toolCallStarted: callId=%s modelCallId=%s pending=%d",
+      val?.callId ?? "",
+      val?.modelCallId ?? "",
+      state.pendingExecs.length,
+    );
   } else if (updateCase === "toolCallCompleted") {
     proxyLog("toolCallCompleted: callId=%s", update.message.value?.callId ?? "");
   } else if (updateCase === "turnEnded") {
@@ -203,7 +206,11 @@ function handleInteractionUpdate(
   } else if (updateCase === "heartbeat") {
     // heartbeat is just a keepalive — not a batch delimiter
   } else if (updateCase && updateCase !== "toolCallDelta" && updateCase !== "partialToolCall") {
-    proxyLog("interactionUpdate: unhandled type=%s (pending=%d)", updateCase, state.pendingExecs.length);
+    proxyLog(
+      "interactionUpdate: unhandled type=%s (pending=%d)",
+      updateCase,
+      state.pendingExecs.length,
+    );
   }
 }
 
@@ -216,9 +223,10 @@ function handleInteractionQuery(
 ): void {
   const queryId: number = query.id ?? 0;
   const queryCase: string = query.query?.case ?? "unknown";
-  const searchTerm = queryCase === "webSearchRequestQuery"
-    ? (query.query?.value?.args?.searchTerm ?? "") as string
-    : "";
+  const searchTerm =
+    queryCase === "webSearchRequestQuery"
+      ? ((query.query?.value?.args?.searchTerm ?? "") as string)
+      : "";
   const queryDetail = searchTerm ? ` search=${JSON.stringify(searchTerm).slice(0, 80)}` : "";
   proxyLog("interactionQuery: id=%d type=%s%s", queryId, queryCase, queryDetail);
 
@@ -251,7 +259,10 @@ function handleInteractionQuery(
       case: "askQuestionInteractionResponse",
       value: create(AskQuestionInteractionResponseSchema, {
         result: create(AskQuestionResultSchema, {
-          result: { case: "rejected", value: create(AskQuestionRejectedSchema, { reason: "Non-interactive session" }) },
+          result: {
+            case: "rejected",
+            value: create(AskQuestionRejectedSchema, { reason: "Non-interactive session" }),
+          },
         }),
       }),
     };
@@ -266,7 +277,11 @@ function handleInteractionQuery(
       value: create(CreatePlanRequestResponseSchema, {}),
     };
   } else {
-    proxyLog("interactionQuery: unknown type %s — sending empty response for id=%d", queryCase, queryId);
+    proxyLog(
+      "interactionQuery: unknown type %s — sending empty response for id=%d",
+      queryCase,
+      queryId,
+    );
     const response = create(InteractionResponseSchema, { id: queryId });
     const clientMsg = create(AgentClientMessageSchema, {
       message: { case: "interactionResponse", value: response },
@@ -316,18 +331,15 @@ function handleKvMessage(
       proxyLog("KV getBlob MISS: %s (store has %d blobs)", blobIdKey.slice(0, 16), blobStore.size);
     }
     sendKvResponse(
-      kvMsg, "getBlobResult",
+      kvMsg,
+      "getBlobResult",
       create(GetBlobResultSchema, blobData ? { blobData } : {}),
       sendFrame,
     );
   } else if (kvCase === "setBlobArgs") {
     const { blobId, blobData } = kvMsg.message.value;
     blobStore.set(Buffer.from(blobId).toString("hex"), blobData);
-    sendKvResponse(
-      kvMsg, "setBlobResult",
-      create(SetBlobResultSchema, {}),
-      sendFrame,
-    );
+    sendKvResponse(kvMsg, "setBlobResult", create(SetBlobResultSchema, {}), sendFrame);
   }
 }
 
@@ -345,7 +357,10 @@ export function handleExecMessage(
 
   if (execCase === "requestContextArgs") {
     if (state && state.pendingExecs.length > 0) {
-      proxyLog("exec: requestContextArgs while %d execs pending → signaling batch complete", state.pendingExecs.length);
+      proxyLog(
+        "exec: requestContextArgs while %d execs pending → signaling batch complete",
+        state.pendingExecs.length,
+      );
       state.checkpointAfterExec = true;
     }
     proxyLog("exec: requestContextArgs (providing %d MCP tools)", mcpTools.length);
@@ -396,7 +411,12 @@ export function handleExecMessage(
   if (state) state.totalExecCount++;
   const nativeRedirect = nativeToMcpRedirect(execCase as string, execMsg);
   if (nativeRedirect) {
-    proxyLog("redirect native exec: %s → %s (id=%d)", execCase, nativeRedirect.toolName, execMsg.id);
+    proxyLog(
+      "redirect native exec: %s → %s (id=%d)",
+      execCase,
+      nativeRedirect.toolName,
+      execMsg.id,
+    );
     onMcpExec({
       execId: execMsg.execId,
       execMsgId: execMsg.id,
@@ -411,7 +431,8 @@ export function handleExecMessage(
 
   // --- Reject unsupported native tools ---
   proxyLog("reject native exec: %s (id=%d)", execCase, execMsg.id);
-  const REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
+  const REJECT_REASON =
+    "Tool not available in this environment. Use the MCP tools provided instead.";
 
   if (execCase === "backgroundShellSpawnArgs") {
     const args = execMsg.message.value;
@@ -431,7 +452,10 @@ export function handleExecMessage(
   }
   if (execCase === "writeShellStdinArgs") {
     const result = create(WriteShellStdinResultSchema, {
-      result: { case: "error", value: create(WriteShellStdinErrorSchema, { error: REJECT_REASON }) },
+      result: {
+        case: "error",
+        value: create(WriteShellStdinErrorSchema, { error: REJECT_REASON }),
+      },
     });
     sendExecResult(execMsg, "writeShellStdinResult", result, sendFrame);
     return;
@@ -501,13 +525,17 @@ function sendUnknownExecResult(
   execMsg: ExecServerMessage,
   sendFrame: (data: Uint8Array) => void,
 ): void {
-  const unknowns: Array<{ no: number; wireType: number; data: Uint8Array }> | undefined =
-    (execMsg as any).$unknown;
+  const unknowns: Array<{ no: number; wireType: number; data: Uint8Array }> | undefined = (
+    execMsg as any
+  ).$unknown;
   const argsField = unknowns?.find(
     (f) => f.wireType === 2 && f.no !== 1 && f.no !== 15 && f.no !== 19,
   );
   if (!argsField) {
-    logWarn("unhandled exec: no recoverable field number", { case: execMsg.message.case, id: execMsg.id });
+    logWarn("unhandled exec: no recoverable field number", {
+      case: execMsg.message.case,
+      id: execMsg.id,
+    });
     return;
   }
   const resultFieldNo = argsField.no;
