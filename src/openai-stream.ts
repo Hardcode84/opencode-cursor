@@ -82,21 +82,19 @@ export function createSSECtx(
       if (!markClosed()) return;
       try {
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-      } catch {
-        /* stream already aborted */
-      }
-      try {
         controller.close();
       } catch {
         /* stream already aborted */
       }
     },
+    // Idempotent teardown: always attempts controller.close() even if
+    // sendDone already closed it, so finally-blocks can call unconditionally.
     close() {
       markClosed();
       try {
         controller.close();
       } catch {
-        /* stream already aborted */
+        /* already closed or aborted */
       }
     },
     get closed() {
@@ -162,9 +160,7 @@ export async function pumpSession(session: CursorSession, ctx: SSECtx): Promise<
         break;
 
       case "batchReady": {
-        logDebug("pumpSession: batchReady, sending finish_reason=tool_calls", {
-          ctxClosed: ctx.closed,
-        });
+        logDebug("pumpSession: batchReady, sending finish_reason=tool_calls");
         const flushed = tagFilter.flush();
         if (flushed.reasoning) ctx.sendChunk({ reasoning_content: flushed.reasoning });
         if (flushed.content) ctx.sendChunk({ content: flushed.content });

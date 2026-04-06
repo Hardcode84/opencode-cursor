@@ -48,6 +48,7 @@ import { buildTitleSourceText, detectTitleRequest, handleTitleGenerationRequest 
 const MAX_BLOB_RETRIES = 2;
 const MAX_AUTO_RESUMES = 5;
 const SESSION_TTL_MS = 5 * 60 * 1000;
+const FLUSHED_MAX_LIFETIME_MS = 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -82,15 +83,28 @@ interface ActiveSession {
 const activeSessions = new Map<string, ActiveSession>();
 
 function evictStaleSessions(): void {
-  const cutoff = Date.now() - SESSION_TTL_MS;
+  const now = Date.now();
+  const ttlCutoff = now - SESSION_TTL_MS;
+  const flushedCutoff = now - FLUSHED_MAX_LIFETIME_MS;
   for (const [key, active] of activeSessions) {
     if (!active.session.alive) {
       activeSessions.delete(key);
       continue;
     }
-    // Don't evict sessions waiting for client tool results
-    if (active.session.flushedExecs.length > 0) continue;
-    if (active.storedAt < cutoff) {
+    if (active.session.flushedExecs.length > 0) {
+      // Safety net: evict even flushed sessions after 60 min to prevent leaks
+      // from clients that disconnect without cancelling the stream.
+      if (active.storedAt < flushedCutoff) {
+        logDebug("evicting long-lived flushed session", {
+          bridgeKey: key,
+          ageSec: Math.round((now - active.storedAt) / 1000),
+        });
+        active.session.close();
+        activeSessions.delete(key);
+      }
+      continue;
+    }
+    if (active.storedAt < ttlCutoff) {
       active.session.close();
       activeSessions.delete(key);
     }
@@ -656,13 +670,16 @@ function tryToolResultResume(
   activeSessions.delete(bridgeKey);
   const pendingIds = new Set(active.session.flushedExecs.map((e) => e.toolCallId));
   const newResults = toolResults.filter((r) => pendingIds.has(r.toolCallId));
-  const orphanedCount = toolResults.length - newResults.length;
+  const staleCount = toolResults.length - newResults.length;
 
-  if (orphanedCount > 0) {
-    logWarn("tool results reference unknown pending exec IDs", {
-      orphanedCount,
-      knownIds: [...pendingIds],
-      receivedIds: toolResults.map((r) => r.toolCallId),
+  if (staleCount > 0) {
+    logDebug("resume: filtered stale tool result IDs from prior turns", {
+      staleCount,
+      matchedCount: newResults.length,
+      staleSample: toolResults
+        .filter((r) => !pendingIds.has(r.toolCallId))
+        .slice(0, 3)
+        .map((r) => r.toolCallId),
     });
   }
 
@@ -675,9 +692,10 @@ function tryToolResultResume(
   }
 
   if (active.session.alive) {
-    logDebug(
-      `resume: session alive, ${newResults.length} new tool results (of ${toolResults.length} total)`,
-    );
+    logDebug("resume: session alive", {
+      matchedCount: newResults.length,
+      totalReceived: toolResults.length,
+    });
     active.session.sendToolResults(newResults);
     return handleResumeStream(active.session, modelId, bridgeKey, convKey);
   }

@@ -23,7 +23,6 @@ const CURSOR_AGENT_URL = process.env.CURSOR_AGENT_URL ?? "https://agentn.us.api5
 const CURSOR_CLIENT_VERSION = "cli-2026.03.30-a5d3e17";
 const THINKING_TIMEOUT_MS = 30_000;
 const STREAMING_TIMEOUT_MS = 15_000;
-const FLUSHED_WAIT_TIMEOUT_MS = 10 * 60 * 1000;
 const CLOSE_OK = 0;
 const CLOSE_ERR = 1;
 
@@ -308,16 +307,9 @@ export class CursorSession implements BridgeWriter {
   }
 
   private resetInactivityTimer(): void {
-    // Flushed: absolute deadline -- don't restart on server traffic
-    if (this.batchState === "flushed") {
-      if (this.inactivityTimer) return;
-      this.inactivityTimer = setTimeout(() => {
-        this.inactivityTimer = null;
-        this.pushDone({ type: "done", error: "Tool result wait timed out" });
-        this.close();
-      }, FLUSHED_WAIT_TIMEOUT_MS);
-      return;
-    }
+    // Flushed: no timer -- the session stays alive until tool results arrive
+    // or the H2 connection drops. Heartbeats keep the wire warm.
+    if (this.batchState === "flushed") return;
     // Collecting with pending execs: non-sliding deadline so heartbeats can't prevent flush.
     // Reuses THINKING_TIMEOUT_MS -- same ceiling as the idle-before-first-token phase.
     if (this.batchState === "collecting" && this.pendingExecs.length > 0) {
@@ -403,8 +395,8 @@ export class CursorSession implements BridgeWriter {
       });
     }
     logDebug("flushBatch", {
-      pendingExecs: this.pendingExecs.length,
-      ids: this.pendingExecs.map((e) => e.toolCallId),
+      count: this.pendingExecs.length,
+      toolCallIds: this.pendingExecs.map((e) => e.toolCallId),
       convKey: this.options.convKey,
     });
     this.batchState = "flushed";
