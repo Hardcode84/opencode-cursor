@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { fixMcpArgNames, nativeToMcpRedirect } from "../src/native-tools";
-import type { ExecServerMessage } from "../src/proto/agent_pb";
+import { buildGrepResult, fixMcpArgNames, nativeToMcpRedirect } from "../src/native-tools";
+import type {
+  ExecServerMessage,
+  GrepContentResult,
+  GrepCountResult,
+  GrepFilesResult,
+  GrepResult,
+  GrepSuccess,
+} from "../src/proto/agent_pb";
 
 /** Minimal mock matching the fields nativeToMcpRedirect actually reads. */
 function mockExec(value: Record<string, unknown>, id = 1, execId = "exec-1"): ExecServerMessage {
@@ -225,7 +232,7 @@ describe("nativeToMcpRedirect", () => {
   test("grepArgs → grep", () => {
     const r = nativeToMcpRedirect(
       "grepArgs",
-      mockExec({ pattern: "TODO", path: "/src", toolCallId: "tc-8" }),
+      mockExec({ pattern: "TODO", path: "/src", toolCallId: "tc-grep-1" }),
     );
     expect(r!.toolName).toBe("grep");
     expect(r!.nativeResultType).toBe("grepResult");
@@ -247,7 +254,7 @@ describe("nativeToMcpRedirect", () => {
         type: "ts",
         headLimit: 50,
         multiline: true,
-        toolCallId: "tc-8",
+        toolCallId: "tc-grep-2",
       }),
     );
     const args = JSON.parse(r!.decodedArgs);
@@ -264,7 +271,7 @@ describe("nativeToMcpRedirect", () => {
   test("grepArgs: empty pattern with glob → redirects to glob tool", () => {
     const r = nativeToMcpRedirect(
       "grepArgs",
-      mockExec({ pattern: "", glob: "*.ts", toolCallId: "tc-8" }),
+      mockExec({ pattern: "", glob: "*.ts", toolCallId: "tc-grep-3" }),
     );
     expect(r!.toolName).toBe("glob");
     expect(r!.nativeResultType).toBe("grepResult");
@@ -272,12 +279,301 @@ describe("nativeToMcpRedirect", () => {
   });
 
   test("grepArgs: no pattern and no glob → default pattern", () => {
-    const r = nativeToMcpRedirect("grepArgs", mockExec({ toolCallId: "tc-8" }));
+    const r = nativeToMcpRedirect("grepArgs", mockExec({ toolCallId: "tc-grep-4" }));
     expect(r!.toolName).toBe("grep");
     expect(JSON.parse(r!.decodedArgs).pattern).toBe(".");
   });
 
   test("unknown exec type → null", () => {
     expect(nativeToMcpRedirect("unknownArgs", mockExec({ toolCallId: "tc-9" }))).toBeNull();
+  });
+
+  test("grepArgs stores pattern/path/outputMode in nativeArgs", () => {
+    const r = nativeToMcpRedirect(
+      "grepArgs",
+      mockExec({ pattern: "TODO", path: "/src", outputMode: "count", toolCallId: "tc-grep-5" }),
+    );
+    expect(r!.nativeArgs!.pattern).toBe("TODO");
+    expect(r!.nativeArgs!.path).toBe("/src");
+    expect(r!.nativeArgs!.outputMode).toBe("count");
+  });
+
+  test("grepArgs: multiline and headLimit stored in nativeArgs", () => {
+    const r = nativeToMcpRedirect(
+      "grepArgs",
+      mockExec({
+        pattern: "x",
+        multiline: true,
+        headLimit: 50,
+        toolCallId: "tc-grep-6",
+      }),
+    );
+    expect(r!.nativeArgs!.multiline).toBe("true");
+    expect(r!.nativeArgs!.headLimit).toBe("50");
+  });
+
+  test("grepArgs: nativeArgs omits multiline/headLimit when not set", () => {
+    const r = nativeToMcpRedirect("grepArgs", mockExec({ pattern: "x", toolCallId: "tc-grep-7" }));
+    expect(r!.nativeArgs!.multiline).toBeUndefined();
+    expect(r!.nativeArgs!.headLimit).toBeUndefined();
+  });
+
+  test("grepArgs: glob redirect stores glob pattern in nativeArgs", () => {
+    const r = nativeToMcpRedirect(
+      "grepArgs",
+      mockExec({ pattern: "", glob: "*.ts", path: "/proj", toolCallId: "tc-grep-8" }),
+    );
+    expect(r!.nativeArgs).toEqual({
+      pattern: "*.ts",
+      path: "/proj",
+      outputMode: "files_with_matches",
+    });
+  });
+});
+
+// ── buildGrepResult ──
+
+function grepSuccess(r: ReturnType<typeof buildGrepResult>): GrepSuccess {
+  expect(r).not.toBeNull();
+  const result = r!.resultValue as GrepResult;
+  expect(result.result.case).toBe("success");
+  return result.result.value as GrepSuccess;
+}
+
+describe("buildGrepResult: content mode", () => {
+  const args = { pattern: "TODO", path: "/src", outputMode: "content" };
+
+  test("parses ripgrep content output with file:line:text format", () => {
+    const content = [
+      "src/a.ts:10:// TODO: fix this",
+      "src/a.ts:11:// TODO: and this",
+      "src/b.ts:5:  TODO item",
+    ].join("\n");
+
+    const r = buildGrepResult(content, args);
+    expect(r).not.toBeNull();
+    expect(r!.resultCase).toBe("grepResult");
+    const success = grepSuccess(r);
+    expect(success.pattern).toBe("TODO");
+    expect(success.path).toBe("/src");
+    expect(success.outputMode).toBe("content");
+
+    const ws = success.workspaceResults["/src"];
+    expect(ws).toBeDefined();
+    expect(ws!.result.case).toBe("content");
+    const contentResult = ws!.result.value as GrepContentResult;
+    expect(contentResult.matches).toHaveLength(2);
+    expect(contentResult.matches[0]!.file).toBe("src/a.ts");
+    expect(contentResult.matches[0]!.matches).toHaveLength(2);
+    expect(contentResult.matches[0]!.matches[0]!.lineNumber).toBe(10);
+    expect(contentResult.matches[0]!.matches[0]!.content).toBe("// TODO: fix this");
+    expect(contentResult.matches[0]!.matches[0]!.isContextLine).toBe(false);
+    expect(contentResult.matches[1]!.file).toBe("src/b.ts");
+    expect(contentResult.totalMatchedLines).toBe(3);
+    expect(contentResult.totalLines).toBe(3);
+  });
+
+  test("parses context lines (file-line-text format)", () => {
+    const content = [
+      "src/a.ts-9-  const x = 1;",
+      "src/a.ts:10:// TODO: fix",
+      "src/a.ts-11-  return x;",
+    ].join("\n");
+
+    const r = buildGrepResult(content, args);
+    const ws = grepSuccess(r).workspaceResults["/src"];
+    const contentResult = ws!.result.value as GrepContentResult;
+    expect(contentResult.matches[0]!.matches).toHaveLength(3);
+    expect(contentResult.matches[0]!.matches[0]!.isContextLine).toBe(true);
+    expect(contentResult.matches[0]!.matches[0]!.lineNumber).toBe(9);
+    expect(contentResult.matches[0]!.matches[1]!.isContextLine).toBe(false);
+    expect(contentResult.matches[0]!.matches[2]!.isContextLine).toBe(true);
+  });
+
+  test("context lines with hyphens in filename use currentFile prefix", () => {
+    const content = [
+      "src/my-2-component.ts:10:export function foo() {",
+      "src/my-2-component.ts-11-  return bar;",
+      "src/my-2-component.ts:12:export function baz() {",
+    ].join("\n");
+
+    const r = buildGrepResult(content, args);
+    const ws = grepSuccess(r).workspaceResults["/src"];
+    const contentResult = ws!.result.value as GrepContentResult;
+    expect(contentResult.matches[0]!.file).toBe("src/my-2-component.ts");
+    expect(contentResult.matches[0]!.matches).toHaveLength(3);
+    expect(contentResult.matches[0]!.matches[1]!.isContextLine).toBe(true);
+    expect(contentResult.matches[0]!.matches[1]!.lineNumber).toBe(11);
+    expect(contentResult.matches[0]!.matches[1]!.content).toBe("  return bar;");
+  });
+
+  test("match lines with colons in filename parse correctly", () => {
+    const content = "src/foo:bar.ts:10:match text";
+    const r = buildGrepResult(content, args);
+    const ws = grepSuccess(r).workspaceResults["/src"];
+    const contentResult = ws!.result.value as GrepContentResult;
+    expect(contentResult.matches[0]!.file).toBe("src/foo:bar.ts");
+    expect(contentResult.matches[0]!.matches[0]!.lineNumber).toBe(10);
+    expect(contentResult.matches[0]!.matches[0]!.content).toBe("match text");
+  });
+
+  test("skips separator lines and empty lines", () => {
+    const content = "src/a.ts:1:line1\n--\nsrc/a.ts:5:line5\n\n";
+    const r = buildGrepResult(content, args);
+    const ws = grepSuccess(r).workspaceResults["/src"];
+    const contentResult = ws!.result.value as GrepContentResult;
+    expect(contentResult.matches[0]!.matches).toHaveLength(2);
+  });
+
+  test("handles empty content", () => {
+    const r = buildGrepResult("", args);
+    const ws = grepSuccess(r).workspaceResults["/src"];
+    const contentResult = ws!.result.value as GrepContentResult;
+    expect(contentResult.matches).toHaveLength(0);
+    expect(contentResult.totalLines).toBe(0);
+  });
+
+  test("strips trailing CR from lines", () => {
+    const content = "src/a.ts:10:match\r\nsrc/a.ts:11:other\r\n";
+    const r = buildGrepResult(content, args);
+    const ws = grepSuccess(r).workspaceResults["/src"];
+    const contentResult = ws!.result.value as GrepContentResult;
+    expect(contentResult.matches[0]!.matches[0]!.content).toBe("match");
+    expect(contentResult.matches[0]!.matches[1]!.content).toBe("other");
+  });
+
+  test("headLimit sets clientTruncated hint", () => {
+    const r = buildGrepResult("src/a.ts:1:hit", { ...args, headLimit: "50" });
+    const ws = grepSuccess(r).workspaceResults["/src"];
+    const contentResult = ws!.result.value as GrepContentResult;
+    expect(contentResult.clientTruncated).toBe(true);
+  });
+});
+
+describe("buildGrepResult: files_with_matches mode", () => {
+  const args = { pattern: "TODO", path: "/proj", outputMode: "files_with_matches" };
+
+  test("parses file list", () => {
+    const content = "src/a.ts\nsrc/b.ts\nlib/c.js\n";
+    const r = buildGrepResult(content, args);
+    const ws = grepSuccess(r).workspaceResults["/proj"];
+    expect(ws!.result.case).toBe("files");
+    const filesResult = ws!.result.value as GrepFilesResult;
+    expect(filesResult.files).toEqual(["src/a.ts", "src/b.ts", "lib/c.js"]);
+    expect(filesResult.totalFiles).toBe(3);
+  });
+
+  test("handles empty result", () => {
+    const r = buildGrepResult("", args);
+    const ws = grepSuccess(r).workspaceResults["/proj"];
+    const filesResult = ws!.result.value as GrepFilesResult;
+    expect(filesResult.files).toHaveLength(0);
+    expect(filesResult.totalFiles).toBe(0);
+  });
+
+  test("strips CRLF and whitespace", () => {
+    const content = "src/a.ts\r\n  src/b.ts  \r\n";
+    const r = buildGrepResult(content, args);
+    const ws = grepSuccess(r).workspaceResults["/proj"];
+    const filesResult = ws!.result.value as GrepFilesResult;
+    expect(filesResult.files).toEqual(["src/a.ts", "src/b.ts"]);
+  });
+});
+
+describe("buildGrepResult: count mode", () => {
+  const args = { pattern: "TODO", path: ".", outputMode: "count" };
+
+  test("parses file:count lines", () => {
+    const content = "src/a.ts:5\nsrc/b.ts:12\nlib/c.js:1\n";
+    const r = buildGrepResult(content, args);
+    const ws = grepSuccess(r).workspaceResults["."];
+    expect(ws!.result.case).toBe("count");
+    const countResult = ws!.result.value as GrepCountResult;
+    expect(countResult.counts).toHaveLength(3);
+    expect(countResult.counts[0]!.file).toBe("src/a.ts");
+    expect(countResult.counts[0]!.count).toBe(5);
+    expect(countResult.counts[2]!.count).toBe(1);
+    expect(countResult.totalFiles).toBe(3);
+    expect(countResult.totalMatches).toBe(18);
+  });
+
+  test("skips lines with non-integer tail", () => {
+    const content = "src/a.ts:5\ngarbage line\nsrc/b.ts:abc\nsrc/c.ts:3\n";
+    const r = buildGrepResult(content, args);
+    const ws = grepSuccess(r).workspaceResults["."];
+    const countResult = ws!.result.value as GrepCountResult;
+    expect(countResult.counts).toHaveLength(2);
+    expect(countResult.counts[0]!.file).toBe("src/a.ts");
+    expect(countResult.counts[1]!.file).toBe("src/c.ts");
+    expect(countResult.totalMatches).toBe(8);
+  });
+
+  test("handles empty result", () => {
+    const r = buildGrepResult("", args);
+    const ws = grepSuccess(r).workspaceResults["."];
+    const countResult = ws!.result.value as GrepCountResult;
+    expect(countResult.counts).toHaveLength(0);
+    expect(countResult.totalMatches).toBe(0);
+  });
+
+  test("handles file with colons in name", () => {
+    const content = "src/foo:bar.ts:7\n";
+    const r = buildGrepResult(content, args);
+    const ws = grepSuccess(r).workspaceResults["."];
+    const countResult = ws!.result.value as GrepCountResult;
+    expect(countResult.counts[0]!.file).toBe("src/foo:bar.ts");
+    expect(countResult.counts[0]!.count).toBe(7);
+  });
+});
+
+describe("buildGrepResult: fallback cases", () => {
+  test("returns null for multiline mode", () => {
+    const r = buildGrepResult("some output", {
+      pattern: "x",
+      path: "/src",
+      outputMode: "content",
+      multiline: "true",
+    });
+    expect(r).toBeNull();
+  });
+
+  test("returns null for unknown outputMode", () => {
+    const r = buildGrepResult("some output", {
+      pattern: "x",
+      path: "/src",
+      outputMode: "json",
+    });
+    expect(r).toBeNull();
+  });
+
+  test("returns null when content is non-empty but nothing parsed (content mode)", () => {
+    const r = buildGrepResult("error: something went wrong\nstderr output", {
+      pattern: "x",
+      path: "/src",
+      outputMode: "content",
+    });
+    expect(r).toBeNull();
+  });
+
+  test("returns null when content is non-empty but nothing parsed (count mode)", () => {
+    const r = buildGrepResult("some garbage output", {
+      pattern: "x",
+      path: ".",
+      outputMode: "count",
+    });
+    expect(r).toBeNull();
+  });
+
+  test("empty content returns empty success (not null)", () => {
+    const r = buildGrepResult("", { pattern: "x", path: "/src", outputMode: "content" });
+    expect(r).not.toBeNull();
+    const ws = grepSuccess(r).workspaceResults["/src"];
+    const contentResult = ws!.result.value as GrepContentResult;
+    expect(contentResult.matches).toHaveLength(0);
+  });
+
+  test("uses '.' when path is empty", () => {
+    const r = buildGrepResult("", { pattern: "x", path: "", outputMode: "content" });
+    expect(grepSuccess(r).workspaceResults["."]).toBeDefined();
   });
 });

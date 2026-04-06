@@ -17,6 +17,23 @@ import {
   type ExecServerMessage,
   FetchResultSchema,
   FetchSuccessSchema,
+  type GrepContentMatch,
+  GrepContentMatchSchema,
+  type GrepContentResult,
+  GrepContentResultSchema,
+  type GrepCountResult,
+  GrepCountResultSchema,
+  type GrepFileCount,
+  GrepFileCountSchema,
+  type GrepFileMatch,
+  GrepFileMatchSchema,
+  type GrepFilesResult,
+  GrepFilesResultSchema,
+  type GrepResult,
+  GrepResultSchema,
+  GrepSuccessSchema,
+  type GrepUnionResult,
+  GrepUnionResultSchema,
   McpResultSchema,
   McpSuccessSchema,
   McpTextContentSchema,
@@ -203,13 +220,17 @@ export function nativeToMcpRedirect(
   if (execCase === "grepArgs") {
     const pattern = args.pattern ?? "";
     if (!pattern && args.glob) {
-      logDebugFmt("grepArgs: empty pattern with glob=%s → redirecting to glob tool", args.glob);
+      logDebugFmt("grepArgs: empty pattern with glob=%s -> redirecting to glob tool", args.glob);
       return {
         toolCallId,
         toolName: "glob",
         decodedArgs: JSON.stringify({ pattern: args.glob, path: args.path || undefined }),
         nativeResultType: "grepResult",
-        nativeArgs: {},
+        nativeArgs: {
+          pattern: args.glob ?? "",
+          path: args.path ?? "",
+          outputMode: "files_with_matches",
+        },
       };
     }
     const mcpArgs: Record<string, any> = { pattern: pattern || "." };
@@ -228,8 +249,247 @@ export function nativeToMcpRedirect(
       toolName: "grep",
       decodedArgs: JSON.stringify(mcpArgs),
       nativeResultType: "grepResult",
-      nativeArgs: {},
+      nativeArgs: {
+        pattern: pattern || ".",
+        path: args.path ?? "",
+        outputMode: args.outputMode || "content",
+        ...(args.multiline ? { multiline: "true" } : undefined),
+        ...(args.headLimit != null ? { headLimit: String(args.headLimit) } : undefined),
+      },
     };
+  }
+  return null;
+}
+
+// ── Grep result parsing ──
+
+const VALID_OUTPUT_MODES: ReadonlySet<string> = new Set(["content", "files_with_matches", "count"]);
+
+export interface GrepBuildResult {
+  resultCase: "grepResult";
+  resultValue: GrepResult;
+}
+
+/**
+ * Build a GrepResult proto from MCP grep text output.
+ * Returns null when the output can't be reliably parsed, signaling
+ * the caller to fall back to MCP text. Null reasons:
+ * - multiline mode (output isn't line-based ripgrep format)
+ * - unknown outputMode (can't choose a parser)
+ * - non-empty content that yielded zero parsed items (likely not ripgrep output)
+ */
+export function buildGrepResult(
+  content: string,
+  args: Record<string, string>,
+): GrepBuildResult | null {
+  const pattern = args.pattern ?? "";
+  const path = args.path ?? "";
+  const outputMode = args.outputMode || "content";
+
+  if (args.multiline === "true") return null;
+  if (!VALID_OUTPUT_MODES.has(outputMode)) return null;
+
+  const clientTruncatedHint = args.headLimit != null && args.headLimit !== "";
+
+  let unionResult:
+    | { case: "count"; value: GrepCountResult }
+    | { case: "files"; value: GrepFilesResult }
+    | { case: "content"; value: GrepContentResult };
+
+  if (outputMode === "count") {
+    unionResult = buildCountResult(content, clientTruncatedHint);
+  } else if (outputMode === "files_with_matches") {
+    unionResult = buildFilesResult(content, clientTruncatedHint);
+  } else {
+    unionResult = buildContentResult(content, clientTruncatedHint);
+  }
+
+  // Non-empty MCP output that yielded zero parsed items likely isn't
+  // ripgrep-shaped (error text, JSON, wrapper banners). Fall back to MCP text.
+  if (content.trim() && isEmptyResult(unionResult)) return null;
+
+  const workspaceResults: { [key: string]: GrepUnionResult } = {};
+  workspaceResults[path || "."] = create(GrepUnionResultSchema, {
+    result: unionResult,
+  });
+
+  return {
+    resultCase: "grepResult",
+    resultValue: create(GrepResultSchema, {
+      result: {
+        case: "success",
+        value: create(GrepSuccessSchema, {
+          pattern,
+          path,
+          outputMode,
+          workspaceResults,
+        }),
+      },
+    }),
+  };
+}
+
+function isEmptyResult(
+  r:
+    | { case: "count"; value: GrepCountResult }
+    | { case: "files"; value: GrepFilesResult }
+    | { case: "content"; value: GrepContentResult },
+): boolean {
+  switch (r.case) {
+    case "count":
+      return r.value.counts.length === 0;
+    case "files":
+      return r.value.files.length === 0;
+    case "content":
+      return r.value.matches.length === 0;
+  }
+}
+
+function buildCountResult(
+  content: string,
+  clientTruncatedHint: boolean,
+): { case: "count"; value: GrepCountResult } {
+  const counts: GrepFileCount[] = [];
+  let totalMatches = 0;
+  for (const raw of content.split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    if (!line) continue;
+    const sep = line.lastIndexOf(":");
+    if (sep === -1) continue;
+    const tail = line.slice(sep + 1);
+    if (!/^\d+$/.test(tail)) continue;
+    const file = line.slice(0, sep);
+    const count = Number.parseInt(tail, 10);
+    counts.push(create(GrepFileCountSchema, { file, count }));
+    totalMatches += count;
+  }
+  return {
+    case: "count" as const,
+    value: create(GrepCountResultSchema, {
+      counts,
+      totalFiles: counts.length,
+      totalMatches,
+      clientTruncated: clientTruncatedHint,
+      ripgrepTruncated: false,
+    }),
+  };
+}
+
+function buildFilesResult(
+  content: string,
+  clientTruncatedHint: boolean,
+): { case: "files"; value: GrepFilesResult } {
+  const files = content
+    .split("\n")
+    .map((l) => l.replace(/\r$/, "").trim())
+    .filter(Boolean);
+  return {
+    case: "files" as const,
+    value: create(GrepFilesResultSchema, {
+      files,
+      totalFiles: files.length,
+      clientTruncated: clientTruncatedHint,
+      ripgrepTruncated: false,
+    }),
+  };
+}
+
+function buildContentResult(
+  content: string,
+  clientTruncatedHint: boolean,
+): { case: "content"; value: GrepContentResult } {
+  const fileMatches: GrepFileMatch[] = [];
+  let currentFile = "";
+  let currentMatches: GrepContentMatch[] = [];
+  let totalLines = 0;
+  let totalMatchedLines = 0;
+
+  const flushFile = () => {
+    if (currentFile && currentMatches.length > 0) {
+      fileMatches.push(create(GrepFileMatchSchema, { file: currentFile, matches: currentMatches }));
+    }
+    currentMatches = [];
+  };
+
+  for (const raw of content.split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    if (line === "--" || line === "") continue;
+
+    // Match lines: "file:lineNum:text" -- colon separators.
+    // Regex backtracking handles colons in filenames correctly since
+    // \d+ requires digits after the separator.
+    const matchHit = line.match(/^(.+?):(\d+):(.*)/);
+    if (matchHit) {
+      const file = matchHit[1]!;
+      const lineNum = Number.parseInt(matchHit[2]!, 10);
+      const text = matchHit[3]!;
+      if (file !== currentFile) {
+        flushFile();
+        currentFile = file;
+      }
+      totalLines++;
+      totalMatchedLines++;
+      currentMatches.push(
+        create(GrepContentMatchSchema, {
+          lineNumber: lineNum,
+          content: text,
+          isContextLine: false,
+        }),
+      );
+      continue;
+    }
+
+    // Context lines: "file-lineNum-text" -- hyphen separators.
+    // Hyphens in filenames are common (e.g. my-2-component.ts), so prefer
+    // matching against the known currentFile prefix when available.
+    const ctxParsed = parseContextLine(line, currentFile);
+    if (ctxParsed) {
+      if (ctxParsed.file !== currentFile) {
+        flushFile();
+        currentFile = ctxParsed.file;
+      }
+      totalLines++;
+      currentMatches.push(
+        create(GrepContentMatchSchema, {
+          lineNumber: ctxParsed.lineNum,
+          content: ctxParsed.text,
+          isContextLine: true,
+        }),
+      );
+    }
+  }
+  flushFile();
+
+  return {
+    case: "content" as const,
+    value: create(GrepContentResultSchema, {
+      matches: fileMatches,
+      totalLines,
+      totalMatchedLines,
+      clientTruncated: clientTruncatedHint,
+      ripgrepTruncated: false,
+    }),
+  };
+}
+
+/** Parse a context line using currentFile as a prefix hint to avoid
+ *  ambiguity from hyphens in filenames. Falls back to naive regex. */
+function parseContextLine(
+  line: string,
+  currentFile: string,
+): { file: string; lineNum: number; text: string } | null {
+  if (currentFile) {
+    const prefix = `${currentFile}-`;
+    if (line.startsWith(prefix)) {
+      const m = line.slice(prefix.length).match(/^(\d+)-(.*)/s);
+      if (m) {
+        return { file: currentFile, lineNum: Number.parseInt(m[1]!, 10), text: m[2]! };
+      }
+    }
+  }
+  const m = line.match(/^(.+?)-(\d+)-(.*)/);
+  if (m) {
+    return { file: m[1]!, lineNum: Number.parseInt(m[2]!, 10), text: m[3]! };
   }
   return null;
 }
@@ -414,12 +674,32 @@ export function sendNativeResult(bridge: BridgeWriter, exec: PendingExec, conten
       });
       return;
     }
+    case "grepResult": {
+      try {
+        const built = buildGrepResult(content, args);
+        if (!built) {
+          const reason =
+            args.multiline === "true"
+              ? "multiline"
+              : !VALID_OUTPUT_MODES.has(args.outputMode || "content")
+                ? "unknown_mode"
+                : "unparseable";
+          logDebugFmt("sendNativeResult: grepResult -> MCP text fallback (%s)", reason);
+          sendMcpResultSuccess(bridge, exec, content);
+          return;
+        }
+        resultValue = built.resultValue;
+        resultCase = built.resultCase;
+      } catch {
+        logDebugFmt("sendNativeResult: grepResult proto build failed -> MCP text fallback");
+        sendMcpResultSuccess(bridge, exec, content);
+        return;
+      }
+      break;
+    }
     default:
-      if (exec.nativeResultType === "grepResult" || exec.nativeResultType === "lsResult") {
-        logDebugFmt(
-          "sendNativeResult: %s → MCP text fallback (complex proto)",
-          exec.nativeResultType,
-        );
+      if (exec.nativeResultType === "lsResult") {
+        logDebugFmt("sendNativeResult: lsResult -> MCP text fallback");
       } else {
         logDebugFmt(
           "sendNativeResult: unknown type %s, falling back to MCP",
