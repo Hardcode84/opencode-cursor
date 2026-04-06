@@ -27,19 +27,29 @@ export function createSSECtx(
   const encoder = new TextEncoder();
   let closed = false;
 
-  const sendRaw = (data: object) => {
+  // stopKeepalive is defined after keepaliveTimer below; closure resolves at call time.
+  const markClosed = () => {
+    if (closed) return false;
+    closed = true;
+    stopKeepalive();
+    return true;
+  };
+
+  const safeEnqueue = (bytes: Uint8Array) => {
     if (closed) return;
-    controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+    try {
+      controller.enqueue(bytes);
+    } catch {
+      markClosed(); // stream aborted by client — stop all further writes
+    }
+  };
+
+  const sendRaw = (data: object) => {
+    safeEnqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
   };
 
   const keepaliveTimer = setInterval(() => {
-    if (closed) return;
-    try {
-      controller.enqueue(encoder.encode(": keep-alive\n\n"));
-    } catch {
-      // enqueue fails after stream abort/close — stop sending
-      clearInterval(keepaliveTimer);
-    }
+    safeEnqueue(encoder.encode(": keep-alive\n\n"));
   }, SSE_KEEPALIVE_MS);
   if (typeof keepaliveTimer === "object" && "unref" in keepaliveTimer) {
     keepaliveTimer.unref();
@@ -68,16 +78,20 @@ export function createSSECtx(
       });
     },
     sendDone() {
-      if (closed) return;
-      closed = true;
-      stopKeepalive();
-      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      if (!markClosed()) return;
+      try {
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      } catch {
+        /* stream already aborted */
+      }
     },
     close() {
-      if (closed) return;
-      closed = true;
-      stopKeepalive();
-      controller.close();
+      if (!markClosed()) return;
+      try {
+        controller.close();
+      } catch {
+        /* stream already aborted */
+      }
     },
     get closed() {
       return closed;

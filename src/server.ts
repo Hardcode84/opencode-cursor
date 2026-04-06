@@ -694,6 +694,89 @@ function tryToolResultResume(
 // Streaming with blob-not-found retries (auto-resume handled by shared loop)
 // ---------------------------------------------------------------------------
 
+interface StreamingPumpOpts {
+  ctx: SSECtx;
+  initialPayload: CursorRequestPayload;
+  accessToken: string;
+  modelId: string;
+  bridgeKey: string;
+  convKey: string;
+  systemPrompt?: string;
+  effectiveUserText?: string;
+  turns?: Array<{ userText: string; assistantText: string }>;
+  mcpTools?: McpToolDefinition[];
+  onSession: (s: CursorSession) => void;
+}
+
+async function runStreamingPump(opts: StreamingPumpOpts): Promise<void> {
+  const {
+    ctx,
+    accessToken,
+    modelId,
+    bridgeKey,
+    convKey,
+    systemPrompt,
+    effectiveUserText,
+    turns,
+    mcpTools,
+    onSession,
+  } = opts;
+  let currentPayload = opts.initialPayload;
+
+  for (let blobAttempt = 0; blobAttempt <= MAX_BLOB_RETRIES; blobAttempt++) {
+    const session = new CursorSession({
+      accessToken,
+      requestBytes: currentPayload.requestBytes,
+      blobStore: currentPayload.blobStore,
+      mcpTools: currentPayload.mcpTools,
+      cloudRule: systemPrompt,
+      convKey,
+      onCheckpoint: makeCheckpointCallback(convKey),
+    });
+    onSession(session);
+
+    const result = await pumpWithAutoResume(ctx, session, modelId, bridgeKey, convKey);
+
+    if (result.outcome !== "retry") break;
+
+    if (result.retryHint === "blob_not_found" && blobAttempt < MAX_BLOB_RETRIES) {
+      if (blobAttempt === 0) {
+        logWarn("blob not found - soft retry: nulling checkpoint", { convKey });
+        const stored2 = resolveConversationState(convKey);
+        stored2.checkpoint = null;
+        persistConversation(convKey, stored2);
+        currentPayload = buildCursorRequest(
+          modelId,
+          systemPrompt ?? "",
+          effectiveUserText ?? "",
+          turns ?? [],
+          stored2.conversationId,
+          null,
+          stored2.blobStore,
+        );
+      } else {
+        logWarn("blob not found again - hard retry: full invalidation", { convKey });
+        invalidateConversationState(convKey);
+        const fresh = resolveConversationState(convKey);
+        currentPayload = buildCursorRequest(
+          modelId,
+          systemPrompt ?? "",
+          effectiveUserText ?? "",
+          turns ?? [],
+          fresh.conversationId,
+          null,
+          fresh.blobStore,
+        );
+      }
+      currentPayload.mcpTools = mcpTools ?? [];
+      continue;
+    }
+
+    writeRetryError(ctx, result);
+    break;
+  }
+}
+
 function handleStreamingWithRetry(
   initialPayload: CursorRequestPayload,
   accessToken: string,
@@ -708,67 +791,42 @@ function handleStreamingWithRetry(
   const completionId = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
 
+  const ref = { session: undefined as CursorSession | undefined, cancelled: false };
+
   const stream = new ReadableStream({
     start(controller) {
       const ctx = createSSECtx(controller, modelId, completionId, created);
 
       void (async () => {
-        let currentPayload = initialPayload;
-
-        for (let blobAttempt = 0; blobAttempt <= MAX_BLOB_RETRIES; blobAttempt++) {
-          const session = new CursorSession({
+        try {
+          await runStreamingPump({
+            ctx,
+            initialPayload,
             accessToken,
-            requestBytes: currentPayload.requestBytes,
-            blobStore: currentPayload.blobStore,
-            mcpTools: currentPayload.mcpTools,
-            cloudRule: systemPrompt,
+            modelId,
+            bridgeKey,
             convKey,
-            onCheckpoint: makeCheckpointCallback(convKey),
+            systemPrompt,
+            effectiveUserText,
+            turns,
+            mcpTools,
+            onSession(s) {
+              ref.session = s;
+              if (ref.cancelled) s.close();
+            },
           });
-
-          const result = await pumpWithAutoResume(ctx, session, modelId, bridgeKey, convKey);
-
-          if (result.outcome !== "retry") break;
-
-          if (result.retryHint === "blob_not_found" && blobAttempt < MAX_BLOB_RETRIES) {
-            if (blobAttempt === 0) {
-              logWarn("blob not found - soft retry: nulling checkpoint", { convKey });
-              const stored2 = resolveConversationState(convKey);
-              stored2.checkpoint = null;
-              persistConversation(convKey, stored2);
-              currentPayload = buildCursorRequest(
-                modelId,
-                systemPrompt ?? "",
-                effectiveUserText ?? "",
-                turns ?? [],
-                stored2.conversationId,
-                null,
-                stored2.blobStore,
-              );
-            } else {
-              logWarn("blob not found again - hard retry: full invalidation", { convKey });
-              invalidateConversationState(convKey);
-              const fresh = resolveConversationState(convKey);
-              currentPayload = buildCursorRequest(
-                modelId,
-                systemPrompt ?? "",
-                effectiveUserText ?? "",
-                turns ?? [],
-                fresh.conversationId,
-                null,
-                fresh.blobStore,
-              );
-            }
-            currentPayload.mcpTools = mcpTools ?? [];
-            continue;
-          }
-
-          writeRetryError(ctx, result);
-          break;
+        } catch (err) {
+          logDebug("streaming pump interrupted", { error: String(err) });
+        } finally {
+          ref.session = undefined;
+          ctx.close();
         }
-
-        ctx.close();
       })();
+    },
+    cancel() {
+      ref.cancelled = true;
+      ref.session?.close();
+      ref.session = undefined;
     },
   });
 
@@ -787,16 +845,29 @@ function handleResumeStream(
 ): Response {
   const completionId = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
+  // Session is known upfront (unlike handleStreamingWithRetry); same cancel contract.
+  const ref = { session: session as CursorSession | undefined, cancelled: false };
 
   const stream = new ReadableStream({
     start(controller) {
       const ctx = createSSECtx(controller, modelId, completionId, created);
 
       void (async () => {
-        const result = await pumpWithAutoResume(ctx, session, modelId, bridgeKey, convKey);
-        writeRetryError(ctx, result);
-        ctx.close();
+        try {
+          const result = await pumpWithAutoResume(ctx, session, modelId, bridgeKey, convKey);
+          writeRetryError(ctx, result);
+        } catch (err) {
+          logDebug("resume pump interrupted", { error: String(err) });
+        } finally {
+          ref.session = undefined;
+          ctx.close();
+        }
       })();
+    },
+    cancel() {
+      ref.cancelled = true;
+      ref.session?.close();
+      ref.session = undefined;
     },
   });
 

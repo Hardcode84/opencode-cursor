@@ -58,6 +58,8 @@ export interface SessionOptions {
   cloudRule?: string;
   convKey: string;
   onCheckpoint?: (bytes: Uint8Array, blobStore: Map<string, Uint8Array>) => void;
+  /** @internal Test-only: override collecting-state inactivity timeout (ms). */
+  _testCollectingTimeoutMs?: number;
 }
 
 function makeHeartbeatFrame(): Buffer {
@@ -83,7 +85,10 @@ export class CursorSession implements BridgeWriter {
   private timerPhase: "thinking" | "streaming" = "thinking";
   private doneEventSent = false;
   private _flushedExecs: PendingExec[] = [];
-  private _checkpointReceived = false;
+  /** Ordinal incremented per H2 `data` event — used to detect same-chunk checkpoint+exec. */
+  private _chunkSeq = 0;
+  private _checkpointChunkSeq = -1;
+  private _batchHasCheckpoint = false;
 
   readonly blobStore: Map<string, Uint8Array>;
   readonly accessToken: string;
@@ -154,6 +159,7 @@ export class CursorSession implements BridgeWriter {
     }, 5_000);
 
     this.h2Stream.on("data", (chunk: Buffer | Uint8Array) => {
+      this._chunkSeq++;
       frameParser(Buffer.from(chunk));
       this.afterParse();
     });
@@ -286,9 +292,24 @@ export class CursorSession implements BridgeWriter {
     }
   }
 
+  private onInactivityFire(): void {
+    this.inactivityTimer = null;
+    // Only flush if no prior batch is still awaiting tool results (_flushedExecs empty).
+    if (
+      this.batchState === "collecting" &&
+      this.pendingExecs.length > 0 &&
+      this._flushedExecs.length === 0
+    ) {
+      this.flushBatch();
+      return;
+    }
+    this.pushDone({ type: "done", error: "Cursor server timed out", retryHint: "timeout" });
+    this.close();
+  }
+
   private resetInactivityTimer(): void {
+    // Flushed: absolute deadline — don't restart on server traffic
     if (this.batchState === "flushed") {
-      // FLUSHED wait is an absolute deadline — don't restart on server traffic
       if (this.inactivityTimer) return;
       this.inactivityTimer = setTimeout(() => {
         this.inactivityTimer = null;
@@ -297,17 +318,17 @@ export class CursorSession implements BridgeWriter {
       }, FLUSHED_WAIT_TIMEOUT_MS);
       return;
     }
+    // Collecting with pending execs: non-sliding deadline so heartbeats can't prevent flush.
+    // Reuses THINKING_TIMEOUT_MS — same ceiling as the idle-before-first-token phase.
+    if (this.batchState === "collecting" && this.pendingExecs.length > 0) {
+      if (this.inactivityTimer) return;
+      const ms = this.options._testCollectingTimeoutMs ?? THINKING_TIMEOUT_MS;
+      this.inactivityTimer = setTimeout(() => this.onInactivityFire(), ms);
+      return;
+    }
     this.clearInactivityTimer();
     const ms = this.timerPhase === "thinking" ? THINKING_TIMEOUT_MS : STREAMING_TIMEOUT_MS;
-    this.inactivityTimer = setTimeout(() => {
-      this.inactivityTimer = null;
-      if (this.batchState === "collecting" && this.pendingExecs.length > 0) {
-        this.flushBatch();
-        return;
-      }
-      this.pushDone({ type: "done", error: "Cursor server timed out", retryHint: "timeout" });
-      this.close();
-    }, ms);
+    this.inactivityTimer = setTimeout(() => this.onInactivityFire(), ms);
   }
 
   private handleMessage(messageBytes: Uint8Array): void {
@@ -329,15 +350,17 @@ export class CursorSession implements BridgeWriter {
           this.streamState.toolCallIndex++;
           if (this.batchState === "streaming" || this.batchState === "flushed") {
             this.batchState = "collecting";
-            this._checkpointReceived = false;
+            this._batchHasCheckpoint = false;
+            this.clearInactivityTimer();
           }
           this.queue.push({ type: "toolCall", exec });
           this.resetInactivityTimer();
         },
         (bytes) => {
-          this._checkpointReceived = true;
+          this._checkpointChunkSeq = this._chunkSeq;
           this.options.onCheckpoint?.(bytes, this.blobStore);
           if (this.pendingExecs.length > 0 && this.batchState === "collecting") {
+            this._batchHasCheckpoint = true;
             this.streamState.checkpointAfterExec = true;
           }
           this.queue.push({
@@ -373,7 +396,7 @@ export class CursorSession implements BridgeWriter {
   }
 
   private flushBatch(): void {
-    if (!this._checkpointReceived) {
+    if (!this._batchHasCheckpoint) {
       logWarn("flushing tool calls without a persisted checkpoint — recovery may fail", {
         pendingExecs: this.pendingExecs.length,
         convKey: this.options.convKey,
@@ -387,7 +410,15 @@ export class CursorSession implements BridgeWriter {
   }
 
   private afterParse(): void {
-    if (this.streamState.checkpointAfterExec && this.batchState === "collecting") {
+    // Flush when: collecting with pending execs, no prior batch awaiting results,
+    // and either (a) checkpoint arrived cross-chunk or (b) checkpoint in same H2 data event.
+    if (
+      this.batchState === "collecting" &&
+      this.pendingExecs.length > 0 &&
+      this._flushedExecs.length === 0 &&
+      (this.streamState.checkpointAfterExec || this._checkpointChunkSeq === this._chunkSeq)
+    ) {
+      this._batchHasCheckpoint = true;
       this.flushBatch();
     }
     if (
