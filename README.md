@@ -40,12 +40,16 @@ OpenAI-compatible proxy on demand and routes requests through Cursor's gRPC API.
 
 ## Features
 
-- **Full native tool redirection** — Cursor's built-in tools (read, write,
-  delete, fetch, shell, shell stream, grep, ls) are transparently redirected to
-  OpenCode's MCP equivalents with native protobuf results sent back to Cursor.
+- **Native tool redirection** — Cursor's built-in tools (read, write, delete,
+  fetch, shell, shell stream, grep, ls) are intercepted and redirected to
+  OpenCode's MCP equivalents. Read, write, delete, fetch, and shell results are
+  sent back as native protobuf types; grep and ls fall back to MCP text results.
+  Unsupported native tools (diagnostics, background shell, etc.) are rejected
+  with an explanatory message.
 - **Parallel tool call batching** — multiple tool calls are accumulated and
   flushed as a single batch using protocol signals (checkpoint, stepCompleted,
-  turnEnded), enabling true parallel execution of subagents.
+  turnEnded, requestContextArgs) or an inactivity timeout, enabling true
+  parallel execution of subagents.
 - **Title generation** — OpenCode title-agent requests are handled via Cursor's
   NameAgent unary RPC instead of spinning up a full agent bridge.
 - **Session scoping** — `x-session-affinity` and `x-parent-session-id` headers
@@ -81,8 +85,8 @@ OpenCode  -->  /v1/chat/completions  -->  Bun.serve (proxy)
 ```
 1. Cursor model receives OpenCode tools via RequestContext (as MCP tool defs)
 2. Model tries native tools (readArgs, shellArgs, grepArgs, etc.)
-3. Proxy redirects ALL native tools to OpenCode MCP equivalents
-4. Native protobuf results are sent back to Cursor for redirected tools
+3. Proxy redirects supported native tools to OpenCode MCP equivalents
+4. Native protobuf results sent back for most tools (grep/ls use MCP fallback)
 5. Model issues MCP tool call → mcpArgs exec message
 6. Proxy accumulates tool calls, flushes batch as OpenAI tool_calls SSE chunk
 7. OpenCode executes tools in parallel, sends results in follow-up request
@@ -98,8 +102,9 @@ OpenCode  -->  /v1/chat/completions  -->  Bun.serve (proxy)
   entire conversation turn; tool results are written back on the same stream
   without reconnecting.
 - **Signal-based batching** — parallel tool calls are batched using protocol
-  signals (checkpoint, stepCompleted, turnEnded) rather than timers, ensuring
-  all tool calls in a batch are dispatched together.
+  signals (checkpoint, stepCompleted, turnEnded, requestContextArgs) with an
+  inactivity timeout fallback, ensuring all tool calls in a batch are dispatched
+  together.
 - **Disk-backed state** — conversation checkpoints and blob stores persist to
   disk, surviving proxy restarts and enabling undo/revisit.
 - **Auto-resume** — on timeout or `resource_exhausted`, the proxy automatically
@@ -152,8 +157,9 @@ intentionally exceed it carry a `biome-ignore` suppression with a reason.
 - `opencode-cursor-oauth.js` — main plugin (auth, proxy, model registry)
 - `opencode-cursor-sdk.js` — AI SDK wrapper (stream interleaving fix)
 
-Only `@opencode-ai/plugin` is kept external. Files are copied into
-`~/.config/opencode/plugins/` — no symlinks, survives OpenCode updates.
+`@opencode-ai/plugin` is kept external for the main plugin bundle. Files are
+copied into `~/.config/opencode/plugins/` — no symlinks, survives OpenCode
+updates.
 
 ## Environment variables
 

@@ -7,9 +7,9 @@ import { GetUsableModelsResponseSchema, ModelDetailsSchema } from "../src/proto/
 type DiscoveryMode = "success" | "empty" | "auth-error";
 
 interface TestModules {
-  startProxy: typeof import("../src/proxy").startProxy;
-  stopProxy: typeof import("../src/proxy").stopProxy;
-  getProxyPort: typeof import("../src/proxy").getProxyPort;
+  startProxy: typeof import("../src/server").startProxy;
+  stopProxy: typeof import("../src/server").stopProxy;
+  getProxyPort: typeof import("../src/server").getProxyPort;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
   CursorAuthPlugin: typeof import("../src/index").CursorAuthPlugin;
@@ -204,7 +204,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
 }
 
 async function loadModules(): Promise<TestModules> {
-  const proxy = await import("../src/proxy");
+  const proxy = await import("../src/server");
   const auth = await import("../src/auth");
   const index = await import("../src/index");
   const models = await import("../src/models");
