@@ -646,14 +646,11 @@ function tryToolResultResume(
   convKey: string,
 ): Response | null {
   if (!active) {
-    logWarn("tool results received but no active session", {
+    logDebug("tool results received but no active session — falling through to fresh request", {
       bridgeKey,
       toolResultIds: toolResults.map((r) => r.toolCallId),
     });
-    return jsonError(
-      "No active session for tool results — session may have expired",
-      "session_not_found",
-    );
+    return null;
   }
 
   activeSessions.delete(bridgeKey);
@@ -824,6 +821,7 @@ function handleStreamingWithRetry(
       })();
     },
     cancel() {
+      logDebug("ReadableStream cancel (streaming)", { bridgeKey, convKey });
       ref.cancelled = true;
       ref.session?.close();
       ref.session = undefined;
@@ -865,6 +863,7 @@ function handleResumeStream(
       })();
     },
     cancel() {
+      logDebug("ReadableStream cancel (resume)", { bridgeKey, convKey });
       ref.cancelled = true;
       ref.session?.close();
       ref.session = undefined;

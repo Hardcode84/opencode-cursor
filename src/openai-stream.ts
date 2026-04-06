@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { CursorSession, RetryHint, SessionEvent } from "./cursor-session";
+import { logDebug } from "./logger";
 import { createThinkingTagFilter } from "./thinking-filter";
 
 export const SSE_HEADERS = {
@@ -84,9 +85,14 @@ export function createSSECtx(
       } catch {
         /* stream already aborted */
       }
+      try {
+        controller.close();
+      } catch {
+        /* stream already aborted */
+      }
     },
     close() {
-      if (!markClosed()) return;
+      markClosed();
       try {
         controller.close();
       } catch {
@@ -107,8 +113,10 @@ export type PumpResult =
 /**
  * Drain events from a CursorSession and write them as SSE chunks.
  * Returns when the session emits batchReady (tool_calls pause) or done.
- * For retryable errors, returns 'retry' without writing stop/DONE — the
- * caller can create a new session and call pumpSession again on the same ctx.
+ * Also returns early with 'done' if the SSE context is already closed
+ * (e.g. client disconnect). For retryable errors, returns 'retry' without
+ * writing stop/DONE — the caller can create a new session and call
+ * pumpSession again on the same ctx.
  */
 // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: event loop with thinking/native branching
 export async function pumpSession(session: CursorSession, ctx: SSECtx): Promise<PumpResult> {
@@ -118,7 +126,10 @@ export async function pumpSession(session: CursorSession, ctx: SSECtx): Promise<
 
   while (true) {
     const event: SessionEvent = await session.next();
-    if (ctx.closed) return { outcome: "done" };
+    if (ctx.closed) {
+      logDebug("pumpSession: ctx already closed, dropping event", { eventType: event.type });
+      return { outcome: "done" };
+    }
 
     switch (event.type) {
       case "text":
@@ -151,6 +162,9 @@ export async function pumpSession(session: CursorSession, ctx: SSECtx): Promise<
         break;
 
       case "batchReady": {
+        logDebug("pumpSession: batchReady, sending finish_reason=tool_calls", {
+          ctxClosed: ctx.closed,
+        });
         const flushed = tagFilter.flush();
         if (flushed.reasoning) ctx.sendChunk({ reasoning_content: flushed.reasoning });
         if (flushed.content) ctx.sendChunk({ content: flushed.content });

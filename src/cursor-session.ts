@@ -3,7 +3,7 @@ import { type ClientHttp2Session, type ClientHttp2Stream, connect as h2Connect }
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { processServerMessage, type StreamState } from "./cursor-messages";
 import { EventQueue } from "./event-queue";
-import { logError, logWarn } from "./logger";
+import { logDebug, logError, logWarn } from "./logger";
 import {
   type BridgeWriter,
   type PendingExec,
@@ -402,6 +402,11 @@ export class CursorSession implements BridgeWriter {
         convKey: this.options.convKey,
       });
     }
+    logDebug("flushBatch", {
+      pendingExecs: this.pendingExecs.length,
+      ids: this.pendingExecs.map((e) => e.toolCallId),
+      convKey: this.options.convKey,
+    });
     this.batchState = "flushed";
     this.streamState.checkpointAfterExec = false;
     this._flushedExecs = [...this.pendingExecs];

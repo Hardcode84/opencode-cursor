@@ -1,11 +1,12 @@
 /**
- * Tests for the CursorSession batch-collecting flush logic and SSE abort handling.
+ * Tests for the CursorSession batch-collecting flush logic and SSE lifecycle.
  *
- * Exercises the two bugs that caused sessions to stall permanently:
+ * Covers the bugs that caused sessions to stall permanently:
  * 1. Checkpoint + exec in the same H2 chunk: checkpoint erased by exec's state transition
  * 2. Heartbeat responses resetting the collecting inactivity timer indefinitely
+ * 3. requestContextArgs prematurely flushing incomplete batches (sub-subagent interleaving)
  *
- * Also verifies SSE stream abort resilience (sendRaw/sendDone/close).
+ * Also verifies SSE stream termination (sendDone closes controller) and abort resilience.
  *
  * NOTE: Tests run serially and share a single `mockH2Stream` instance that is
  * reassigned on each `http2.connect()` call. Do not run these in parallel.
@@ -58,6 +59,19 @@ function makeExecFrame(toolCallId: string, execId = 1): Buffer {
     id: execId,
     execId: `exec_${execId}`,
     message: { case: "mcpArgs", value: mcpArgs },
+  });
+  const msg = create(proto.AgentServerMessageSchema, {
+    message: { case: "execServerMessage", value: exec },
+  });
+  return Buffer.from(frameConnectMessage(toBinary(proto.AgentServerMessageSchema, msg)));
+}
+
+function makeRequestContextArgsFrame(execId = 99): Buffer {
+  const rca = create(proto.RequestContextArgsSchema, {});
+  const exec = create(proto.ExecServerMessageSchema, {
+    id: execId,
+    execId: `exec_rca_${execId}`,
+    message: { case: "requestContextArgs", value: rca },
   });
   const msg = create(proto.AgentServerMessageSchema, {
     message: { case: "execServerMessage", value: exec },
@@ -275,6 +289,31 @@ describe("streaming: cancel-race pattern", () => {
   });
 });
 
+describe("batch flush: requestContextArgs does not premature-flush", () => {
+  test("requestContextArgs with pending execs does not trigger flush", async () => {
+    session = createSession();
+
+    // MCP exec arrives → collecting state
+    mockH2Stream.emit("data", makeExecFrame("call_rca_1"));
+    const e1 = await session.next();
+    expect(e1.type).toBe("toolCall");
+
+    // requestContextArgs arrives while 1 exec pending — should NOT flush
+    mockH2Stream.emit("data", makeRequestContextArgsFrame());
+
+    // Send another MCP exec
+    mockH2Stream.emit("data", makeExecFrame("call_rca_2", 2));
+    const e2 = await session.next();
+    expect(e2.type).toBe("toolCall");
+
+    // Now checkpoint arrives — should flush both execs together
+    mockH2Stream.emit("data", makeCheckpointFrame());
+    const { found, events } = await drainUntil(session, "batchReady");
+    expect(found).toBe(true);
+    expect(session.flushedExecs.length).toBe(2);
+  });
+});
+
 describe("streaming: SSE abort handling", () => {
   test("sendChunk marks context closed on enqueue failure", () => {
     const controller = {
@@ -287,7 +326,6 @@ describe("streaming: SSE abort handling", () => {
 
     ctx.sendChunk({ content: "test" });
     expect(ctx.closed).toBe(true);
-    // Subsequent calls are no-ops
     ctx.sendChunk({ content: "ignored" });
     ctx.close();
   });
@@ -303,6 +341,43 @@ describe("streaming: SSE abort handling", () => {
 
     expect(() => ctx.sendDone()).not.toThrow();
     expect(ctx.closed).toBe(true);
+  });
+
+  test("sendDone calls controller.close to terminate the stream", () => {
+    let closeCalled = false;
+    const chunks: string[] = [];
+    const controller = {
+      enqueue(bytes: Uint8Array) {
+        chunks.push(new TextDecoder().decode(bytes));
+      },
+      close() {
+        closeCalled = true;
+      },
+    } as unknown as ReadableStreamDefaultController;
+    const ctx = createSSECtx(controller, "model", "id", 0);
+
+    ctx.sendDone();
+    expect(ctx.closed).toBe(true);
+    expect(chunks.some((c) => c.includes("[DONE]"))).toBe(true);
+    expect(closeCalled).toBe(true);
+  });
+
+  test("close after sendDone still calls controller.close", () => {
+    let closeCount = 0;
+    const controller = {
+      enqueue() {},
+      close() {
+        closeCount++;
+        if (closeCount > 1) throw new Error("already closed");
+      },
+    } as unknown as ReadableStreamDefaultController;
+    const ctx = createSSECtx(controller, "model", "id", 0);
+
+    ctx.sendDone();
+    expect(closeCount).toBe(1);
+    // Second close() should attempt controller.close but swallow the error
+    expect(() => ctx.close()).not.toThrow();
+    expect(closeCount).toBe(2);
   });
 
   test("close does not throw on controller.close failure", () => {

@@ -58,10 +58,9 @@ export interface StreamState {
   totalTokens: number;
   /** Set when the server sends an endStream frame (clean close or error). */
   endStreamSeen: boolean;
-  /** Set by batch-complete signals (checkpoint, stepCompleted, turnEnded,
-   *  requestContextArgs) to indicate pending execs should be flushed.
-   *  NOT set by toolCallStarted (which means more tools are coming)
-   *  or heartbeat (which is just a keepalive). */
+  /** Set by batch-complete signals (checkpoint, stepCompleted, turnEnded)
+   *  to indicate pending execs should be flushed.
+   *  NOT set by toolCallStarted, requestContextArgs, or heartbeat. */
   checkpointAfterExec: boolean;
   /** Tracks last delta type for debug logging transitions. */
   lastDeltaType: string | null;
@@ -349,14 +348,11 @@ export function handleExecMessage(
   const execCase = execMsg.message.case;
 
   if (execCase === "requestContextArgs") {
-    if (state && state.pendingExecs.length > 0) {
-      logDebugFmt(
-        "exec: requestContextArgs while %d execs pending → signaling batch complete",
-        state.pendingExecs.length,
-      );
-      state.checkpointAfterExec = true;
-    }
-    logDebugFmt("exec: requestContextArgs (providing %d MCP tools)", mcpTools.length);
+    logDebugFmt(
+      "exec: requestContextArgs (providing %d MCP tools, pending=%d)",
+      mcpTools.length,
+      state?.pendingExecs.length ?? 0,
+    );
     const requestContext = create(RequestContextSchema, {
       rules: [],
       repositoryInfo: [],

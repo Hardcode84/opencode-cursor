@@ -47,7 +47,7 @@ describe("resume validation", () => {
     expect(body.error.code).toBe("unsupported_mode");
   });
 
-  test("tool results with no active session returns 400 session_not_found", async () => {
+  test("tool results with no active session falls through to fresh stream", async () => {
     const res = await fetch(BASE(), {
       method: "POST",
       headers: {
@@ -74,10 +74,41 @@ describe("resume validation", () => {
         }),
       ),
     });
-    expect(res.status).toBe(400);
-    const body = (await res.json()) as { error: { code: string; message: string } };
-    expect(body.error.code).toBe("session_not_found");
-    expect(body.error.message).toContain("No active session");
+    // Falls through to streaming instead of returning a 400 error
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+  });
+
+  test("new message with stale tool results falls through to fresh stream", async () => {
+    const res = await fetch(BASE(), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-session-affinity": "stale-session",
+      },
+      body: JSON.stringify(
+        chatBody({
+          messages: [
+            { role: "user", content: "hello" },
+            {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                {
+                  id: "call_stale",
+                  type: "function",
+                  function: { name: "grep", arguments: '{"q":"foo"}' },
+                },
+              ],
+            },
+            { role: "tool", tool_call_id: "call_stale", content: "grep output" },
+            { role: "user", content: "now do something else" },
+          ],
+        }),
+      ),
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
   });
 
   test("validation error includes type, code, and message fields", async () => {
