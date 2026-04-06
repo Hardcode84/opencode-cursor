@@ -1,6 +1,8 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { callCursorUnaryRpc } from "./cursor-session";
 import { logInfo } from "./logger";
+import { textContent } from "./openai-messages";
+import { SSE_HEADERS } from "./openai-stream";
 import { NameAgentRequestSchema, NameAgentResponseSchema } from "./proto/agent_pb";
 
 const TITLE_REQUEST_MARKER = "Generate a title for this conversation:";
@@ -14,15 +16,6 @@ interface TitleCheckMessage {
 interface TitleCheckBody {
   tools?: unknown[];
   messages: TitleCheckMessage[];
-}
-
-function textContent(content: TitleCheckMessage["content"]): string {
-  if (content == null) return "";
-  if (typeof content === "string") return content;
-  return content
-    .filter((p) => p.type === "text" && p.text)
-    .map((p) => p.text!)
-    .join("\n");
 }
 
 export function detectTitleRequest(body: TitleCheckBody): boolean {
@@ -64,12 +57,6 @@ function deriveFallbackTitle(text: string): string {
   const words = cleaned.split(" ").filter(Boolean).slice(0, 6);
   return finalizeTitle(words.map((w) => w[0]!.toUpperCase() + w.slice(1)).join(" "));
 }
-
-const SSE_HEADERS = {
-  "Content-Type": "text/event-stream",
-  "Cache-Control": "no-cache",
-  Connection: "keep-alive",
-} as const;
 
 export async function handleTitleGenerationRequest(
   sourceText: string,

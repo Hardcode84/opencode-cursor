@@ -149,27 +149,6 @@ export async function pumpSession(session: CursorSession, ctx: SSECtx): Promise<
   }
 }
 
-/** Simple wrapper for cases that don't need retry orchestration. */
-export function createStreamingResponse(session: CursorSession, modelId: string): Response {
-  const completionId = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 28)}`;
-  const created = Math.floor(Date.now() / 1000);
-
-  const stream = new ReadableStream({
-    start(controller) {
-      const ctx = createSSECtx(controller, modelId, completionId, created);
-      void (async () => {
-        try {
-          await pumpSession(session, ctx);
-        } finally {
-          ctx.close();
-        }
-      })();
-    },
-  });
-
-  return new Response(stream, { headers: SSE_HEADERS });
-}
-
 export async function collectNonStreamingResponse(
   session: CursorSession,
   modelId: string,

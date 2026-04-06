@@ -87,6 +87,27 @@ describe("EventQueue", () => {
     expect(q.length).toBe(0);
   });
 
+  test("push returns false on overflow", () => {
+    const q = new EventQueue<number>();
+    for (let i = 0; i < MAX_QUEUE_DEPTH; i++) {
+      expect(q.push(i)).toBe(true);
+    }
+    expect(q.push(99999)).toBe(false);
+  });
+
+  test("onOverflow callback fires on overflow", () => {
+    let overflowCount = 0;
+    const q = new EventQueue<number>({ onOverflow: () => overflowCount++ });
+    for (let i = 0; i < MAX_QUEUE_DEPTH; i++) {
+      q.push(i);
+    }
+    expect(overflowCount).toBe(0);
+    q.push(99999);
+    expect(overflowCount).toBe(1);
+    q.push(99998);
+    expect(overflowCount).toBe(2);
+  });
+
   test("interleaved push/next", async () => {
     const q = new EventQueue<string>();
     q.push("a");

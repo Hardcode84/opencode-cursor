@@ -47,6 +47,24 @@ export function logError(message: string, extra: Record<string, unknown> = {}): 
   logPlugin("error", message, extra);
 }
 
+/** Printf-style debug logger: `%s`/`%d` are stringified, `%j` is JSON-encoded. */
+export function logDebugFmt(msg: string, ...args: unknown[]): void {
+  let i = 0;
+  logDebug(
+    msg.replace(/%[sdj]/g, (m) => {
+      const arg = args[i++];
+      if (m === "%j") {
+        try {
+          return JSON.stringify(arg);
+        } catch {
+          return String(arg);
+        }
+      }
+      return String(arg ?? "");
+    }),
+  );
+}
+
 export function flushLogs(): Promise<void> {
   return pendingLogWrites;
 }

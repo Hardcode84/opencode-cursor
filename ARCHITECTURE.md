@@ -95,19 +95,15 @@ the bidirectional stream alive — tool results flow back on the same connection
 The proxy must "cut" the SSE stream at tool-call batch boundaries, keep the
 H2 connection alive, and resume SSE output when the next request arrives.
 
-### The wrong way (current implementation)
+### The naive approach (historical — replaced)
 
-State lives inside the SSE `ReadableStream` closure. Each HTTP response creates
-a fresh `StreamState` with `checkpointAfterExec: false`. The bridge's message
-handler is installed inside the SSE closure too. When the SSE closes and a
-new one opens, both state and handler are replaced.
+In an earlier design, state lived inside the SSE `ReadableStream` closure. Each
+HTTP response created a fresh `StreamState`. The bridge's message handler was
+installed inside the SSE closure too. When the SSE closed and a new one opened,
+both state and handler were replaced, causing a race: messages arriving between
+SSE close and the next request were processed by the dead handler.
 
-This causes a race: messages arriving between SSE close and the next request
-are processed by the old (dead) handler. Batch boundary signals
-(checkpoint, stepCompleted) are consumed but can't act. The new SSE stream
-starts with no knowledge that a boundary was already crossed.
-
-### The right way: session owns state, SSE writer is a consumer
+### The current design: session owns state, SSE writer is a consumer
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -155,7 +151,8 @@ type SessionEvent =
   | { type: 'toolCall'; exec: PendingExec }
   | { type: 'batchReady' }
   | { type: 'usage'; outputTokens: number; totalTokens: number }
-  | { type: 'done'; error?: string }
+  | { type: 'done'; error?: string; retryHint?: RetryHint }
+// RetryHint = 'blob_not_found' | 'resource_exhausted' | 'timeout'
 ```
 
 Protocol-level messages (KV, requestContext, interactionQuery, exec responses)
@@ -193,15 +190,16 @@ Boundary signals:
 The SSE writer is a simple consumer — no protocol knowledge:
 
 ```typescript
-async function writeSSE(session: CursorSession, controller) {
+// pumpSession() in openai-stream.ts
+async function pumpSession(session: CursorSession, ctx: SSECtx): Promise<PumpResult> {
   for (;;) {
     const event = await session.next()
     switch (event.type) {
       case 'text':       emit content/reasoning chunk; break
       case 'toolCall':   emit tool_calls chunk; break
       case 'usage':      emit usage chunk; break
-      case 'batchReady': emit finish_reason=tool_calls + [DONE]; close; return
-      case 'done':       emit finish_reason=stop + [DONE]; close; return
+      case 'batchReady': emit finish_reason=tool_calls + [DONE]; return 'batchReady'
+      case 'done':       emit finish_reason=stop + [DONE]; return 'done'
     }
   }
 }
@@ -221,18 +219,23 @@ No state is lost. No handler is replaced. The queue bridges the gap.
 
 ### Inactivity timer
 
-Reset on `text` or `toolCall` events (real model activity), NOT on H2
-keepalive messages.
+Reset on recognized server messages (text, tool calls), NOT on H2 keepalives.
+**Exception**: in FLUSHED state, the timer is an absolute deadline — it is
+set once on entering FLUSHED and not restarted by server traffic.
 
 ```
 Phases:
   THINKING (30s) — waiting for first model output
   STREAMING (15s) — gap between output tokens
+  FLUSHED (10min) — absolute deadline waiting for client tool results
 
-On timeout:
-  if FLUSHED with pending execs → force batchReady (safety net)
+On thinking/streaming timeout:
+  if COLLECTING with pending execs → force batchReady (safety net)
   elif has checkpoint → auto-resume (up to 5 attempts)
   else → emit done with error
+
+On FLUSHED timeout:
+  → emit done with "Tool result wait timed out", close session
 ```
 
 ## Sequence Diagrams
@@ -399,6 +402,6 @@ Result flows back: OpenCode MCP result → formatted as native Cursor protobuf
 | `src/conversation-state.ts` | Checkpoint persistence, disk serialization, TTL eviction |
 | `src/thinking-filter.ts` | Streaming thinking tag parser |
 | `src/title.ts` | Title detection + Cursor NameAgent RPC |
-| `src/index.ts` | Plugin entrypoint: registers MCP tools, starts server |
+| `src/index.ts` | Plugin entrypoint: OAuth hooks, `startProxy`, model catalog, SDK wrapper |
 | `src/logger.ts` | Structured logging via OpenCode plugin API |
 | `src/sdk-wrapper.ts` | Custom AI SDK wrapper (OpenAI-compatible provider) |

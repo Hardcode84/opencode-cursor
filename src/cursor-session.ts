@@ -23,6 +23,7 @@ const CURSOR_AGENT_URL = process.env.CURSOR_AGENT_URL ?? "https://agentn.us.api5
 const CURSOR_CLIENT_VERSION = "cli-2026.03.30-a5d3e17";
 const THINKING_TIMEOUT_MS = 30_000;
 const STREAMING_TIMEOUT_MS = 15_000;
+const FLUSHED_WAIT_TIMEOUT_MS = 10 * 60 * 1000;
 const CLOSE_OK = 0;
 const CLOSE_ERR = 1;
 
@@ -70,7 +71,7 @@ function makeHeartbeatFrame(): Buffer {
 }
 
 export class CursorSession implements BridgeWriter {
-  private readonly queue = new EventQueue<SessionEvent>();
+  private readonly queue: EventQueue<SessionEvent>;
   private readonly streamState: StreamState;
   private batchState: "streaming" | "collecting" | "flushed" = "streaming";
   private pendingExecs: PendingExec[] = [];
@@ -88,6 +89,12 @@ export class CursorSession implements BridgeWriter {
   readonly options: SessionOptions;
 
   constructor(options: SessionOptions) {
+    this.queue = new EventQueue<SessionEvent>({
+      onOverflow: () => {
+        this.pushDone({ type: "done", error: "Event queue overflow — stream corrupted" });
+        this.close();
+      },
+    });
     this.options = options;
     this.blobStore = options.blobStore;
     this.accessToken = options.accessToken;
@@ -182,14 +189,20 @@ export class CursorSession implements BridgeWriter {
     if (!this._alive) return;
     try {
       this.h2Stream.write(data);
-    } catch {
-      /* ignore write-after-close */
+    } catch (err) {
+      logError("CursorSession: write failed", { error: String(err) });
+      this.closeTransport();
+      this.finish(CLOSE_ERR);
     }
   }
 
   sendToolResults(results: Array<{ toolCallId: string; content: string }>): void {
     const remaining: PendingExec[] = [];
     for (const exec of this.pendingExecs) {
+      if (!this._alive) {
+        remaining.push(exec);
+        continue;
+      }
       const match = results.find((r) => r.toolCallId === exec.toolCallId);
       if (match) {
         if (exec.nativeResultType) {
@@ -204,6 +217,8 @@ export class CursorSession implements BridgeWriter {
     this.pendingExecs.length = 0;
     this.pendingExecs.push(...remaining);
 
+    if (!this._alive) return;
+
     if (remaining.length > 0) {
       for (const exec of remaining) {
         this.queue.push({ type: "toolCall", exec });
@@ -213,6 +228,7 @@ export class CursorSession implements BridgeWriter {
       this.queue.push({ type: "batchReady" });
     } else {
       this.batchState = "streaming";
+      this._flushedExecs = [];
     }
 
     this.timerPhase = "thinking";
@@ -269,10 +285,18 @@ export class CursorSession implements BridgeWriter {
     }
   }
 
-  // Timer is paused in FLUSHED state (waiting for client tool results, not server)
   private resetInactivityTimer(): void {
+    if (this.batchState === "flushed") {
+      // FLUSHED wait is an absolute deadline — don't restart on server traffic
+      if (this.inactivityTimer) return;
+      this.inactivityTimer = setTimeout(() => {
+        this.inactivityTimer = null;
+        this.pushDone({ type: "done", error: "Tool result wait timed out" });
+        this.close();
+      }, FLUSHED_WAIT_TIMEOUT_MS);
+      return;
+    }
     this.clearInactivityTimer();
-    if (this.batchState === "flushed") return;
     const ms = this.timerPhase === "thinking" ? THINKING_TIMEOUT_MS : STREAMING_TIMEOUT_MS;
     this.inactivityTimer = setTimeout(() => {
       this.inactivityTimer = null;
@@ -413,7 +437,7 @@ export async function callCursorUnaryRpc(
     } catch {
       /* ignore */
     }
-    resolve({ body, exitCode: code, timedOut });
+    resolve({ body, exitCode: timedOut ? 1 : code, timedOut });
   };
 
   session.on("error", () => finish(new Uint8Array(0), 1));

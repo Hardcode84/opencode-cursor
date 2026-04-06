@@ -6,7 +6,7 @@
  * format them as the native Cursor protobuf types the server expects.
  */
 import { create, toBinary } from "@bufbuild/protobuf";
-import { logDebug } from "./logger";
+import { logDebugFmt } from "./logger";
 import {
   AgentClientMessageSchema,
   DeleteResultSchema,
@@ -33,11 +33,6 @@ import {
   WriteSuccessSchema,
 } from "./proto/agent_pb";
 import { frameConnectMessage } from "./protocol";
-
-function proxyLog(msg: string, ...args: unknown[]): void {
-  let i = 0;
-  logDebug(msg.replace(/%[sdj]/g, () => String(args[i++] ?? "")));
-}
 
 // ── Types ──
 
@@ -146,7 +141,19 @@ export function nativeToMcpRedirect(
     };
   }
   if (execCase === "deleteArgs") {
-    const safePath = (args.path ?? "").replace(/'/g, "'\\''");
+    const rawPath: string = args.path ?? "";
+    if (!rawPath) {
+      return {
+        toolCallId,
+        toolName: "bash",
+        decodedArgs: JSON.stringify({ command: "true", description: "No-op delete (empty path)" }),
+        nativeResultType: "deleteResult" as const,
+        nativeArgs: { path: "" },
+      };
+    }
+    // Single-quote wrapping is POSIX-safe for all characters except NUL
+    // (which can't appear in real file paths). Strip NUL as defense-in-depth.
+    const safePath = rawPath.replace(/\0/g, "").replace(/'/g, "'\\''");
     return {
       toolCallId,
       toolName: "bash",
@@ -196,7 +203,7 @@ export function nativeToMcpRedirect(
   if (execCase === "grepArgs") {
     const pattern = args.pattern ?? "";
     if (!pattern && args.glob) {
-      proxyLog("grepArgs: empty pattern with glob=%s → redirecting to glob tool", args.glob);
+      logDebugFmt("grepArgs: empty pattern with glob=%s → redirecting to glob tool", args.glob);
       return {
         toolCallId,
         toolName: "glob",
@@ -409,9 +416,15 @@ export function sendNativeResult(bridge: BridgeWriter, exec: PendingExec, conten
     }
     default:
       if (exec.nativeResultType === "grepResult" || exec.nativeResultType === "lsResult") {
-        proxyLog("sendNativeResult: %s → MCP text fallback (complex proto)", exec.nativeResultType);
+        logDebugFmt(
+          "sendNativeResult: %s → MCP text fallback (complex proto)",
+          exec.nativeResultType,
+        );
       } else {
-        proxyLog("sendNativeResult: unknown type %s, falling back to MCP", exec.nativeResultType);
+        logDebugFmt(
+          "sendNativeResult: unknown type %s, falling back to MCP",
+          exec.nativeResultType,
+        );
       }
       sendMcpResultSuccess(bridge, exec, content);
       return;

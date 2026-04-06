@@ -83,7 +83,13 @@ const activeSessions = new Map<string, ActiveSession>();
 function evictStaleSessions(): void {
   const cutoff = Date.now() - SESSION_TTL_MS;
   for (const [key, active] of activeSessions) {
-    if (!active.session.alive || active.storedAt < cutoff) {
+    if (!active.session.alive) {
+      activeSessions.delete(key);
+      continue;
+    }
+    // Don't evict sessions waiting for client tool results
+    if (active.session.flushedExecs.length > 0) continue;
+    if (active.storedAt < cutoff) {
       active.session.close();
       activeSessions.delete(key);
     }
@@ -406,13 +412,12 @@ function makeCheckpointCallback(
   convKey: string,
 ): (bytes: Uint8Array, blobStore: Map<string, Uint8Array>) => void {
   return (bytes, blobStore) => {
-    const stored = getConversationState(convKey);
-    if (stored) {
-      stored.checkpoint = bytes;
-      for (const [k, v] of blobStore) stored.blobStore.set(k, v);
-      stored.lastAccessMs = Date.now();
-      persistConversation(convKey, stored);
-    }
+    // Re-resolve if the entry was evicted while session was alive
+    const stored = getConversationState(convKey) ?? resolveConversationState(convKey);
+    stored.checkpoint = bytes;
+    for (const [k, v] of blobStore) stored.blobStore.set(k, v);
+    stored.lastAccessMs = Date.now();
+    persistConversation(convKey, stored);
   };
 }
 

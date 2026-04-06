@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { logDebug, logWarn } from "./logger";
 
 export interface StoredConversation {
   conversationId: string;
@@ -35,7 +36,9 @@ const CONV_DISK_DIR = join(
 );
 try {
   mkdirSync(CONV_DISK_DIR, { recursive: true });
-} catch {}
+} catch (err) {
+  logWarn("Failed to create conversation directory", { dir: CONV_DISK_DIR, error: String(err) });
+}
 
 const CONV_DISK_TTL_MS = 24 * 60 * 60 * 1000; // 24h on-disk TTL
 
@@ -65,7 +68,9 @@ export function persistConversation(convKey: string, stored: StoredConversation)
   };
   try {
     writeFileSync(convDiskPath(convKey), JSON.stringify(data));
-  } catch {}
+  } catch (err) {
+    logWarn("Failed to persist conversation to disk", { convKey, error: String(err) });
+  }
 }
 
 function loadConversation(convKey: string): StoredConversation | null {
@@ -94,7 +99,8 @@ function loadConversation(convKey: string): StoredConversation | null {
         ]),
       ),
     };
-  } catch {
+  } catch (err) {
+    logDebug("Failed to load conversation from disk", { convKey, error: String(err) });
     return null;
   }
 }

@@ -7,7 +7,7 @@
  */
 import { create, fromBinary, toBinary, toJson } from "@bufbuild/protobuf";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
-import { logDebug, logWarn } from "./logger";
+import { logDebugFmt, logWarn } from "./logger";
 import { fixMcpArgNames, nativeToMcpRedirect, type PendingExec } from "./native-tools";
 import {
   AgentClientMessageSchema,
@@ -47,11 +47,6 @@ import {
 } from "./proto/agent_pb";
 import { frameConnectMessage } from "./protocol";
 
-function proxyLog(msg: string, ...args: unknown[]): void {
-  let i = 0;
-  logDebug(msg.replace(/%[sdj]/g, () => String(args[i++] ?? "")));
-}
-
 // ── Types ──
 
 export interface StreamState {
@@ -70,13 +65,6 @@ export interface StreamState {
   checkpointAfterExec: boolean;
   /** Tracks last delta type for debug logging transitions. */
   lastDeltaType: string | null;
-}
-
-export function computeUsage(state: StreamState) {
-  const completion_tokens = state.outputTokens;
-  const total_tokens = state.totalTokens || completion_tokens;
-  const prompt_tokens = Math.max(0, total_tokens - completion_tokens);
-  return { prompt_tokens, completion_tokens, total_tokens };
 }
 
 // ── MCP arg decoding ──
@@ -135,7 +123,7 @@ export function processServerMessage(
     if (stateStructure.tokenDetails) {
       state.totalTokens = stateStructure.tokenDetails.usedTokens;
     }
-    proxyLog("checkpoint: tokens=%d pending=%d", state.totalTokens, state.pendingExecs.length);
+    logDebugFmt("checkpoint: tokens=%d pending=%d", state.totalTokens, state.pendingExecs.length);
     if (onCheckpoint) {
       onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
     }
@@ -143,14 +131,14 @@ export function processServerMessage(
   } else if (msgCase === "execServerControlMessage") {
     const ctrl = msg.message.value as ExecServerControlMessage;
     if (ctrl.message.case === "abort") {
-      proxyLog("exec ABORT for id=%d", ctrl.message.value.id);
+      logDebugFmt("exec ABORT for id=%d", ctrl.message.value.id);
     }
     return true;
   } else if (msgCase === "interactionQuery") {
     handleInteractionQuery(msg.message.value as any, sendFrame, onNotify);
     return true;
   }
-  proxyLog("unrecognized server message case: %s", msgCase ?? "undefined");
+  logDebugFmt("unrecognized server message case: %s", msgCase ?? "undefined");
   return false;
 }
 
@@ -168,7 +156,7 @@ function handleInteractionUpdate(
     const delta = update.message.value.text || "";
     if (delta) {
       if (state.lastDeltaType !== "text") {
-        proxyLog("delta: → textDelta (first=%s)", JSON.stringify(delta.slice(0, 60)));
+        logDebugFmt("delta: → textDelta (first=%s)", JSON.stringify(delta.slice(0, 60)));
         state.lastDeltaType = "text";
       }
       onText(delta, false);
@@ -177,7 +165,7 @@ function handleInteractionUpdate(
     const delta = update.message.value.text || "";
     if (delta) {
       if (state.lastDeltaType !== "thinking") {
-        proxyLog("delta: → thinkingDelta (first=%s)", JSON.stringify(delta.slice(0, 60)));
+        logDebugFmt("delta: → thinkingDelta (first=%s)", JSON.stringify(delta.slice(0, 60)));
         state.lastDeltaType = "thinking";
       }
       onText(delta, true);
@@ -186,28 +174,28 @@ function handleInteractionUpdate(
     state.outputTokens += update.message.value.tokens ?? 0;
   } else if (updateCase === "toolCallStarted") {
     const val = update.message.value;
-    proxyLog(
+    logDebugFmt(
       "toolCallStarted: callId=%s modelCallId=%s pending=%d",
       val?.callId ?? "",
       val?.modelCallId ?? "",
       state.pendingExecs.length,
     );
   } else if (updateCase === "toolCallCompleted") {
-    proxyLog("toolCallCompleted: callId=%s", update.message.value?.callId ?? "");
+    logDebugFmt("toolCallCompleted: callId=%s", update.message.value?.callId ?? "");
   } else if (updateCase === "turnEnded") {
-    proxyLog("turnEnded received (pending=%d)", state.pendingExecs.length);
+    logDebugFmt("turnEnded received (pending=%d)", state.pendingExecs.length);
     if (state.pendingExecs.length > 0) {
       state.checkpointAfterExec = true;
     }
   } else if (updateCase === "stepCompleted") {
-    proxyLog("stepCompleted (pending=%d)", state.pendingExecs.length);
+    logDebugFmt("stepCompleted (pending=%d)", state.pendingExecs.length);
     if (state.pendingExecs.length > 0) {
       state.checkpointAfterExec = true;
     }
   } else if (updateCase === "heartbeat") {
     // heartbeat is just a keepalive — not a batch delimiter
   } else if (updateCase && updateCase !== "toolCallDelta" && updateCase !== "partialToolCall") {
-    proxyLog(
+    logDebugFmt(
       "interactionUpdate: unhandled type=%s (pending=%d)",
       updateCase,
       state.pendingExecs.length,
@@ -229,7 +217,7 @@ function handleInteractionQuery(
       ? ((query.query?.value?.args?.searchTerm ?? "") as string)
       : "";
   const queryDetail = searchTerm ? ` search=${JSON.stringify(searchTerm).slice(0, 80)}` : "";
-  proxyLog("interactionQuery: id=%d type=%s%s", queryId, queryCase, queryDetail);
+  logDebugFmt("interactionQuery: id=%d type=%s%s", queryId, queryCase, queryDetail);
 
   let responseResult: any;
 
@@ -278,7 +266,7 @@ function handleInteractionQuery(
       value: create(CreatePlanRequestResponseSchema, {}),
     };
   } else {
-    proxyLog(
+    logDebugFmt(
       "interactionQuery: unknown type %s — sending empty response for id=%d",
       queryCase,
       queryId,
@@ -296,7 +284,7 @@ function handleInteractionQuery(
     message: { case: "interactionResponse", value: response },
   });
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMsg)));
-  proxyLog("interactionQuery: responded to %s (id=%d)", queryCase, queryId);
+  logDebugFmt("interactionQuery: responded to %s (id=%d)", queryCase, queryId);
 }
 
 // ── KV (blob store) ──
@@ -329,7 +317,11 @@ function handleKvMessage(
     const blobIdKey = Buffer.from(blobId).toString("hex");
     const blobData = blobStore.get(blobIdKey);
     if (!blobData) {
-      proxyLog("KV getBlob MISS: %s (store has %d blobs)", blobIdKey.slice(0, 16), blobStore.size);
+      logDebugFmt(
+        "KV getBlob MISS: %s (store has %d blobs)",
+        blobIdKey.slice(0, 16),
+        blobStore.size,
+      );
     }
     sendKvResponse(
       kvMsg,
@@ -358,13 +350,13 @@ export function handleExecMessage(
 
   if (execCase === "requestContextArgs") {
     if (state && state.pendingExecs.length > 0) {
-      proxyLog(
+      logDebugFmt(
         "exec: requestContextArgs while %d execs pending → signaling batch complete",
         state.pendingExecs.length,
       );
       state.checkpointAfterExec = true;
     }
-    proxyLog("exec: requestContextArgs (providing %d MCP tools)", mcpTools.length);
+    logDebugFmt("exec: requestContextArgs (providing %d MCP tools)", mcpTools.length);
     const requestContext = create(RequestContextSchema, {
       rules: [],
       repositoryInfo: [],
@@ -412,7 +404,7 @@ export function handleExecMessage(
   if (state) state.totalExecCount++;
   const nativeRedirect = nativeToMcpRedirect(execCase as string, execMsg);
   if (nativeRedirect) {
-    proxyLog(
+    logDebugFmt(
       "redirect native exec: %s → %s (id=%d)",
       execCase,
       nativeRedirect.toolName,
@@ -431,7 +423,7 @@ export function handleExecMessage(
   }
 
   // --- Reject unsupported native tools ---
-  proxyLog("reject native exec: %s (id=%d)", execCase, execMsg.id);
+  logDebugFmt("reject native exec: %s (id=%d)", execCase, execMsg.id);
   const REJECT_REASON =
     "Tool not available in this environment. Use the MCP tools provided instead.";
 

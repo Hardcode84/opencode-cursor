@@ -154,6 +154,21 @@ describe("nativeToMcpRedirect", () => {
     expect(cmd).toContain("it");
   });
 
+  test("deleteArgs: empty path → no-op bash true", () => {
+    const r = nativeToMcpRedirect("deleteArgs", mockExec({ path: "", toolCallId: "tc-3" }));
+    expect(r).not.toBeNull();
+    expect(r!.toolName).toBe("bash");
+    expect(JSON.parse(r!.decodedArgs).command).toBe("true");
+    expect(r!.nativeResultType).toBe("deleteResult");
+  });
+
+  test("deleteArgs: null path → no-op bash true", () => {
+    const r = nativeToMcpRedirect("deleteArgs", mockExec({ toolCallId: "tc-3" }));
+    expect(r).not.toBeNull();
+    expect(r!.toolName).toBe("bash");
+    expect(JSON.parse(r!.decodedArgs).command).toBe("true");
+  });
+
   test("fetchArgs → web_fetch", () => {
     const r = nativeToMcpRedirect(
       "fetchArgs",

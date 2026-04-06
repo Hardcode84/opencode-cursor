@@ -62,6 +62,12 @@ export async function pollCursorAuth(
           accessToken: string;
           refreshToken: string;
         };
+        if (!data.accessToken || typeof data.accessToken !== "string") {
+          throw new Error("Cursor auth response missing accessToken");
+        }
+        if (!data.refreshToken || typeof data.refreshToken !== "string") {
+          throw new Error("Cursor auth response missing refreshToken");
+        }
         return {
           accessToken: data.accessToken,
           refreshToken: data.refreshToken,
@@ -99,6 +105,10 @@ export async function refreshCursorToken(refreshToken: string): Promise<CursorCr
     accessToken: string;
     refreshToken: string;
   };
+
+  if (!data.accessToken || typeof data.accessToken !== "string") {
+    throw new Error("Cursor token refresh response missing accessToken");
+  }
 
   return {
     access: data.accessToken,

@@ -7,6 +7,7 @@ import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { z } from "zod";
 import { callCursorUnaryRpc } from "./cursor-session";
 import { GetUsableModelsRequestSchema, GetUsableModelsResponseSchema } from "./proto/agent_pb";
+import { CONNECT_END_STREAM_FLAG } from "./protocol";
 
 // TODO: switch to aiserver.v1.AvailableModels which returns per-model
 // context_token_limit and context_token_limit_for_max_mode fields.
@@ -220,8 +221,7 @@ function decodeConnectUnaryBody(payload: Uint8Array): Uint8Array | null {
     // Compression flag
     if ((flags & 0b0000_0001) !== 0) return null;
 
-    // End-of-stream flag — skip trailer frames
-    if ((flags & 0b0000_0010) === 0) {
+    if ((flags & CONNECT_END_STREAM_FLAG) === 0) {
       return payload.subarray(offset + 5, frameEnd);
     }
 

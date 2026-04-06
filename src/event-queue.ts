@@ -5,22 +5,30 @@ export const MAX_QUEUE_DEPTH = 10_000;
 export class EventQueue<T> {
   private buffer: T[] = [];
   private waiters: Array<(value: T) => void> = [];
+  private overflowCb?: () => void;
+
+  constructor(opts?: { onOverflow?: () => void }) {
+    this.overflowCb = opts?.onOverflow;
+  }
 
   get length(): number {
     return this.buffer.length;
   }
 
-  push(event: T): void {
+  /** Returns false if the event was dropped due to overflow. */
+  push(event: T): boolean {
     const waiter = this.waiters.shift();
     if (waiter) {
       waiter(event);
-    } else {
-      if (this.buffer.length >= MAX_QUEUE_DEPTH) {
-        logWarn("EventQueue overflow, dropping event", { depth: this.buffer.length });
-        return;
-      }
-      this.buffer.push(event);
+      return true;
     }
+    if (this.buffer.length >= MAX_QUEUE_DEPTH) {
+      logWarn("EventQueue overflow", { depth: this.buffer.length });
+      this.overflowCb?.();
+      return false;
+    }
+    this.buffer.push(event);
+    return true;
   }
 
   /** Push unconditionally (bypasses high-water mark). Used for terminal events. */
