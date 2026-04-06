@@ -92,7 +92,6 @@ export async function handleTitleGenerationRequest(
 
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
-  const usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
 
   if (stream) {
     const chunks = `${[
@@ -110,14 +109,6 @@ export async function handleTitleGenerationRequest(
         model: modelId,
         choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
       },
-      {
-        id: completionId,
-        object: "chat.completion.chunk",
-        created,
-        model: modelId,
-        choices: [],
-        usage,
-      },
     ]
       .map((c) => `data: ${JSON.stringify(c)}\n\n`)
       .join("")}data: [DONE]\n\n`;
@@ -133,7 +124,6 @@ export async function handleTitleGenerationRequest(
       choices: [
         { index: 0, message: { role: "assistant", content: title }, finish_reason: "stop" },
       ],
-      usage,
     }),
     { headers: { "Content-Type": "application/json" } },
   );

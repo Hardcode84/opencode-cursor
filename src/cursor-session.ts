@@ -187,6 +187,14 @@ export class CursorSession implements BridgeWriter {
     return this.options.mcpTools;
   }
 
+  get outputTokens(): number {
+    return this.streamState.outputTokens;
+  }
+
+  get totalTokens(): number {
+    return this.streamState.totalTokens;
+  }
+
   next(): Promise<SessionEvent> {
     return this.queue.next();
   }

@@ -11,13 +11,54 @@ export const SSE_HEADERS = {
 
 export interface SSECtx {
   sendChunk(delta: Record<string, unknown>, finishReason?: string | null): void;
-  sendUsage(completion: number, total: number): void;
+  sendUsage(usage: OpenAIUsage): void;
   sendDone(): void;
   close(): void;
   readonly closed: boolean;
 }
 
 const SSE_KEEPALIVE_MS = 15_000;
+
+interface OpenAIUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+function sanitizeTokenCount(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
+}
+
+function buildUsage(completionTokens: number, totalTokens: number): OpenAIUsage | null {
+  const completion = sanitizeTokenCount(completionTokens);
+  const reportedTotal = sanitizeTokenCount(totalTokens);
+  const total = Math.max(completion, reportedTotal || completion);
+  if (completion === 0 && total === 0) return null;
+  return {
+    prompt_tokens: Math.max(0, total - completion),
+    completion_tokens: completion,
+    total_tokens: total,
+  };
+}
+
+function pickBetterUsage(
+  current: OpenAIUsage | null,
+  candidate: OpenAIUsage | null,
+): OpenAIUsage | null {
+  if (!candidate) return current;
+  if (!current) return candidate;
+  if (candidate.total_tokens > current.total_tokens) return candidate;
+  if (candidate.total_tokens === current.total_tokens) {
+    if (candidate.completion_tokens > current.completion_tokens) return candidate;
+    if (
+      candidate.completion_tokens === current.completion_tokens &&
+      candidate.prompt_tokens > current.prompt_tokens
+    ) {
+      return candidate;
+    }
+  }
+  return current;
+}
 
 export function createSSECtx(
   controller: ReadableStreamDefaultController,
@@ -68,14 +109,14 @@ export function createSSECtx(
         choices: [{ index: 0, delta, finish_reason: finishReason }],
       });
     },
-    sendUsage(completion, total) {
+    sendUsage(usage) {
       sendRaw({
         id: completionId,
         object: "chat.completion.chunk",
         created,
         model: modelId,
         choices: [],
-        usage: { prompt_tokens: 0, completion_tokens: completion, total_tokens: total },
+        usage,
       });
     },
     sendDone() {
@@ -121,6 +162,14 @@ export async function pumpSession(session: CursorSession, ctx: SSECtx): Promise<
   const tagFilter = createThinkingTagFilter();
   let hasNativeThinking = false;
   let toolCallIndex = 0;
+  let usageSent = false;
+
+  const sendUsageIfAvailable = (completionTokens: number, totalTokens: number) => {
+    const usage = buildUsage(completionTokens, totalTokens);
+    if (!usage) return;
+    ctx.sendUsage(usage);
+    usageSent = true;
+  };
 
   while (true) {
     const event: SessionEvent = await session.next();
@@ -164,13 +213,16 @@ export async function pumpSession(session: CursorSession, ctx: SSECtx): Promise<
         const flushed = tagFilter.flush();
         if (flushed.reasoning) ctx.sendChunk({ reasoning_content: flushed.reasoning });
         if (flushed.content) ctx.sendChunk({ content: flushed.content });
+        if (!usageSent) {
+          sendUsageIfAvailable(session.outputTokens, session.totalTokens);
+        }
         ctx.sendChunk({}, "tool_calls");
         ctx.sendDone();
         return { outcome: "batchReady" };
       }
 
       case "usage":
-        ctx.sendUsage(event.outputTokens, event.totalTokens || event.outputTokens);
+        sendUsageIfAvailable(event.outputTokens, event.totalTokens);
         break;
 
       case "done": {
@@ -180,6 +232,10 @@ export async function pumpSession(session: CursorSession, ctx: SSECtx): Promise<
 
         if (event.retryHint) {
           return { outcome: "retry", retryHint: event.retryHint, error: event.error || "" };
+        }
+
+        if (!usageSent) {
+          sendUsageIfAvailable(session.outputTokens, session.totalTokens);
         }
 
         if (event.error) {
@@ -199,16 +255,20 @@ export async function collectNonStreamingResponse(
 ): Promise<Response> {
   const tagFilter = createThinkingTagFilter();
   let text = "";
+  let usage: OpenAIUsage | null = null;
   while (true) {
     const event = await session.next();
     if (event.type === "text" && !event.isThinking) {
       const { content } = tagFilter.process(event.text);
       text += content;
+    } else if (event.type === "usage") {
+      usage = pickBetterUsage(usage, buildUsage(event.outputTokens, event.totalTokens));
     } else if (event.type === "done") {
       text += tagFilter.flush().content;
       break;
     }
   }
+  usage = pickBetterUsage(usage, buildUsage(session.outputTokens, session.totalTokens));
   session.close();
 
   return new Response(
@@ -218,7 +278,7 @@ export async function collectNonStreamingResponse(
       created: Math.floor(Date.now() / 1000),
       model: modelId,
       choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      ...(usage ? { usage } : {}),
     }),
     { headers: { "Content-Type": "application/json" } },
   );
