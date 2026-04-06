@@ -156,6 +156,7 @@ export function processServerMessage(
 
 // ── Interaction updates ──
 
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: large switch over Cursor interaction types
 function handleInteractionUpdate(
   update: any,
   state: StreamState,

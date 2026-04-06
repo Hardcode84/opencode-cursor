@@ -115,6 +115,21 @@ bun run deploy   # bundle + copy to ~/.config/opencode/plugins/
 bun run test     # smoke tests
 ```
 
+### Pre-commit checks
+
+A **husky** pre-commit hook runs **Biome** (lint + format) on every staged `.ts`
+file via **lint-staged**. The hook is installed automatically by `bun install`
+(via the `prepare` script).
+
+```sh
+bun run check       # lint + format check (no writes)
+bun run check:fix   # lint + format with auto-fix
+bun run typecheck   # tsc --noEmit
+```
+
+Cognitive complexity is enforced at a threshold of 25. Functions that
+intentionally exceed it carry a `biome-ignore` suppression with a reason.
+
 `bun run deploy` bundles the plugin into two self-contained JS files:
 
 - `opencode-cursor-oauth.js` — main plugin (auth, proxy, model registry)

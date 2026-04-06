@@ -114,6 +114,7 @@ export function fixMcpArgNames(toolName: string, args: Record<string, unknown>):
 
 // ── Native → MCP redirection ──
 
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: maps all native Cursor tool types to MCP equivalents
 export function nativeToMcpRedirect(
   execCase: string,
   execMsg: ExecServerMessage,

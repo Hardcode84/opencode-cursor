@@ -76,6 +76,7 @@ export type PumpResult =
  * For retryable errors, returns 'retry' without writing stop/DONE — the
  * caller can create a new session and call pumpSession again on the same ctx.
  */
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: event loop with thinking/native branching
 export async function pumpSession(session: CursorSession, ctx: SSECtx): Promise<PumpResult> {
   const tagFilter = createThinkingTagFilter();
   let hasNativeThinking = false;

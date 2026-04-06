@@ -238,6 +238,7 @@ function textContent(content: OpenAIMessage["content"]): string {
     .join("\n");
 }
 
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: OpenAI message parsing with role/tool interleaving
 function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   let systemPrompt = "You are a helpful assistant.";
   const pairs: Array<{ userText: string; assistantText: string }> = [];

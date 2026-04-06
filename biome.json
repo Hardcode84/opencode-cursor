@@ -23,7 +23,11 @@
       },
       "complexity": {
         "noForEach": "off",
-        "noBannedTypes": "off"
+        "noBannedTypes": "off",
+        "noExcessiveCognitiveComplexity": {
+          "level": "error",
+          "options": { "maxAllowedComplexity": 25 }
+        }
       }
     }
   },
