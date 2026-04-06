@@ -2,7 +2,8 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { type ClientHttp2Session, type ClientHttp2Stream, connect as h2Connect } from "node:http2";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { processServerMessage, type StreamState } from "./cursor-messages";
-import { logError, logWarn } from "./logger";
+import { EventQueue } from "./event-queue";
+import { logError } from "./logger";
 import {
   type BridgeWriter,
   type PendingExec,
@@ -24,7 +25,6 @@ const THINKING_TIMEOUT_MS = 30_000;
 const STREAMING_TIMEOUT_MS = 15_000;
 const CLOSE_OK = 0;
 const CLOSE_ERR = 1;
-const MAX_QUEUE_DEPTH = 10_000;
 
 export type RetryHint = "blob_not_found" | "resource_exhausted" | "timeout";
 
@@ -47,46 +47,6 @@ export function classifyConnectError(errorMessage: string): RetryHint | undefine
   if (/blob not found/i.test(errorMessage)) return "blob_not_found";
   if (/resource_exhausted/i.test(errorMessage)) return "resource_exhausted";
   return undefined;
-}
-
-class EventQueue<T> {
-  private buffer: T[] = [];
-  private waiters: Array<(value: T) => void> = [];
-
-  get length(): number {
-    return this.buffer.length;
-  }
-
-  push(event: T): void {
-    const waiter = this.waiters.shift();
-    if (waiter) {
-      waiter(event);
-    } else {
-      if (this.buffer.length >= MAX_QUEUE_DEPTH) {
-        logWarn("EventQueue overflow, dropping event", { depth: this.buffer.length });
-        return;
-      }
-      this.buffer.push(event);
-    }
-  }
-
-  /** Push unconditionally (bypasses high-water mark). Used for terminal events. */
-  pushForce(event: T): void {
-    const waiter = this.waiters.shift();
-    if (waiter) {
-      waiter(event);
-    } else {
-      this.buffer.push(event);
-    }
-  }
-
-  next(): Promise<T> {
-    const head = this.buffer.shift();
-    if (head !== undefined) return Promise.resolve(head);
-    return new Promise((resolve) => {
-      this.waiters.push(resolve);
-    });
-  }
 }
 
 export interface SessionOptions {

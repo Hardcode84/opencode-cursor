@@ -2,10 +2,7 @@ import http from "node:http";
 import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
 import { create, toBinary } from "@bufbuild/protobuf";
-import {
-  GetUsableModelsResponseSchema,
-  ModelDetailsSchema,
-} from "../src/proto/agent_pb";
+import { GetUsableModelsResponseSchema, ModelDetailsSchema } from "../src/proto/agent_pb";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
 
@@ -132,30 +129,29 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
             ":status": 401,
             "content-type": "application/json",
           });
-          stream.end(
-            JSON.stringify({ code: "unauthenticated", message: "expired token" }),
-          );
+          stream.end(JSON.stringify({ code: "unauthenticated", message: "expired token" }));
           return;
         }
 
-        const responseBody = discoveryMode === "empty"
-          ? frameConnectUnaryMessage(new Uint8Array())
-          : frameConnectUnaryMessage(
-              toBinary(
-                GetUsableModelsResponseSchema,
-                create(GetUsableModelsResponseSchema, {
-                  models: discoveredModels.map((model) =>
-                    create(ModelDetailsSchema, {
-                      modelId: model.id,
-                      displayModelId: model.id,
-                      displayName: model.name,
-                      displayNameShort: model.name,
-                      aliases: [],
-                    }),
-                  ),
-                }),
-              ),
-            );
+        const responseBody =
+          discoveryMode === "empty"
+            ? frameConnectUnaryMessage(new Uint8Array())
+            : frameConnectUnaryMessage(
+                toBinary(
+                  GetUsableModelsResponseSchema,
+                  create(GetUsableModelsResponseSchema, {
+                    models: discoveredModels.map((model) =>
+                      create(ModelDetailsSchema, {
+                        modelId: model.id,
+                        displayModelId: model.id,
+                        displayName: model.name,
+                        displayNameShort: model.name,
+                        aliases: [],
+                      }),
+                    ),
+                  }),
+                ),
+              );
         stream.respond({
           ":status": 200,
           "content-type": "application/connect+proto",
@@ -313,7 +309,9 @@ async function testTokenExpiry(modules: TestModules) {
   const expectedMax = futureExp * 1000 - 5 * 60 * 1000 + 1000;
 
   if (expiry < expectedMin || expiry > expectedMax) {
-    throw new Error(`Token expiry ${expiry} out of expected range [${expectedMin}, ${expectedMax}]`);
+    throw new Error(
+      `Token expiry ${expiry} out of expected range [${expectedMin}, ${expectedMax}]`,
+    );
   }
 
   const fallbackExpiry = modules.getTokenExpiry("not-a-jwt");
@@ -390,9 +388,7 @@ async function testArrayContentParsing(modules: TestModules) {
   if (res.status === 400) {
     const body = await res.json();
     if (body.error?.message?.includes("No user message")) {
-      throw new Error(
-        "Array content not normalized — plan mode messages lost",
-      );
+      throw new Error("Array content not normalized — plan mode messages lost");
     }
   }
 
@@ -408,9 +404,7 @@ async function testExpiredTokenRefreshBeforeDiscovery(
   modules.clearModelCache();
   backend.resetObservations();
   backend.setDiscoveryMode("success");
-  backend.setDiscoveredModels([
-    { id: "fresh-model", name: "Fresh Model", reasoning: true },
-  ]);
+  backend.setDiscoveredModels([{ id: "fresh-model", name: "Fresh Model", reasoning: true }]);
 
   let authState = {
     type: "oauth" as const,
@@ -457,10 +451,7 @@ async function testExpiredTokenRefreshBeforeDiscovery(
   console.log("[test] Refresh-before-discovery OK");
 }
 
-async function testDiscoveryFallbackAndSuccess(
-  modules: TestModules,
-  backend: TestCursorBackend,
-) {
+async function testDiscoveryFallbackAndSuccess(modules: TestModules, backend: TestCursorBackend) {
   console.log("[test] Testing discovery fallback and success...");
 
   const authState = {
@@ -486,17 +477,11 @@ async function testDiscoveryFallbackAndSuccess(
     Object.keys(provider.models).length > 0,
     "Expected fallback models to be registered when discovery fails",
   );
-  assert(
-    !("stale" in provider.models),
-    "Expected stale models to be replaced",
-  );
+  assert(!("stale" in provider.models), "Expected stale models to be replaced");
   const degradedModelsRes = await fetch(`${degradedConfig.baseURL}/models`);
   assertEqual(degradedModelsRes.status, 200, "Expected degraded /v1/models to succeed");
   const degradedModelsBody = await degradedModelsRes.json();
-  assert(
-    degradedModelsBody.data.length > 0,
-    "Expected proxy /v1/models to expose fallback models",
-  );
+  assert(degradedModelsBody.data.length > 0, "Expected proxy /v1/models to expose fallback models");
 
   // Successful discovery should replace with real models
   modules.clearModelCache();

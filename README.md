@@ -112,14 +112,31 @@ bun install
 bun run build    # tsc — type-checked build
 bun run bundle   # bun build — produces dist/index.js + dist/sdk-wrapper.js
 bun run deploy   # bundle + copy to ~/.config/opencode/plugins/
-bun run test     # smoke tests
 ```
+
+### Tests
+
+```sh
+bun test          # run all unit tests
+bun test:smoke    # run integration smoke tests only
+```
+
+Unit tests live in `test/` and cover pure/stateful logic with no network I/O:
+
+| File | What it covers |
+|------|----------------|
+| `protocol.test.ts` | Connect frame encoding/decoding, split reassembly, oversized frame rejection |
+| `thinking-filter.test.ts` | Thinking tag stripping, partial tag buffering across chunks, flush |
+| `native-tools.test.ts` | `fixMcpArgNames` remapping, `nativeToMcpRedirect` for every exec type |
+| `openai-messages.test.ts` | `parseMessages` (multi-turn, tool results), `selectToolsForChoice`, `textContent` |
+| `event-queue.test.ts` | EventQueue FIFO ordering, waiter resolution, high-water mark overflow |
+| `cursor-session.test.ts` | `classifyConnectError` error classification |
 
 ### Pre-commit checks
 
 A **husky** pre-commit hook runs **Biome** (lint + format) on every staged `.ts`
-file via **lint-staged**. The hook is installed automatically by `bun install`
-(via the `prepare` script).
+file in `src/` and `test/` via **lint-staged**. The hook is installed
+automatically by `bun install` (via the `prepare` script).
 
 ```sh
 bun run check       # lint + format check (no writes)
