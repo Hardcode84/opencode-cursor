@@ -14,7 +14,7 @@ import {
   pollCursorAuth,
   refreshCursorToken,
 } from "./auth";
-import { configureLogger } from "./logger";
+import { configureLogger, logWarn } from "./logger";
 import { type CursorModel, getCursorModels } from "./models";
 import { startProxy } from "./server";
 
@@ -32,6 +32,15 @@ export const CursorAuthPlugin: Plugin = async (input: PluginInput): Promise<Hook
   let cursorModelList: CursorModel[] | null = null;
 
   return {
+    "chat.headers": async (
+      ctx: { sessionID: string; agent: string },
+      out: { headers: Record<string, string> },
+    ) => {
+      out.headers ??= {};
+      if (ctx.sessionID) out.headers["x-session-affinity"] = ctx.sessionID;
+      if (ctx.agent) out.headers["x-opencode-agent"] = ctx.agent;
+    },
+
     auth: {
       provider: CURSOR_PROVIDER_ID,
 
@@ -55,7 +64,14 @@ export const CursorAuthPlugin: Plugin = async (input: PluginInput): Promise<Hook
           accessToken = refreshed.access;
         }
 
-        const models = await getCursorModels(accessToken);
+        const discovery = await getCursorModels(accessToken);
+        if (discovery.usedFallback) {
+          logWarn(
+            "Model discovery failed — using hardcoded fallback list. " +
+              "Some models may be missing or outdated.",
+          );
+        }
+        const models = discovery.models;
 
         const port = await startProxy(async () => {
           const currentAuth = await getAuth();

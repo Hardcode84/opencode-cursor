@@ -3,7 +3,7 @@ import { type ClientHttp2Session, type ClientHttp2Stream, connect as h2Connect }
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { processServerMessage, type StreamState } from "./cursor-messages";
 import { EventQueue } from "./event-queue";
-import { logError } from "./logger";
+import { logError, logWarn } from "./logger";
 import {
   type BridgeWriter,
   type PendingExec,
@@ -83,6 +83,7 @@ export class CursorSession implements BridgeWriter {
   private timerPhase: "thinking" | "streaming" = "thinking";
   private doneEventSent = false;
   private _flushedExecs: PendingExec[] = [];
+  private _checkpointReceived = false;
 
   readonly blobStore: Map<string, Uint8Array>;
   readonly accessToken: string;
@@ -301,10 +302,7 @@ export class CursorSession implements BridgeWriter {
     this.inactivityTimer = setTimeout(() => {
       this.inactivityTimer = null;
       if (this.batchState === "collecting" && this.pendingExecs.length > 0) {
-        this.batchState = "flushed";
-        this._flushedExecs = [...this.pendingExecs];
-        this.clearInactivityTimer();
-        this.queue.push({ type: "batchReady" });
+        this.flushBatch();
         return;
       }
       this.pushDone({ type: "done", error: "Cursor server timed out", retryHint: "timeout" });
@@ -331,11 +329,13 @@ export class CursorSession implements BridgeWriter {
           this.streamState.toolCallIndex++;
           if (this.batchState === "streaming" || this.batchState === "flushed") {
             this.batchState = "collecting";
+            this._checkpointReceived = false;
           }
           this.queue.push({ type: "toolCall", exec });
           this.resetInactivityTimer();
         },
         (bytes) => {
+          this._checkpointReceived = true;
           this.options.onCheckpoint?.(bytes, this.blobStore);
           if (this.pendingExecs.length > 0 && this.batchState === "collecting") {
             this.streamState.checkpointAfterExec = true;
@@ -372,13 +372,23 @@ export class CursorSession implements BridgeWriter {
     }
   }
 
+  private flushBatch(): void {
+    if (!this._checkpointReceived) {
+      logWarn("flushing tool calls without a persisted checkpoint — recovery may fail", {
+        pendingExecs: this.pendingExecs.length,
+        convKey: this.options.convKey,
+      });
+    }
+    this.batchState = "flushed";
+    this.streamState.checkpointAfterExec = false;
+    this._flushedExecs = [...this.pendingExecs];
+    this.clearInactivityTimer();
+    this.queue.push({ type: "batchReady" });
+  }
+
   private afterParse(): void {
     if (this.streamState.checkpointAfterExec && this.batchState === "collecting") {
-      this.batchState = "flushed";
-      this.streamState.checkpointAfterExec = false;
-      this._flushedExecs = [...this.pendingExecs];
-      this.clearInactivityTimer();
-      this.queue.push({ type: "batchReady" });
+      this.flushBatch();
     }
     if (
       this.streamState.endStreamSeen &&

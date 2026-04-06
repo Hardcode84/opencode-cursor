@@ -16,6 +16,8 @@ export interface SSECtx {
   readonly closed: boolean;
 }
 
+const SSE_KEEPALIVE_MS = 15_000;
+
 export function createSSECtx(
   controller: ReadableStreamDefaultController,
   modelId: string,
@@ -29,6 +31,21 @@ export function createSSECtx(
     if (closed) return;
     controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
   };
+
+  const keepaliveTimer = setInterval(() => {
+    if (closed) return;
+    try {
+      controller.enqueue(encoder.encode(": keep-alive\n\n"));
+    } catch {
+      // enqueue fails after stream abort/close — stop sending
+      clearInterval(keepaliveTimer);
+    }
+  }, SSE_KEEPALIVE_MS);
+  if (typeof keepaliveTimer === "object" && "unref" in keepaliveTimer) {
+    keepaliveTimer.unref();
+  }
+
+  const stopKeepalive = () => clearInterval(keepaliveTimer);
 
   return {
     sendChunk(delta, finishReason = null) {
@@ -52,11 +69,14 @@ export function createSSECtx(
     },
     sendDone() {
       if (closed) return;
+      closed = true;
+      stopKeepalive();
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));
     },
     close() {
       if (closed) return;
       closed = true;
+      stopKeepalive();
       controller.close();
     },
     get closed() {

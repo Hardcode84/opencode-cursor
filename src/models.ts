@@ -173,18 +173,27 @@ async function fetchCursorUsableModels(apiKey: string): Promise<CursorModel[] | 
   }
 }
 
-let cachedModels: CursorModel[] | null = null;
+export interface ModelDiscoveryResult {
+  models: CursorModel[];
+  usedFallback: boolean;
+}
 
-export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
-  if (cachedModels) return cachedModels;
+let cachedResult: ModelDiscoveryResult | null = null;
+
+export async function getCursorModels(apiKey: string): Promise<ModelDiscoveryResult> {
+  if (cachedResult) return cachedResult;
   const discovered = await fetchCursorUsableModels(apiKey);
-  cachedModels = discovered && discovered.length > 0 ? discovered : FALLBACK_MODELS;
-  return cachedModels;
+  const usedFallback = !discovered || discovered.length === 0;
+  cachedResult = {
+    models: usedFallback ? FALLBACK_MODELS : discovered,
+    usedFallback,
+  };
+  return cachedResult;
 }
 
 /** @internal Test-only. */
 export function clearModelCache(): void {
-  cachedModels = null;
+  cachedResult = null;
 }
 
 function decodeGetUsableModelsResponse(payload: Uint8Array): {

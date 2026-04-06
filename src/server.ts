@@ -15,6 +15,7 @@ import {
   type OpenAIToolDef,
   parseMessages,
   selectToolsForChoice,
+  type ToolResultInfo,
   textContent,
 } from "./openai-messages";
 import type { PumpResult } from "./openai-stream";
@@ -170,7 +171,7 @@ export async function startProxy(
         }
       }
 
-      return new Response("Not Found", { status: 404 });
+      return jsonError("Not Found", "not_found", 404);
     },
   });
 
@@ -538,24 +539,11 @@ function handleChatCompletion(
   const tools = selectToolsForChoice(body.tools ?? [], body.tool_choice);
 
   if (!userText && toolResults.length === 0) {
-    return new Response(
-      JSON.stringify({
-        error: { message: "No user message found", type: "invalid_request_error" },
-      }),
-      { status: 400, headers: { "Content-Type": "application/json" } },
-    );
+    return jsonError("No user message found", "missing_user_message");
   }
 
   if (body.stream === false && tools.length > 0) {
-    return new Response(
-      JSON.stringify({
-        error: {
-          message: "Non-streaming responses with tools are not supported",
-          type: "invalid_request_error",
-        },
-      }),
-      { status: 400, headers: { "Content-Type": "application/json" } },
-    );
+    return jsonError("Non-streaming responses with tools are not supported", "unsupported_mode");
   }
 
   const bridgeKey = deriveBridgeKey(modelId, body.messages, sessionId, parentSessionId);
@@ -563,21 +551,9 @@ function handleChatCompletion(
   const active = activeSessions.get(bridgeKey);
 
   // --- Tool-result resume ---
-  if (active && toolResults.length > 0) {
-    activeSessions.delete(bridgeKey);
-    const pendingIds = new Set(active.session.flushedExecs.map((e) => e.toolCallId));
-    const newResults = toolResults.filter((r) => pendingIds.has(r.toolCallId));
-
-    if (active.session.alive) {
-      logDebug(
-        `resume: session alive, ${newResults.length} new tool results (of ${toolResults.length} total)`,
-      );
-      active.session.sendToolResults(newResults);
-      return handleResumeStream(active.session, modelId, bridgeKey, convKey);
-    }
-
-    logDebug("resume: session DEAD, falling through to fresh session");
-    active.session.close();
+  if (toolResults.length > 0) {
+    const resumeResponse = tryToolResultResume(active, toolResults, bridgeKey, modelId, convKey);
+    if (resumeResponse) return resumeResponse;
   }
 
   // Clean up stale session
@@ -649,6 +625,69 @@ function handleChatCompletion(
     turns,
     mcpTools,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Tool-result resume validation
+// ---------------------------------------------------------------------------
+
+function jsonError(message: string, code: string, status = 400): Response {
+  return new Response(JSON.stringify({ error: { message, type: "invalid_request_error", code } }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function tryToolResultResume(
+  active: ActiveSession | undefined,
+  toolResults: ToolResultInfo[],
+  bridgeKey: string,
+  modelId: string,
+  convKey: string,
+): Response | null {
+  if (!active) {
+    logWarn("tool results received but no active session", {
+      bridgeKey,
+      toolResultIds: toolResults.map((r) => r.toolCallId),
+    });
+    return jsonError(
+      "No active session for tool results — session may have expired",
+      "session_not_found",
+    );
+  }
+
+  activeSessions.delete(bridgeKey);
+  const pendingIds = new Set(active.session.flushedExecs.map((e) => e.toolCallId));
+  const newResults = toolResults.filter((r) => pendingIds.has(r.toolCallId));
+  const orphanedCount = toolResults.length - newResults.length;
+
+  if (orphanedCount > 0) {
+    logWarn("tool results reference unknown pending exec IDs", {
+      orphanedCount,
+      knownIds: [...pendingIds],
+      receivedIds: toolResults.map((r) => r.toolCallId),
+    });
+  }
+
+  if (newResults.length === 0) {
+    active.session.close();
+    return jsonError(
+      "None of the provided tool results match pending executions",
+      "tool_results_mismatch",
+    );
+  }
+
+  if (active.session.alive) {
+    logDebug(
+      `resume: session alive, ${newResults.length} new tool results (of ${toolResults.length} total)`,
+    );
+    active.session.sendToolResults(newResults);
+    return handleResumeStream(active.session, modelId, bridgeKey, convKey);
+  }
+
+  logDebug("resume: session DEAD, falling through to fresh session");
+  active.session.close();
+  return null;
 }
 
 // ---------------------------------------------------------------------------
