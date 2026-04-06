@@ -13,7 +13,7 @@ import {
   sendNativeResult,
 } from "./native-tools";
 import { type StreamState, processServerMessage } from "./cursor-messages";
-import { logError } from "./logger";
+import { logError, logWarn } from "./logger";
 import { connect as h2Connect, type ClientHttp2Session, type ClientHttp2Stream } from "node:http2";
 import { randomBytes, randomUUID } from "node:crypto";
 
@@ -22,6 +22,9 @@ const CURSOR_AGENT_URL = process.env.CURSOR_AGENT_URL ?? "https://agentn.us.api5
 const CURSOR_CLIENT_VERSION = "cli-2026.03.30-a5d3e17";
 const THINKING_TIMEOUT_MS = 30_000;
 const STREAMING_TIMEOUT_MS = 15_000;
+const CLOSE_OK = 0;
+const CLOSE_ERR = 1;
+const MAX_QUEUE_DEPTH = 10_000;
 
 export type RetryHint = "blob_not_found" | "resource_exhausted" | "timeout";
 
@@ -50,7 +53,25 @@ class EventQueue<T> {
   private buffer: T[] = [];
   private waiters: Array<(value: T) => void> = [];
 
+  get length(): number {
+    return this.buffer.length;
+  }
+
   push(event: T): void {
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter(event);
+    } else {
+      if (this.buffer.length >= MAX_QUEUE_DEPTH) {
+        logWarn("EventQueue overflow, dropping event", { depth: this.buffer.length });
+        return;
+      }
+      this.buffer.push(event);
+    }
+  }
+
+  /** Push unconditionally (bypasses high-water mark). Used for terminal events. */
+  pushForce(event: T): void {
     const waiter = this.waiters.shift();
     if (waiter) {
       waiter(event);
@@ -93,7 +114,6 @@ export class CursorSession implements BridgeWriter {
   private readonly streamState: StreamState;
   private batchState: "streaming" | "collecting" | "flushed" = "streaming";
   private pendingExecs: PendingExec[] = [];
-  private toolCallIndex = 0;
   private _alive = true;
   private h2Session: ClientHttp2Session;
   private h2Stream: ClientHttp2Stream;
@@ -138,7 +158,7 @@ export class CursorSession implements BridgeWriter {
     this.h2Session.on("error", (err) => {
       logError("CursorSession: h2 session error", { error: err?.message ?? err });
       this.closeTransport();
-      this.finish(1);
+      this.finish(CLOSE_ERR);
     });
 
     const headers: Record<string, string> = {
@@ -171,12 +191,12 @@ export class CursorSession implements BridgeWriter {
     });
     this.h2Stream.on("end", () => {
       this.closeTransport();
-      this.finish(0);
+      this.finish(CLOSE_OK);
     });
     this.h2Stream.on("error", (err) => {
       logError("CursorSession: h2 stream error", { error: err?.message ?? err });
       this.closeTransport();
-      this.finish(1);
+      this.finish(CLOSE_ERR);
     });
 
     this.resetInactivityTimer();
@@ -199,7 +219,7 @@ export class CursorSession implements BridgeWriter {
   }
 
   write(data: Uint8Array): void {
-    if (!this._alive || !this.h2Stream) return;
+    if (!this._alive) return;
     try {
       this.h2Stream.write(data);
     } catch {
@@ -242,13 +262,13 @@ export class CursorSession implements BridgeWriter {
 
   close(): void {
     this.closeTransport();
-    this.finish(0);
+    this.finish(CLOSE_OK);
   }
 
   private pushDone(event: Extract<SessionEvent, { type: "done" }>): void {
     if (this.doneEventSent) return;
     this.doneEventSent = true;
-    this.queue.push(event);
+    this.queue.pushForce(event);
   }
 
   private closeTransport(): void {
@@ -273,7 +293,7 @@ export class CursorSession implements BridgeWriter {
     if (!this.doneEventSent) {
       if (this.pendingExecs.length > 0) {
         this.pushDone({ type: "done", error: "session closed with pending tool calls" });
-      } else if (code !== 0) {
+      } else if (code !== CLOSE_OK) {
         this.pushDone({ type: "done", error: "bridge connection lost" });
       } else {
         this.pushDone({ type: "done" });
@@ -316,8 +336,7 @@ export class CursorSession implements BridgeWriter {
         },
         (exec) => {
           this.pendingExecs.push(exec);
-          this.toolCallIndex++;
-          this.streamState.toolCallIndex = this.toolCallIndex;
+          this.streamState.toolCallIndex++;
           if (this.batchState === "streaming" || this.batchState === "flushed") {
             this.batchState = "collecting";
           }
@@ -342,6 +361,8 @@ export class CursorSession implements BridgeWriter {
       if (recognized) this.resetInactivityTimer();
     } catch (err) {
       logError("CursorSession: processServerMessage failed", { error: String(err) });
+      this.pushDone({ type: "done", error: "Failed to process server message" });
+      this.close();
     }
   }
 
@@ -351,7 +372,7 @@ export class CursorSession implements BridgeWriter {
     if (err) {
       const hint = classifyConnectError(err.message);
       this.pushDone({ type: "done", error: err.message, retryHint: hint });
-      this.finish(1);
+      this.finish(CLOSE_ERR);
       return;
     }
     if (this.pendingExecs.length > 0 && this.batchState === "collecting") {

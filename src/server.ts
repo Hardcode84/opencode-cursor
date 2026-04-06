@@ -33,8 +33,9 @@ import {
   createSSECtx,
   pumpSession,
   collectNonStreamingResponse,
+  type SSECtx,
 } from "./openai-stream";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 const MAX_BLOB_RETRIES = 2;
 const MAX_AUTO_RESUMES = 5;
@@ -119,6 +120,15 @@ function evictStaleSessions(): void {
       activeSessions.delete(key);
     }
   }
+}
+
+/** Store a session, closing any existing entry for the same key to prevent orphans. */
+function storeActiveSession(key: string, entry: ActiveSession): void {
+  const existing = activeSessions.get(key);
+  if (existing && existing.session !== entry.session) {
+    existing.session.close();
+  }
+  activeSessions.set(key, entry);
 }
 
 setInterval(evictStaleSessions, 60_000).unref();
@@ -399,7 +409,7 @@ function buildCursorRequest(
     for (const turn of turns) {
       const userMsg = create(UserMessageSchema, {
         text: turn.userText,
-        messageId: crypto.randomUUID(),
+        messageId: randomUUID(),
       });
       const userMsgBytes = toBinary(UserMessageSchema, userMsg);
 
@@ -442,7 +452,7 @@ function buildCursorRequest(
 
   const userMessage = create(UserMessageSchema, {
     text: userText,
-    messageId: crypto.randomUUID(),
+    messageId: randomUUID(),
   });
   const action = create(ConversationActionSchema, {
     action: {
@@ -541,8 +551,6 @@ function makeCheckpointCallback(
   };
 }
 
-import type { SSECtx } from "./openai-stream";
-
 /**
  * Pump a session with auto-resume on timeout/resource_exhausted.
  * Returns the final PumpResult. On batchReady, stores the session.
@@ -567,7 +575,7 @@ async function pumpWithAutoResume(
     }
 
     if (result.outcome === "batchReady") {
-      activeSessions.set(bridgeKey, {
+      storeActiveSession(bridgeKey, {
         session: currentSession,
         convKey,
         storedAt: Date.now(),
@@ -785,7 +793,7 @@ function handleStreamingWithRetry(
   turns?: Array<{ userText: string; assistantText: string }>,
   mcpTools?: McpToolDefinition[],
 ): Response {
-  const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
+  const completionId = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
 
   const stream = new ReadableStream({
@@ -865,7 +873,7 @@ function handleResumeStream(
   bridgeKey: string,
   convKey: string,
 ): Response {
-  const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
+  const completionId = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
 
   const stream = new ReadableStream({

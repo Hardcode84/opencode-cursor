@@ -1,13 +1,13 @@
-/** Connect protocol frame: [1-byte flags][4-byte BE length][payload] */
 export function frameConnectMessage(data: Uint8Array, flags = 0): Buffer {
-  const frame = Buffer.alloc(5 + data.length);
-  frame[0] = flags;
-  frame.writeUInt32BE(data.length, 1);
-  frame.set(data, 5);
-  return frame;
+  const header = Buffer.alloc(5);
+  header[0] = flags;
+  header.writeUInt32BE(data.length, 1);
+  return Buffer.concat([header, Buffer.from(data)]);
 }
 
 export const CONNECT_END_STREAM_FLAG = 0b00000010;
+
+const MAX_FRAME_SIZE = 32 * 1024 * 1024; // 32 MiB
 
 export function createConnectFrameParser(
   onMessage: (bytes: Uint8Array) => void,
@@ -19,6 +19,15 @@ export function createConnectFrameParser(
     while (pending.length >= 5) {
       const flags = pending[0]!;
       const msgLen = pending.readUInt32BE(1);
+      if (msgLen > MAX_FRAME_SIZE) {
+        pending = Buffer.alloc(0);
+        onEndStream(
+          new TextEncoder().encode(
+            JSON.stringify({ error: { code: "frame_too_large", message: `Frame size ${msgLen} exceeds limit` } }),
+          ),
+        );
+        return;
+      }
       if (pending.length < 5 + msgLen) break;
       const messageBytes = pending.subarray(5, 5 + msgLen);
       pending = pending.subarray(5 + msgLen);

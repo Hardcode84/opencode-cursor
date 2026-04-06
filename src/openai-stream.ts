@@ -1,5 +1,6 @@
 import type { CursorSession, SessionEvent, RetryHint } from "./cursor-session";
 import { createThinkingTagFilter } from "./thinking-filter";
+import { randomUUID } from "node:crypto";
 
 export const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
@@ -152,7 +153,7 @@ export async function pumpSession(
 
 /** Simple wrapper for cases that don't need retry orchestration. */
 export function createStreamingResponse(session: CursorSession, modelId: string): Response {
-  const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
+  const completionId = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
 
   const stream = new ReadableStream({
@@ -191,7 +192,7 @@ export async function collectNonStreamingResponse(
 
   return new Response(
     JSON.stringify({
-      id: `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`,
+      id: `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 28)}`,
       object: "chat.completion",
       created: Math.floor(Date.now() / 1000),
       model: modelId,
