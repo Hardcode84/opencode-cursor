@@ -93,10 +93,15 @@ import {
   type McpToolDefinition,
 } from "./proto/agent_pb";
 import { logDebug, logInfo, logWarn, logError, errorDetails } from "./logger";
+import {
+  type StoredConversation,
+  persistConversation,
+  resolveConversationState,
+  getConversationState,
+  invalidateConversationState,
+  turnsFingerprint,
+} from "./conversation-state";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, statSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CURSOR_AGENT_URL = process.env.CURSOR_AGENT_URL ?? "https://agentn.us.api5.cursor.sh";
@@ -237,112 +242,6 @@ function clearBridgeInactivityTimer(bridgeKey: string): void {
   }
 }
 
-interface StoredConversation {
-  conversationId: string;
-  checkpoint: Uint8Array | null;
-  blobStore: Map<string, Uint8Array>;
-  lastAccessMs: number;
-  checkpointHistory: Map<string, Uint8Array>;
-}
-
-function turnsFingerprint(turns: ParsedMessages["turns"]): string {
-  if (turns.length === 0) return "";
-  const h = createHash("md5");
-  for (const t of turns) {
-    h.update(t.userText);
-    h.update("\0");
-    h.update(t.assistantText);
-    h.update("\0");
-  }
-  return `${turns.length}:${h.digest("hex").slice(0, 12)}`;
-}
-
-const conversationStates = new Map<string, StoredConversation>();
-const CONVERSATION_TTL_MS = 30 * 60 * 1000; // 30 minutes
-
-function evictStaleConversations(): void {
-  const now = Date.now();
-  for (const [key, stored] of conversationStates) {
-    if (now - stored.lastAccessMs > CONVERSATION_TTL_MS) {
-      conversationStates.delete(key);
-      try { unlinkSync(convDiskPath(key)); } catch {}
-    }
-  }
-}
-
-// --- Disk persistence for conversation state across process restarts ---
-
-const CONV_DISK_DIR = join(
-  process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"),
-  "opencode",
-  "cursor-conversations",
-);
-try { mkdirSync(CONV_DISK_DIR, { recursive: true }); } catch {}
-
-const CONV_DISK_TTL_MS = 24 * 60 * 60 * 1000; // 24h on-disk TTL
-
-function convDiskPath(convKey: string): string {
-  return join(CONV_DISK_DIR, `${convKey}.json`);
-}
-
-interface SerializedConversation {
-  conversationId: string;
-  checkpoint: string | null; // base64
-  blobStore: Record<string, string>; // hex key → base64 value
-  savedMs: number;
-  checkpointHistory?: Record<string, string>; // fingerprint → base64 checkpoint
-}
-
-function persistConversation(convKey: string, stored: StoredConversation): void {
-  const data: SerializedConversation = {
-    conversationId: stored.conversationId,
-    checkpoint: stored.checkpoint ? Buffer.from(stored.checkpoint).toString("base64") : null,
-    blobStore: Object.fromEntries(
-      [...stored.blobStore].map(([k, v]) => [k, Buffer.from(v).toString("base64")]),
-    ),
-    savedMs: Date.now(),
-    checkpointHistory: Object.fromEntries(
-      [...stored.checkpointHistory].map(([fp, cp]) => [fp, Buffer.from(cp).toString("base64")]),
-    ),
-  };
-  try { writeFileSync(convDiskPath(convKey), JSON.stringify(data)); } catch {}
-}
-
-function loadConversation(convKey: string): StoredConversation | null {
-  try {
-    const raw: SerializedConversation = JSON.parse(readFileSync(convDiskPath(convKey), "utf-8"));
-    if (Date.now() - raw.savedMs > CONV_DISK_TTL_MS) {
-      try { unlinkSync(convDiskPath(convKey)); } catch {}
-      return null;
-    }
-    return {
-      conversationId: raw.conversationId,
-      checkpoint: raw.checkpoint ? new Uint8Array(Buffer.from(raw.checkpoint, "base64")) : null,
-      blobStore: new Map(
-        Object.entries(raw.blobStore).map(([k, v]) => [k, new Uint8Array(Buffer.from(v, "base64"))]),
-      ),
-      lastAccessMs: Date.now(),
-      checkpointHistory: new Map(
-        Object.entries(raw.checkpointHistory ?? {}).map(([fp, cp]) => [fp, new Uint8Array(Buffer.from(cp, "base64"))]),
-      ),
-    };
-  } catch {
-    return null;
-  }
-}
-
-function evictStaleDiskConversations(): void {
-  try {
-    const now = Date.now();
-    for (const name of readdirSync(CONV_DISK_DIR)) {
-      if (!name.endsWith(".json")) continue;
-      const full = join(CONV_DISK_DIR, name);
-      try {
-        if (now - statSync(full).mtimeMs > CONV_DISK_TTL_MS) unlinkSync(full);
-      } catch {}
-    }
-  } catch {}
-}
 
 /** Length-prefix a message: [4-byte BE length][payload] */
 /** Connect protocol frame: [1-byte flags][4-byte BE length][payload] */
@@ -663,7 +562,7 @@ export function stopProxy(): void {
   }
   // Merge blobs from active bridges into stored state before shutdown
   for (const active of activeBridges.values()) {
-    const stored = conversationStates.get(active.convKey);
+    const stored = getConversationState(active.convKey);
     if (stored) {
       for (const [k, v] of active.blobStore) stored.blobStore.set(k, v);
       stored.lastAccessMs = Date.now();
@@ -914,28 +813,6 @@ function handleChatCompletion(
   });
 }
 
-function resolveConversationState(convKey: string): StoredConversation {
-  let stored = conversationStates.get(convKey);
-  if (!stored) {
-    stored = loadConversation(convKey) ?? {
-      conversationId: deterministicConversationId(convKey),
-      checkpoint: null,
-      blobStore: new Map(),
-      lastAccessMs: Date.now(),
-      checkpointHistory: new Map(),
-    };
-    conversationStates.set(convKey, stored);
-  }
-  stored.lastAccessMs = Date.now();
-  evictStaleConversations();
-  evictStaleDiskConversations();
-  return stored;
-}
-
-function invalidateConversationState(convKey: string): void {
-  conversationStates.delete(convKey);
-  try { unlinkSync(convDiskPath(convKey)); } catch {}
-}
 
 interface ToolResultInfo {
   toolCallId: string;
@@ -1955,23 +1832,6 @@ function deriveConversationKey(messages: OpenAIMessage[], sessionId?: string, pa
     .slice(0, 16);
 }
 
-/** Deterministic UUID derived from convKey so Cursor's server-side conversation
- *  persists across proxy restarts. Formats 16 bytes of SHA-256 as a v4-shaped UUID. */
-function deterministicConversationId(convKey: string): string {
-  const hex = createHash("sha256")
-    .update(`cursor-conv-id:${convKey}`)
-    .digest("hex")
-    .slice(0, 32);
-  // Format as UUID: xxxxxxxx-xxxx-4xxx-Nxxx-xxxxxxxxxxxx
-  return [
-    hex.slice(0, 8),
-    hex.slice(8, 12),
-    `4${hex.slice(13, 16)}`,
-    `${(0x8 | (parseInt(hex[16], 16) & 0x3)).toString(16)}${hex.slice(17, 20)}`,
-    hex.slice(20, 32),
-  ].join("-");
-}
-
 /** Create an SSE streaming Response that reads from a live bridge. */
 function createBridgeStreamResponse(
   bridge: BridgeHandle,
@@ -2088,7 +1948,7 @@ function createBridgeStreamResponse(
             return true;
           }
           const timeoutSec = (timerPhase === "thinking" ? THINKING_TIMEOUT_MS : STREAMING_TIMEOUT_MS) / 1000;
-          const stored = conversationStates.get(convKey);
+          const stored = getConversationState(convKey);
           if (accessToken && stored?.checkpoint && resumeCount < MAX_AUTO_RESUMES) {
             logWarn("timeout — auto-resuming", { execs: state.totalExecCount, mcpCalls: state.toolCallIndex, attempt: resumeCount + 1, max: MAX_AUTO_RESUMES });
             sendSSE(makeChunk({ content: `\n[Cursor server timed out after ${timeoutSec}s — auto-resuming (attempt ${resumeCount + 1}/${MAX_AUTO_RESUMES})]\n` }));
@@ -2161,7 +2021,7 @@ function createBridgeStreamResponse(
                 }
               },
               (checkpointBytes) => {
-                const stored = conversationStates.get(convKey);
+                const stored = getConversationState(convKey);
                 if (stored) {
                   stored.checkpoint = checkpointBytes;
                   for (const [k, v] of blobStore) stored.blobStore.set(k, v);
@@ -2193,7 +2053,7 @@ function createBridgeStreamResponse(
               blobNotFoundRetry = onBlobNotFound;
               return;
             }
-            const stored = conversationStates.get(convKey);
+            const stored = getConversationState(convKey);
             if (/resource_exhausted/i.test(endError.message) && accessToken && stored?.checkpoint && resumeCount < MAX_AUTO_RESUMES) {
               logWarn("resource_exhausted — will auto-resume", { attempt: resumeCount + 1, max: MAX_AUTO_RESUMES });
               autoResumeRetry = () => {
@@ -2224,7 +2084,7 @@ function createBridgeStreamResponse(
 
       bridge.onClose((code) => {
         clearBridgeInactivityTimer(bridgeKey);
-        const stored = conversationStates.get(convKey);
+        const stored = getConversationState(convKey);
         const hasCheckpoint = !!(stored?.checkpoint);
         proxyLog(
           "bridge.onClose: code=%d execs=%d mcpCalls=%d mcpExec=%s pending=%d endStream=%s checkpoint=%s blobRetry=%s autoResume=%s",
@@ -2736,7 +2596,7 @@ async function collectFullResponse(
           },
           (exec: PendingExec) => {},
           (checkpointBytes: Uint8Array) => {
-            const stored = conversationStates.get(convKey);
+            const stored = getConversationState(convKey);
             if (stored) {
               stored.checkpoint = checkpointBytes;
               for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
@@ -2756,7 +2616,7 @@ async function collectFullResponse(
   bridge.onClose(() => {
     clearBridgeInactivityTimer(nonStreamBridgeKey);
     clearInterval(heartbeatTimer);
-    const stored = conversationStates.get(convKey);
+    const stored = getConversationState(convKey);
     if (stored) {
       for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
       stored.lastAccessMs = Date.now();
