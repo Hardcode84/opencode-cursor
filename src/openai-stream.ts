@@ -32,8 +32,9 @@ function sanitizeTokenCount(value: number): number {
 function buildUsage(completionTokens: number, totalTokens: number): OpenAIUsage | null {
   const completion = sanitizeTokenCount(completionTokens);
   const reportedTotal = sanitizeTokenCount(totalTokens);
-  const total = Math.max(completion, reportedTotal || completion);
-  if (completion === 0 && total === 0) return null;
+  if (completion === 0 && reportedTotal === 0) return null;
+  if (reportedTotal === 0) return null;
+  const total = Math.max(completion, reportedTotal);
   return {
     prompt_tokens: Math.max(0, total - completion),
     completion_tokens: completion,
@@ -162,13 +163,13 @@ export async function pumpSession(session: CursorSession, ctx: SSECtx): Promise<
   const tagFilter = createThinkingTagFilter();
   let hasNativeThinking = false;
   let toolCallIndex = 0;
-  let usageSent = false;
+  let bestUsage: OpenAIUsage | null = null;
 
-  const sendUsageIfAvailable = (completionTokens: number, totalTokens: number) => {
-    const usage = buildUsage(completionTokens, totalTokens);
-    if (!usage) return;
-    ctx.sendUsage(usage);
-    usageSent = true;
+  const sendUsageIfBetter = (completionTokens: number, totalTokens: number) => {
+    const nextUsage = pickBetterUsage(bestUsage, buildUsage(completionTokens, totalTokens));
+    if (!nextUsage || nextUsage === bestUsage) return;
+    ctx.sendUsage(nextUsage);
+    bestUsage = nextUsage;
   };
 
   while (true) {
@@ -213,16 +214,14 @@ export async function pumpSession(session: CursorSession, ctx: SSECtx): Promise<
         const flushed = tagFilter.flush();
         if (flushed.reasoning) ctx.sendChunk({ reasoning_content: flushed.reasoning });
         if (flushed.content) ctx.sendChunk({ content: flushed.content });
-        if (!usageSent) {
-          sendUsageIfAvailable(session.outputTokens, session.totalTokens);
-        }
+        sendUsageIfBetter(session.outputTokens, session.totalTokens);
         ctx.sendChunk({}, "tool_calls");
         ctx.sendDone();
         return { outcome: "batchReady" };
       }
 
       case "usage":
-        sendUsageIfAvailable(event.outputTokens, event.totalTokens);
+        sendUsageIfBetter(event.outputTokens, event.totalTokens);
         break;
 
       case "done": {
@@ -234,9 +233,7 @@ export async function pumpSession(session: CursorSession, ctx: SSECtx): Promise<
           return { outcome: "retry", retryHint: event.retryHint, error: event.error || "" };
         }
 
-        if (!usageSent) {
-          sendUsageIfAvailable(session.outputTokens, session.totalTokens);
-        }
+        sendUsageIfBetter(session.outputTokens, session.totalTokens);
 
         if (event.error) {
           ctx.sendChunk({ content: `\n[Error: ${event.error}]` });
