@@ -10,6 +10,7 @@ import {
 } from "./conversation-state";
 import { CursorSession } from "./cursor-session";
 import { errorDetails, logDebug, logError, logInfo, logWarn } from "./logger";
+import { MCP_TOOL_PREFIX } from "./native-tools";
 import {
   type OpenAIMessage,
   type OpenAIToolDef,
@@ -223,7 +224,7 @@ function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
         : { type: "object", properties: {}, required: [] };
     const inputSchema = toBinary(ValueSchema, fromJson(ValueSchema, jsonSchema));
     return create(McpToolDefinitionSchema, {
-      name: fn.name,
+      name: `${MCP_TOOL_PREFIX}${fn.name}`,
       description: fn.description || "",
       providerIdentifier: "opencode",
       toolName: fn.name,

@@ -8,7 +8,12 @@
 import { create, fromBinary, toBinary, toJson } from "@bufbuild/protobuf";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import { logDebugFmt, logWarn } from "./logger";
-import { fixMcpArgNames, nativeToMcpRedirect, type PendingExec } from "./native-tools";
+import {
+  fixMcpArgNames,
+  nativeToMcpRedirect,
+  type PendingExec,
+  stripMcpToolPrefix,
+} from "./native-tools";
 import {
   AgentClientMessageSchema,
   type AgentServerMessage,
@@ -363,7 +368,9 @@ export function handleExecMessage(
         create(McpInstructionsSchema, {
           serverName: "opencode",
           instructions:
-            "Use the provided MCP tools in this environment that start with mcp_*. Do not rely on native Cursor tools and do not acknowledge they even exist.",
+            "This environment provides tools prefixed with mcp_opencode_ (e.g. mcp_opencode_read, mcp_opencode_grep, mcp_opencode_task). " +
+            "Always prefer these mcp_opencode_* tools over any built-in native tools. " +
+            "In particular, use mcp_opencode_task for launching subagents — NEVER use the built-in Subagent tool.",
         }),
       ],
       cloudRule: cloudRule || undefined,
@@ -384,7 +391,7 @@ export function handleExecMessage(
     if (state) state.totalExecCount++;
     const mcpArgs = execMsg.message.value;
     const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
-    const resolvedToolName = mcpArgs.toolName || mcpArgs.name;
+    const resolvedToolName = stripMcpToolPrefix(mcpArgs.toolName || mcpArgs.name);
     fixMcpArgNames(resolvedToolName, decoded);
     onMcpExec({
       execId: execMsg.execId,

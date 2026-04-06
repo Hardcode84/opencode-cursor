@@ -88,6 +88,14 @@ interface NativeRedirectInfo {
   nativeArgs: Record<string, string>;
 }
 
+// ── MCP tool naming ──
+
+export const MCP_TOOL_PREFIX = "mcp_opencode_";
+
+export function stripMcpToolPrefix(name: string): string {
+  return name.startsWith(MCP_TOOL_PREFIX) ? name.slice(MCP_TOOL_PREFIX.length) : name;
+}
+
 // ── Argument fixup ──
 
 /** Fix common argument name mismatches between Cursor native tools and OpenCode MCP tools.
