@@ -7,7 +7,7 @@
  * transform that gives each text/reasoning segment a unique ID and properly
  * closes/reopens blocks on transitions.
  *
- * Loaded via `npm: "file://…/sdk-wrapper.js"` so OpenCode imports this instead
+ * Loaded via `npm: "file://.../sdk-wrapper.js"` so OpenCode imports this instead
  * of the bundled provider.
  */
 

@@ -41,7 +41,7 @@ export function createSSECtx(
     try {
       controller.enqueue(bytes);
     } catch {
-      markClosed(); // stream aborted by client — stop all further writes
+      markClosed(); // stream aborted by client -- stop all further writes
     }
   };
 
@@ -115,7 +115,7 @@ export type PumpResult =
  * Returns when the session emits batchReady (tool_calls pause) or done.
  * Also returns early with 'done' if the SSE context is already closed
  * (e.g. client disconnect). For retryable errors, returns 'retry' without
- * writing stop/DONE — the caller can create a new session and call
+ * writing stop/DONE -- the caller can create a new session and call
  * pumpSession again on the same ctx.
  */
 // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: event loop with thinking/native branching

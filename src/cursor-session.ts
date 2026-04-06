@@ -85,7 +85,7 @@ export class CursorSession implements BridgeWriter {
   private timerPhase: "thinking" | "streaming" = "thinking";
   private doneEventSent = false;
   private _flushedExecs: PendingExec[] = [];
-  /** Ordinal incremented per H2 `data` event — used to detect same-chunk checkpoint+exec. */
+  /** Ordinal incremented per H2 `data` event -- used to detect same-chunk checkpoint+exec. */
   private _chunkSeq = 0;
   private _checkpointChunkSeq = -1;
   private _batchHasCheckpoint = false;
@@ -97,7 +97,7 @@ export class CursorSession implements BridgeWriter {
   constructor(options: SessionOptions) {
     this.queue = new EventQueue<SessionEvent>({
       onOverflow: () => {
-        this.pushDone({ type: "done", error: "Event queue overflow — stream corrupted" });
+        this.pushDone({ type: "done", error: "Event queue overflow -- stream corrupted" });
         this.close();
       },
     });
@@ -308,7 +308,7 @@ export class CursorSession implements BridgeWriter {
   }
 
   private resetInactivityTimer(): void {
-    // Flushed: absolute deadline — don't restart on server traffic
+    // Flushed: absolute deadline -- don't restart on server traffic
     if (this.batchState === "flushed") {
       if (this.inactivityTimer) return;
       this.inactivityTimer = setTimeout(() => {
@@ -319,7 +319,7 @@ export class CursorSession implements BridgeWriter {
       return;
     }
     // Collecting with pending execs: non-sliding deadline so heartbeats can't prevent flush.
-    // Reuses THINKING_TIMEOUT_MS — same ceiling as the idle-before-first-token phase.
+    // Reuses THINKING_TIMEOUT_MS -- same ceiling as the idle-before-first-token phase.
     if (this.batchState === "collecting" && this.pendingExecs.length > 0) {
       if (this.inactivityTimer) return;
       const ms = this.options._testCollectingTimeoutMs ?? THINKING_TIMEOUT_MS;
@@ -397,7 +397,7 @@ export class CursorSession implements BridgeWriter {
 
   private flushBatch(): void {
     if (!this._batchHasCheckpoint) {
-      logWarn("flushing tool calls without a persisted checkpoint — recovery may fail", {
+      logWarn("flushing tool calls without a persisted checkpoint -- recovery may fail", {
         pendingExecs: this.pendingExecs.length,
         convKey: this.options.convKey,
       });

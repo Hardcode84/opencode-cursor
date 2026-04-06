@@ -646,7 +646,7 @@ function tryToolResultResume(
   convKey: string,
 ): Response | null {
   if (!active) {
-    logDebug("tool results received but no active session — falling through to fresh request", {
+    logDebug("tool results received but no active session -- falling through to fresh request", {
       bridgeKey,
       toolResultIds: toolResults.map((r) => r.toolCallId),
     });

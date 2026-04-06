@@ -18,19 +18,19 @@ const DEFAULT_CONTEXT_WINDOW = 200_000;
 const DEFAULT_MAX_TOKENS = 64_000;
 
 const MODEL_LIMITS: Record<string, { context?: number; maxTokens?: number }> = {
-  // Claude — 1M variants
+  // Claude -- 1M variants
   "claude-4-sonnet-1m": { context: 1_000_000 },
   "claude-4.5-opus": { context: 200_000, maxTokens: 128_000 },
   "claude-4.6-opus": { context: 200_000, maxTokens: 128_000 },
   "claude-4.6-opus-fast": { context: 200_000, maxTokens: 128_000 },
   "claude-4.6-opus-high": { context: 200_000, maxTokens: 128_000 },
-  // GPT — larger contexts
+  // GPT -- larger contexts
   "gpt-5.2": { context: 400_000, maxTokens: 128_000 },
   "gpt-5.2-codex": { context: 400_000, maxTokens: 128_000 },
   "gpt-5.3-codex": { context: 400_000, maxTokens: 128_000 },
   "gpt-5.4": { context: 272_000, maxTokens: 128_000 },
   "gpt-5.4-medium": { context: 272_000, maxTokens: 128_000 },
-  // Gemini — 1M+
+  // Gemini -- 1M+
   "gemini-3-pro": { context: 1_000_000 },
   "gemini-3.1-pro": { context: 1_000_000 },
   "gemini-3-flash": { context: 1_000_000 },

@@ -192,7 +192,7 @@ function handleInteractionUpdate(
       state.checkpointAfterExec = true;
     }
   } else if (updateCase === "heartbeat") {
-    // heartbeat is just a keepalive — not a batch delimiter
+    // heartbeat is just a keepalive -- not a batch delimiter
   } else if (updateCase && updateCase !== "toolCallDelta" && updateCase !== "partialToolCall") {
     logDebugFmt(
       "interactionUpdate: unhandled type=%s (pending=%d)",
@@ -266,7 +266,7 @@ function handleInteractionQuery(
     };
   } else {
     logDebugFmt(
-      "interactionQuery: unknown type %s — sending empty response for id=%d",
+      "interactionQuery: unknown type %s -- sending empty response for id=%d",
       queryCase,
       queryId,
     );

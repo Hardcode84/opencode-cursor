@@ -174,12 +174,12 @@ describe("batch flush: checkpoint + exec in same chunk", () => {
   test("stale checkpoint from streaming state does not flush a later batch", async () => {
     session = createSession();
 
-    // Checkpoint while streaming (no pending execs) — should NOT cause a later flush
+    // Checkpoint while streaming (no pending execs) -- should NOT cause a later flush
     mockH2Stream.emit("data", makeCheckpointFrame());
     const eUsage = await session.next();
     expect(eUsage.type).toBe("usage");
 
-    // Later exec in a new chunk — must NOT trigger immediate flush
+    // Later exec in a new chunk -- must NOT trigger immediate flush
     mockH2Stream.emit("data", makeExecFrame("call_stale"));
     const eToolCall = await session.next();
     expect(eToolCall.type).toBe("toolCall");
@@ -220,7 +220,7 @@ describe("batch flush: collecting timer vs heartbeats", () => {
     await Bun.sleep(20);
     mockH2Stream.emit("data", makeHeartbeatFrame());
 
-    // Non-sliding timer still fires — batchReady arrives
+    // Non-sliding timer still fires -- batchReady arrives
     const e2 = await session.next();
     expect(e2.type).toBe("batchReady");
   }, 5000);
@@ -262,7 +262,7 @@ describe("batch flush: no double batchReady while flushed", () => {
     const types = [e1.type, e2.type].sort();
     expect(types).toEqual(["toolCall", "usage"]);
 
-    // flushedExecs still from first batch — not overwritten by a second flush
+    // flushedExecs still from first batch -- not overwritten by a second flush
     expect(session.flushedExecs[0]!.toolCallId).toBe("call_a");
   });
 });
@@ -298,7 +298,7 @@ describe("batch flush: requestContextArgs does not premature-flush", () => {
     const e1 = await session.next();
     expect(e1.type).toBe("toolCall");
 
-    // requestContextArgs arrives while 1 exec pending — should NOT flush
+    // requestContextArgs arrives while 1 exec pending -- should NOT flush
     mockH2Stream.emit("data", makeRequestContextArgsFrame());
 
     // Send another MCP exec
@@ -306,7 +306,7 @@ describe("batch flush: requestContextArgs does not premature-flush", () => {
     const e2 = await session.next();
     expect(e2.type).toBe("toolCall");
 
-    // Now checkpoint arrives — should flush both execs together
+    // Now checkpoint arrives -- should flush both execs together
     mockH2Stream.emit("data", makeCheckpointFrame());
     const { found, events } = await drainUntil(session, "batchReady");
     expect(found).toBe(true);

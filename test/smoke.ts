@@ -388,7 +388,7 @@ async function testArrayContentParsing(modules: TestModules) {
   if (res.status === 400) {
     const body = await res.json();
     if (body.error?.message?.includes("No user message")) {
-      throw new Error("Array content not normalized — plan mode messages lost");
+      throw new Error("Array content not normalized -- plan mode messages lost");
     }
   }
 

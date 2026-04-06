@@ -67,7 +67,7 @@ export const CursorAuthPlugin: Plugin = async (input: PluginInput): Promise<Hook
         const discovery = await getCursorModels(accessToken);
         if (discovery.usedFallback) {
           logWarn(
-            "Model discovery failed — using hardcoded fallback list. " +
+            "Model discovery failed -- using hardcoded fallback list. " +
               "Some models may be missing or outdated.",
           );
         }
