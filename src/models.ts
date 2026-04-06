@@ -5,7 +5,7 @@
  */
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { z } from "zod";
-import { callCursorUnaryRpc } from "./proxy";
+import { callCursorUnaryRpc } from "./cursor-session";
 import {
   GetUsableModelsRequestSchema,
   GetUsableModelsResponseSchema,

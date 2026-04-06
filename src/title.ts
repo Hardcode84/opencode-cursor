@@ -1,7 +1,7 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { NameAgentRequestSchema, NameAgentResponseSchema } from "./proto/agent_pb";
 import { logInfo } from "./logger";
-import { callCursorUnaryRpc } from "./proxy";
+import { callCursorUnaryRpc } from "./cursor-session";
 
 const TITLE_REQUEST_MARKER = "Generate a title for this conversation:";
 

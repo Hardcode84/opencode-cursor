@@ -16,7 +16,7 @@ import {
 } from "./auth";
 import { getCursorModels, type CursorModel } from "./models";
 import { configureLogger } from "./logger";
-import { startProxy } from "./proxy";
+import { startProxy } from "./server";
 
 const SDK_WRAPPER_PATH = `file://${resolve(dirname(fileURLToPath(import.meta.url)), "opencode-cursor-sdk.js")}`;
 

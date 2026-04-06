@@ -3,7 +3,7 @@
 ## Overview
 
 ```
-┌──────────┐   OpenAI HTTP/SSE    ┌───────────┐   HTTP/2 Connect+Protobuf   ┌──────────────┐
+┌──────────┐   OpenAI HTTP/SSE    ┌───────────┐   HTTP/2 Connect+Protobuf  ┌──────────────┐
 │ OpenCode │ ◄──────────────────► │   proxy   │ ◄────────────────────────► │ Cursor Server│
 │ (client) │   localhost:4011     │           │   api2direct.cursor.sh     │  (agent.v1)  │
 └──────────┘                      └───────────┘                            └──────────────┘
@@ -116,7 +116,7 @@ starts with no knowledge that a boundary was already crossed.
 │  H2 stream ──► message handler (installed ONCE)          │
 │                    │                                     │
 │                    ├─ KV, exec responses,  ──► respond   │
-│                    │  interactionQuery        immediately │
+│                    │  interactionQuery        immediately│
 │                    │                                     │
 │                    └─ text, toolCall,      ──► event     │
 │                       batchReady, done        queue      │
@@ -165,8 +165,8 @@ are handled inline by the session — they never reach the event queue.
 
 ```
 STREAMING ───[mcpArgs]──► COLLECTING ───[boundary]──► FLUSHED
-    ▲                      ↑ [more mcpArgs]               │
-    │                                                     │
+    ▲                      ↑ [more mcpArgs]                │
+    │                                                      │
     └──────────────────[sendToolResults()]─────────────────┘
 ```
 
@@ -248,15 +248,15 @@ OpenCode                    Proxy                         Cursor
   │                           │ ────────────────────────────>│
   │                           │                              │
   │                           │    textDelta                 │
-  │                           │<────────────────────────────│
+  │                           │<─────────────────────────────│
   │ SSE: content              │                              │
   │<──────────────────────────│                              │
   │                           │    ...more deltas...         │
-  │                           │<────────────────────────────│
+  │                           │<─────────────────────────────│
   │ SSE: content              │                              │
   │<──────────────────────────│                              │
   │                           │    endStream                 │
-  │                           │<────────────────────────────│
+  │                           │<─────────────────────────────│
   │ SSE: finish_reason="stop" │                              │
   │ SSE: [DONE]               │                              │
   │<──────────────────────────│                              │
@@ -274,38 +274,38 @@ OpenCode                    Proxy (CursorSession)         Cursor
   │                           │ ────────────────────────────>│
   │                           │                              │
   │                           │    requestContextArgs        │
-  │                           │<────────────────────────────│
+  │                           │<─────────────────────────────│
   │                           │ H2: requestContextResult     │  ◄─ handled inline
   │                           │ ────────────────────────────>│     by session
   │                           │                              │
   │                           │    textDelta                 │
-  │                           │<────────────────────────────│
+  │                           │<─────────────────────────────│
   │                           │  → queue: text event         │
-  │ SSE: content              │  ← SSE writer reads it      │
+  │ SSE: content              │  ← SSE writer reads it       │
   │<──────────────────────────│                              │
   │                           │                              │
   │                           │    mcpArgs (tool A)          │
-  │                           │<────────────────────────────│
+  │                           │<─────────────────────────────│
   │                           │  state: COLLECTING           │
   │                           │  → queue: toolCall event     │
-  │ SSE: tool_calls[0]        │  ← SSE writer reads it      │
+  │ SSE: tool_calls[0]        │  ← SSE writer reads it       │
   │<──────────────────────────│                              │
   │                           │    mcpArgs (tool B)          │
-  │                           │<────────────────────────────│
+  │                           │<─────────────────────────────│
   │                           │  → queue: toolCall event     │
-  │ SSE: tool_calls[1]        │  ← SSE writer reads it      │
+  │ SSE: tool_calls[1]        │  ← SSE writer reads it       │
   │<──────────────────────────│                              │
   │                           │                              │
   │                           │    checkpoint                │
-  │                           │<────────────────────────────│
+  │                           │<─────────────────────────────│
   │                           │  state: → FLUSHED            │
   │                           │  → queue: batchReady event   │
-  │ SSE: finish=tool_calls    │  ← SSE writer reads it      │
+  │ SSE: finish=tool_calls    │  ← SSE writer reads it       │
   │ SSE: [DONE]               │    and closes                │
   │<──────────────────────────│                              │
   │                           │                              │
   │                           │    stepCompleted             │  ◄─ FLUSHED state:
-  │                           │<────────────────────────────│     ignored, no event
+  │                           │<─────────────────────────────│     ignored, no event
   │                           │                              │
   │  [execute tools A, B]     │  [session alive, no reader]  │
   │                           │                              │
@@ -321,9 +321,9 @@ OpenCode                    Proxy (CursorSession)         Cursor
   │                           │  [new SSE writer subscribes] │
   │                           │                              │
   │                           │    textDelta                 │
-  │                           │<────────────────────────────│
+  │                           │<─────────────────────────────│
   │                           │  → queue: text event         │
-  │ SSE: content              │  ← SSE writer reads it      │
+  │ SSE: content              │  ← SSE writer reads it       │
   │<──────────────────────────│                              │
   │                           │    ...continues...           │
 ```
@@ -355,7 +355,7 @@ OpenCode                    Proxy (CursorSession)         Cursor
   Tool results arrive ───>│                                  │
   sendToolResults()       │  state: → STREAMING              │
   new SSE writer          │  H2: mcpResult A+B               │
-                          │  ──────────────────────────────>│
+                          │  ───────────────────────────────>│
                           │                                  │
   SSE writer calls next() │                                  │
   reads toolCall(C) ──────│ ◄── from buffer!                 │
