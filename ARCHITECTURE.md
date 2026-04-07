@@ -231,7 +231,7 @@ Phases:
 
 On thinking/streaming timeout:
   if COLLECTING with pending execs → force batchReady (safety net)
-  elif has checkpoint → auto-resume (up to 5 attempts)
+  elif has checkpoint → auto-resume (timeout: up to 5 attempts; resource_exhausted: up to 10 attempts with exponential backoff)
   else → emit done with error
 
 On FLUSHED timeout:

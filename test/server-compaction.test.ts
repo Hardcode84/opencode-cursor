@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { type StoredConversation, turnsFingerprint } from "../src/conversation-state";
 import type { OpenAIMessage } from "../src/openai-messages";
-import { deriveConversationKey, prepareStoredConversationForRequest } from "../src/server";
+import {
+  autoResumeAttemptLimit,
+  deriveConversationKey,
+  prepareStoredConversationForRequest,
+  resourceExhaustedBackoffDelayMs,
+} from "../src/server";
 
 function createStoredConversation(): StoredConversation {
   return {
@@ -140,5 +145,29 @@ describe("prepareStoredConversationForRequest", () => {
     expect(result.didReset).toBe(false);
     expect(result.checkpoint).toBe(currentCheckpoint);
     expect(stored.checkpointHistory.get(fp)).toBe(currentCheckpoint);
+  });
+});
+
+describe("resourceExhaustedBackoffDelayMs", () => {
+  test("grows exponentially and caps at the configured maximum", () => {
+    const runtimeConfig = {
+      resourceExhaustedRetryDelayMs: 250,
+      resourceExhaustedRetryMaxDelayMs: 1_000,
+    };
+
+    expect(resourceExhaustedBackoffDelayMs(0, runtimeConfig)).toBe(0);
+    expect(resourceExhaustedBackoffDelayMs(1, runtimeConfig)).toBe(250);
+    expect(resourceExhaustedBackoffDelayMs(2, runtimeConfig)).toBe(500);
+    expect(resourceExhaustedBackoffDelayMs(3, runtimeConfig)).toBe(1_000);
+    expect(resourceExhaustedBackoffDelayMs(4, runtimeConfig)).toBe(1_000);
+  });
+});
+
+describe("autoResumeAttemptLimit", () => {
+  test("keeps timeout retries at 5 and resource_exhausted retries at 10", () => {
+    expect(autoResumeAttemptLimit("timeout")).toBe(5);
+    expect(autoResumeAttemptLimit("resource_exhausted")).toBe(10);
+    expect(autoResumeAttemptLimit("blob_not_found")).toBe(0);
+    expect(autoResumeAttemptLimit(undefined)).toBe(0);
   });
 });

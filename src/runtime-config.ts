@@ -11,6 +11,8 @@ export interface CursorRuntimeConfig {
   thinkingTimeoutMs: number;
   streamingTimeoutMs: number;
   collectingTimeoutMs: number;
+  resourceExhaustedRetryDelayMs: number;
+  resourceExhaustedRetryMaxDelayMs: number;
   activeSessionTtlMs: number;
   flushedSessionMaxLifetimeMs: number;
   conversationTtlMs: number;
@@ -40,6 +42,8 @@ export function resolveRuntimeConfig(
     thinkingTimeoutMs: 30_000,
     streamingTimeoutMs: 15_000,
     collectingTimeoutMs: 30_000,
+    resourceExhaustedRetryDelayMs: 500,
+    resourceExhaustedRetryMaxDelayMs: 4_000,
     activeSessionTtlMs: 5 * 60 * 1000,
     flushedSessionMaxLifetimeMs: 60 * 60 * 1000,
     conversationTtlMs: 30 * 60 * 1000,

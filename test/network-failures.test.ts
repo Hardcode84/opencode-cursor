@@ -104,11 +104,16 @@ describe("network failures and timeout integration", () => {
 
   test("resource_exhausted endStream triggers transparent auto-resume", async () => {
     backend = await FakeCursorBackend.start();
+    const retryDelayMs = 60;
+    let firstFailureAt = 0;
+    let secondRunStartedAt = 0;
     backend.enqueueRun(async (connection) => {
       await connection.waitForRunRequest();
+      firstFailureAt = performance.now();
       connection.sendEndStreamError("resource_exhausted", "step boundary exceeded");
     });
     backend.enqueueRun(async (connection) => {
+      secondRunStartedAt = performance.now();
       await connection.waitForRunRequest();
       connection.sendTextDelta("Recovered after resource exhausted");
       connection.sendEndStreamOk();
@@ -121,6 +126,7 @@ describe("network failures and timeout integration", () => {
         thinkingTimeoutMs: 100,
         streamingTimeoutMs: 100,
         collectingTimeoutMs: 100,
+        resourceExhaustedRetryDelayMs: retryDelayMs,
       },
     });
 
@@ -130,6 +136,45 @@ describe("network failures and timeout integration", () => {
     expect(backend.runCount).toBe(2);
     expect(body).not.toContain("Auto-resuming");
     expect(body).toContain("Recovered after resource exhausted");
+    expect(secondRunStartedAt).toBeGreaterThan(0);
+    expect(secondRunStartedAt - firstFailureAt).toBeGreaterThanOrEqual(retryDelayMs - 10);
+  }, 10_000);
+
+  test("resource_exhausted allows up to 10 resume attempts before succeeding", async () => {
+    backend = await FakeCursorBackend.start();
+    for (let attempt = 0; attempt < 10; attempt++) {
+      backend.enqueueRun(async (connection) => {
+        await connection.waitForRunRequest();
+        connection.sendEndStreamError(
+          "resource_exhausted",
+          `step boundary exceeded ${attempt + 1}`,
+        );
+      });
+    }
+    backend.enqueueRun(async (connection) => {
+      await connection.waitForRunRequest();
+      connection.sendTextDelta("Recovered after tenth retry.");
+      connection.sendEndStreamOk();
+    });
+
+    proxy = await startProxyHarness({
+      runtimeConfig: {
+        apiUrl: backend.apiUrl,
+        agentUrl: backend.agentUrl,
+        thinkingTimeoutMs: 100,
+        streamingTimeoutMs: 100,
+        collectingTimeoutMs: 100,
+        resourceExhaustedRetryDelayMs: 1,
+        resourceExhaustedRetryMaxDelayMs: 2,
+      },
+    });
+
+    const response = await postStream();
+    const body = await response.text();
+
+    expect(backend.runCount).toBe(11);
+    expect(body).not.toContain("Auto-resuming");
+    expect(body).toContain("Recovered after tenth retry.");
   }, 10_000);
 
   test("blob_not_found retries rebuild from turns and then fully invalidates state", async () => {

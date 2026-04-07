@@ -10,6 +10,7 @@ import {
   type Turn,
   turnsFingerprint,
 } from "./conversation-state";
+import type { RetryHint } from "./cursor-session";
 import { CursorSession } from "./cursor-session";
 import { errorDetails, logDebug, logError, logInfo, logWarn } from "./logger";
 import { MCP_TOOL_PREFIX } from "./native-tools";
@@ -50,7 +51,8 @@ import { type CursorRuntimeConfig, resolveRuntimeConfig } from "./runtime-config
 import { buildTitleSourceText, detectTitleRequest, handleTitleGenerationRequest } from "./title";
 
 const MAX_BLOB_RETRIES = 2;
-const MAX_AUTO_RESUMES = 5;
+const MAX_TIMEOUT_AUTO_RESUMES = 5;
+const MAX_RESOURCE_EXHAUSTED_AUTO_RESUMES = 10;
 const CHECKPOINT_HISTORY_LIMIT = 30;
 const CHECKPOINT_ARCHIVE_LIMIT = 60;
 
@@ -658,6 +660,42 @@ function buildAutoResumePayload(options: {
   return payload;
 }
 
+export function resourceExhaustedBackoffDelayMs(
+  attempt: number,
+  runtimeConfig: Pick<
+    CursorRuntimeConfig,
+    "resourceExhaustedRetryDelayMs" | "resourceExhaustedRetryMaxDelayMs"
+  >,
+): number {
+  if (attempt <= 0) return 0;
+  const baseDelay = Math.max(0, Math.trunc(runtimeConfig.resourceExhaustedRetryDelayMs));
+  if (baseDelay === 0) return 0;
+  const maxDelay = Math.max(baseDelay, Math.trunc(runtimeConfig.resourceExhaustedRetryMaxDelayMs));
+  return Math.min(baseDelay * 2 ** (attempt - 1), maxDelay);
+}
+
+function retryDelayMsForHint(
+  runtimeConfig: CursorRuntimeConfig,
+  result: PumpResult,
+  attempt: number,
+): number {
+  if (result.outcome !== "retry") return 0;
+  return result.retryHint === "resource_exhausted"
+    ? resourceExhaustedBackoffDelayMs(attempt, runtimeConfig)
+    : 0;
+}
+
+export function autoResumeAttemptLimit(retryHint: RetryHint | undefined): number {
+  if (retryHint === "resource_exhausted") return MAX_RESOURCE_EXHAUSTED_AUTO_RESUMES;
+  if (retryHint === "timeout") return MAX_TIMEOUT_AUTO_RESUMES;
+  return 0;
+}
+
+async function sleepMs(ms: number): Promise<void> {
+  if (ms <= 0) return;
+  await new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Pump a session with auto-resume on timeout/resource_exhausted.
  * Returns the final PumpResult. On batchReady, stores the session.
@@ -695,25 +733,33 @@ async function pumpWithAutoResume(
     const accessToken = currentSession.accessToken;
     const cloudRule = currentSession.cloudRule;
     currentSession.close();
+    const maxAutoResumes = autoResumeAttemptLimit(result.retryHint);
 
     if (
       (result.retryHint === "timeout" || result.retryHint === "resource_exhausted") &&
-      resumeCount < MAX_AUTO_RESUMES
+      resumeCount < maxAutoResumes
     ) {
       resumeCount++;
       const isStepBoundary = result.retryHint === "resource_exhausted";
+      const retryDelayMs = retryDelayMsForHint(currentSession.runtimeConfig, result, resumeCount);
       if (isStepBoundary) {
-        logDebug("step-boundary resume", { attempt: resumeCount });
+        logDebug("step-boundary resume", {
+          attempt: resumeCount,
+          max: maxAutoResumes,
+          delayMs: retryDelayMs,
+        });
       } else {
         logWarn("auto-resume", {
           hint: result.retryHint,
           attempt: resumeCount,
-          max: MAX_AUTO_RESUMES,
+          max: maxAutoResumes,
         });
         ctx.sendChunk({
-          content: `\n[Auto-resuming (attempt ${resumeCount}/${MAX_AUTO_RESUMES})...]\n`,
+          content: `\n[Auto-resuming (attempt ${resumeCount}/${maxAutoResumes})...]\n`,
         });
       }
+      await sleepMs(retryDelayMs);
+      if (ctx.closed) return { outcome: "done" };
 
       const stored = getConversationState(convKey, currentSession.runtimeConfig);
       const payload = buildAutoResumePayload({

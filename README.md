@@ -61,8 +61,9 @@ OpenAI-compatible proxy on demand and routes requests through Cursor's gRPC API.
   to `~/.local/share/opencode/cursor-conversations/`, surviving proxy restarts.
 - **Undo / revisit** — content-addressed checkpoint history (up to 30 entries)
   restores prior conversation state when the turn fingerprint matches.
-- **Auto-resume** — on timeout or `resource_exhausted`, the proxy rebuilds the
-  request from the last checkpoint (up to 5 attempts).
+- **Auto-resume** — timeout failures retry up to 5 times; `resource_exhausted`
+  retries up to 10 times with exponential backoff before rebuilding from the
+  last checkpoint.
 - **AI SDK stream fix** — `sdk-wrapper.ts` works around a bug in
   `@ai-sdk/openai-compatible` where hardcoded block IDs break reasoning/text
   interleaving. See [docs/ai-sdk-stream-interleaving-bug.md](docs/ai-sdk-stream-interleaving-bug.md).
@@ -107,8 +108,9 @@ OpenCode  -->  /v1/chat/completions  -->  Bun.serve (proxy)
   together.
 - **Disk-backed state** — conversation checkpoints and blob stores persist to
   disk, surviving proxy restarts and enabling undo/revisit.
-- **Auto-resume** — on timeout or `resource_exhausted`, the proxy automatically
-  rebuilds the request from the last checkpoint (up to 5 attempts).
+- **Auto-resume** — timeout failures retry up to 5 times; `resource_exhausted`
+  retries up to 10 times with exponential backoff before rebuilding from the
+  last checkpoint.
 
 ## Develop locally
 
