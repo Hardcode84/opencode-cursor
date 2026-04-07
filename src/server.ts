@@ -6,6 +6,8 @@ import {
   invalidateConversationState,
   persistConversation,
   resolveConversationState,
+  type StoredConversation,
+  type Turn,
   turnsFingerprint,
 } from "./conversation-state";
 import { CursorSession } from "./cursor-session";
@@ -50,6 +52,8 @@ const MAX_BLOB_RETRIES = 2;
 const MAX_AUTO_RESUMES = 5;
 const SESSION_TTL_MS = 5 * 60 * 1000;
 const FLUSHED_MAX_LIFETIME_MS = 60 * 60 * 1000;
+const CHECKPOINT_HISTORY_LIMIT = 30;
+const CHECKPOINT_ARCHIVE_LIMIT = 60;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -173,7 +177,8 @@ export async function startProxy(
           const accessToken = await proxyAccessTokenProvider();
           const sessionId = req.headers.get("x-session-affinity") ?? undefined;
           const parentSessionId = req.headers.get("x-parent-session-id") ?? undefined;
-          return handleChatCompletion(body, accessToken, sessionId, parentSessionId);
+          const opencodeAgent = req.headers.get("x-opencode-agent") ?? undefined;
+          return handleChatCompletion(body, accessToken, sessionId, parentSessionId, opencodeAgent);
         } catch (err) {
           logError("chat completion failed", errorDetails(err));
           const message = err instanceof Error ? err.message : String(err);
@@ -253,11 +258,29 @@ function deriveBridgeKey(
     .slice(0, 16);
 }
 
-function deriveConversationKey(
+/**
+ * Derive a stable conversation key for checkpoint storage.
+ *
+ * When session headers are present (OpenCode sets `x-session-affinity`), the
+ * key is based solely on session/parent IDs — intentionally ignoring message
+ * content so that compaction agents (which rewrite the system prompt) share
+ * the same stored conversation as the original session.
+ *
+ * Without session headers (anonymous / legacy), the key incorporates the
+ * system prompt text so different instructions get separate conversations.
+ */
+export function deriveConversationKey(
   messages: OpenAIMessage[],
   sessionId?: string,
   parentSessionId?: string,
 ): string {
+  if (sessionId || parentSessionId) {
+    return createHash("sha256")
+      .update(`conv:${sessionId ?? ""}:${parentSessionId ?? ""}`)
+      .digest("hex")
+      .slice(0, 16);
+  }
+
   const systemParts = messages
     .filter((m) => m.role === "system")
     .map((m) => textContent(m.content));
@@ -266,6 +289,83 @@ function deriveConversationKey(
     .update(`conv:${sessionId ?? ""}:${parentSessionId ?? ""}:${systemText.slice(0, 2000)}`)
     .digest("hex")
     .slice(0, 16);
+}
+
+const OPENCODE_AGENT_COMPACTION = "compaction";
+
+export function shouldBypassStoredCheckpoint(opencodeAgent?: string): boolean {
+  return opencodeAgent === OPENCODE_AGENT_COMPACTION;
+}
+
+interface PreparedConversationState {
+  checkpoint: Uint8Array | null;
+  didReset: boolean;
+}
+
+function rememberCheckpoint(
+  map: Map<string, Uint8Array>,
+  fingerprint: string,
+  checkpoint: Uint8Array,
+  limit: number,
+): void {
+  if (!fingerprint) return;
+  map.delete(fingerprint);
+  map.set(fingerprint, checkpoint);
+  while (map.size > limit) {
+    const oldest = map.keys().next().value;
+    if (!oldest) break;
+    map.delete(oldest);
+  }
+}
+
+function archiveCheckpointLineage(stored: StoredConversation, fingerprint: string): boolean {
+  for (const [fp, cp] of stored.checkpointHistory) {
+    rememberCheckpoint(stored.checkpointArchive, fp, cp, CHECKPOINT_ARCHIVE_LIMIT);
+  }
+  if (stored.checkpoint) {
+    const key = fingerprint || "__current__";
+    rememberCheckpoint(stored.checkpointArchive, key, stored.checkpoint, CHECKPOINT_ARCHIVE_LIMIT);
+  }
+
+  const didReset = stored.checkpoint !== null || stored.checkpointHistory.size > 0;
+  stored.checkpoint = null;
+  stored.checkpointHistory.clear();
+  return didReset;
+}
+
+export function prepareStoredConversationForRequest(
+  stored: StoredConversation,
+  turns: Turn[],
+  opencodeAgent?: string,
+): PreparedConversationState {
+  const fp = turnsFingerprint(turns);
+
+  if (shouldBypassStoredCheckpoint(opencodeAgent)) {
+    const didReset = archiveCheckpointLineage(stored, fp);
+    return { checkpoint: null, didReset };
+  }
+
+  const historicCheckpoint = stored.checkpointHistory.get(fp);
+  if (historicCheckpoint) {
+    logDebug(`checkpoint-history hit for fp=${fp}`);
+    stored.checkpoint = historicCheckpoint;
+    return { checkpoint: historicCheckpoint, didReset: false };
+  }
+
+  if (fp) {
+    const archivedCheckpoint = stored.checkpointArchive.get(fp);
+    if (archivedCheckpoint) {
+      logDebug(`checkpoint-archive hit for fp=${fp}`);
+      stored.checkpoint = archivedCheckpoint;
+      return { checkpoint: archivedCheckpoint, didReset: false };
+    }
+  }
+
+  if (stored.checkpoint && fp) {
+    rememberCheckpoint(stored.checkpointHistory, fp, stored.checkpoint, CHECKPOINT_HISTORY_LIMIT);
+  }
+
+  return { checkpoint: stored.checkpoint, didReset: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +545,7 @@ async function pumpWithAutoResume(
   modelId: string,
   bridgeKey: string,
   convKey: string,
+  rebuildRequest?: () => CursorRequestPayload,
 ): Promise<PumpResult> {
   let resumeCount = 0;
   let currentSession = session;
@@ -468,6 +569,7 @@ async function pumpWithAutoResume(
 
     const mcpTools = currentSession.mcpTools;
     const accessToken = currentSession.accessToken;
+    const cloudRule = currentSession.cloudRule;
     currentSession.close();
 
     if (
@@ -488,20 +590,33 @@ async function pumpWithAutoResume(
           content: `\n[Auto-resuming (attempt ${resumeCount}/${MAX_AUTO_RESUMES})...]\n`,
         });
       }
+
       const stored = getConversationState(convKey);
+      let payload: CursorRequestPayload | null = null;
+
       if (stored?.checkpoint) {
-        const payload = buildResumeRequest(
+        payload = buildResumeRequest(
           modelId,
           stored.conversationId,
           stored.checkpoint,
           stored.blobStore,
           mcpTools,
         );
+      } else if (rebuildRequest) {
+        logDebug("no checkpoint for resume, rebuilding original request", {
+          attempt: resumeCount,
+        });
+        payload = rebuildRequest();
+        payload.mcpTools = mcpTools;
+      }
+
+      if (payload) {
         currentSession = new CursorSession({
           accessToken,
           requestBytes: payload.requestBytes,
           blobStore: payload.blobStore,
           mcpTools: payload.mcpTools,
+          cloudRule,
           convKey,
           onCheckpoint: makeCheckpointCallback(convKey),
         });
@@ -532,6 +647,7 @@ function handleChatCompletion(
   accessToken: string,
   sessionId?: string,
   parentSessionId?: string,
+  opencodeAgent?: string,
 ): Response | Promise<Response> {
   if (detectTitleRequest(body)) {
     const sourceText = buildTitleSourceText(body.messages);
@@ -583,17 +699,14 @@ function handleChatCompletion(
 
   const stored = resolveConversationState(convKey);
 
-  const fp = turnsFingerprint(turns);
-  const historicCheckpoint = stored.checkpointHistory.get(fp);
-  if (historicCheckpoint) {
-    logDebug(`checkpoint-history hit for fp=${fp}`);
-    stored.checkpoint = historicCheckpoint;
-  } else if (stored.checkpoint && fp) {
-    stored.checkpointHistory.set(fp, stored.checkpoint);
-    if (stored.checkpointHistory.size > 30) {
-      const oldest = stored.checkpointHistory.keys().next().value!;
-      stored.checkpointHistory.delete(oldest);
-    }
+  const preparedConversation = prepareStoredConversationForRequest(stored, turns, opencodeAgent);
+  if (preparedConversation.didReset) {
+    logInfo("resetting stored conversation for compaction request", {
+      convKey,
+      sessionId,
+      parentSessionId,
+    });
+    persistConversation(convKey, stored);
   }
 
   const mcpTools = buildMcpToolDefinitions(tools);
@@ -606,7 +719,7 @@ function handleChatCompletion(
     effectiveUserText,
     turns,
     stored.conversationId,
-    stored.checkpoint,
+    preparedConversation.checkpoint,
     stored.blobStore,
   );
   payload.mcpTools = mcpTools;
@@ -616,7 +729,7 @@ function handleChatCompletion(
     stream: body.stream !== false,
     tools: tools.length,
     userTextLen: effectiveUserText.length,
-    hasCheckpoint: !!stored.checkpoint,
+    hasCheckpoint: !!preparedConversation.checkpoint,
     messages: body.messages.length,
     turns: turns.length,
     blobs: stored.blobStore.size,
@@ -748,7 +861,26 @@ async function runStreamingPump(opts: StreamingPumpOpts): Promise<void> {
     });
     onSession(session);
 
-    const result = await pumpWithAutoResume(ctx, session, modelId, bridgeKey, convKey);
+    const rebuildRequest = () => {
+      const stored = resolveConversationState(convKey);
+      return buildCursorRequest(
+        modelId,
+        systemPrompt ?? "",
+        effectiveUserText ?? "",
+        turns ?? [],
+        stored.conversationId,
+        stored.checkpoint,
+        stored.blobStore,
+      );
+    };
+    const result = await pumpWithAutoResume(
+      ctx,
+      session,
+      modelId,
+      bridgeKey,
+      convKey,
+      rebuildRequest,
+    );
 
     if (result.outcome !== "retry") break;
 

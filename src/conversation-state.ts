@@ -10,6 +10,7 @@ export interface StoredConversation {
   blobStore: Map<string, Uint8Array>;
   lastAccessMs: number;
   checkpointHistory: Map<string, Uint8Array>;
+  checkpointArchive: Map<string, Uint8Array>;
 }
 
 const conversationStates = new Map<string, StoredConversation>();
@@ -52,19 +53,27 @@ interface SerializedConversation {
   blobStore: Record<string, string>; // hex key → base64 value
   savedMs: number;
   checkpointHistory?: Record<string, string>; // fingerprint → base64 checkpoint
+  checkpointArchive?: Record<string, string>; // archived fingerprint → base64 checkpoint
+}
+
+function serializeByteMap(map: Map<string, Uint8Array>): Record<string, string> {
+  return Object.fromEntries([...map].map(([k, v]) => [k, Buffer.from(v).toString("base64")]));
+}
+
+function deserializeByteMap(obj: Record<string, string> | undefined): Map<string, Uint8Array> {
+  return new Map(
+    Object.entries(obj ?? {}).map(([k, v]) => [k, new Uint8Array(Buffer.from(v, "base64"))]),
+  );
 }
 
 export function persistConversation(convKey: string, stored: StoredConversation): void {
   const data: SerializedConversation = {
     conversationId: stored.conversationId,
     checkpoint: stored.checkpoint ? Buffer.from(stored.checkpoint).toString("base64") : null,
-    blobStore: Object.fromEntries(
-      [...stored.blobStore].map(([k, v]) => [k, Buffer.from(v).toString("base64")]),
-    ),
+    blobStore: serializeByteMap(stored.blobStore),
     savedMs: Date.now(),
-    checkpointHistory: Object.fromEntries(
-      [...stored.checkpointHistory].map(([fp, cp]) => [fp, Buffer.from(cp).toString("base64")]),
-    ),
+    checkpointHistory: serializeByteMap(stored.checkpointHistory),
+    checkpointArchive: serializeByteMap(stored.checkpointArchive),
   };
   try {
     writeFileSync(convDiskPath(convKey), JSON.stringify(data));
@@ -85,19 +94,10 @@ function loadConversation(convKey: string): StoredConversation | null {
     return {
       conversationId: raw.conversationId,
       checkpoint: raw.checkpoint ? new Uint8Array(Buffer.from(raw.checkpoint, "base64")) : null,
-      blobStore: new Map(
-        Object.entries(raw.blobStore).map(([k, v]) => [
-          k,
-          new Uint8Array(Buffer.from(v, "base64")),
-        ]),
-      ),
+      blobStore: deserializeByteMap(raw.blobStore),
       lastAccessMs: Date.now(),
-      checkpointHistory: new Map(
-        Object.entries(raw.checkpointHistory ?? {}).map(([fp, cp]) => [
-          fp,
-          new Uint8Array(Buffer.from(cp, "base64")),
-        ]),
-      ),
+      checkpointHistory: deserializeByteMap(raw.checkpointHistory),
+      checkpointArchive: deserializeByteMap(raw.checkpointArchive),
     };
   } catch (err) {
     logDebug("Failed to load conversation from disk", { convKey, error: String(err) });
@@ -140,6 +140,7 @@ export function resolveConversationState(convKey: string): StoredConversation {
       blobStore: new Map(),
       lastAccessMs: Date.now(),
       checkpointHistory: new Map(),
+      checkpointArchive: new Map(),
     };
     conversationStates.set(convKey, stored);
   }

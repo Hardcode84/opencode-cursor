@@ -187,6 +187,10 @@ export class CursorSession implements BridgeWriter {
     return this.options.mcpTools;
   }
 
+  get cloudRule(): string | undefined {
+    return this.options.cloudRule;
+  }
+
   get outputTokens(): number {
     return this.streamState.outputTokens;
   }
