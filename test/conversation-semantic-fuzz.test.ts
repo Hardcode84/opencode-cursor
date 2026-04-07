@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { isDeepStrictEqual } from "node:util";
 import {
   createSemanticFuzzTools,
   executeSemanticFuzzScenario,
@@ -9,6 +10,7 @@ import {
   summarizeSemanticTurns,
   validateSemanticFuzzResponse,
 } from "./support/conversation-semantic-fuzz";
+import { readEchoToolText } from "./support/conversation-test-helpers";
 import {
   type FakeCommunicationPoint,
   FakeCursorBackend,
@@ -32,24 +34,34 @@ interface SemanticFuzzRunResult {
 }
 
 const DEFAULT_SEMANTIC_FUZZ_COUNT = 5;
+const MAX_SEMANTIC_FUZZ_COUNT = 100;
 const DEFAULT_SEMANTIC_FUZZ_FAILURE_POINT_COUNT = 8;
-const SEMANTIC_FUZZ_SEEDS = resolveSemanticFuzzSeeds(process.env.SEMANTIC_FUZZ_COUNT);
-const SEMANTIC_FUZZ_FAILURE_POINT_COUNT = resolveSemanticFuzzFailurePointCount(
+const MAX_SEMANTIC_FUZZ_FAILURE_POINT_COUNT = 64;
+const SEMANTIC_FUZZ_CONFIG = resolveSemanticFuzzConfig(
+  process.env.SEMANTIC_FUZZ_COUNT,
   process.env.SEMANTIC_FUZZ_FAILURE_POINT_COUNT,
+);
+const SEMANTIC_FUZZ_TIMEOUT_MS = Math.max(
+  180_000,
+  30_000 + SEMANTIC_FUZZ_CONFIG.seeds.length * (SEMANTIC_FUZZ_CONFIG.failurePointCount + 1) * 3_000,
 );
 
 describe("conversation semantic fuzz", () => {
-  test("matches the golden conversation across seeded semantic failure replays", async () => {
-    const failures: string[] = [];
+  test(
+    "matches the golden conversation across seeded semantic failure replays",
+    async () => {
+      const failures: string[] = [];
 
-    for (const seed of SEMANTIC_FUZZ_SEEDS) {
-      failures.push(...(await evaluateSemanticSeed(seed)));
-    }
+      for (const seed of SEMANTIC_FUZZ_CONFIG.seeds) {
+        failures.push(...(await evaluateSemanticSeed(seed)));
+      }
 
-    if (failures.length > 0) {
-      throw new Error(failures.join("\n"));
-    }
-  }, 180_000);
+      if (failures.length > 0) {
+        throw new Error(failures.join("\n"));
+      }
+    },
+    SEMANTIC_FUZZ_TIMEOUT_MS,
+  );
 });
 
 async function evaluateSemanticSeed(seed: number): Promise<string[]> {
@@ -62,7 +74,7 @@ async function evaluateSemanticSeed(seed: number): Promise<string[]> {
   const sampledPoints = sampleSemanticFailurePoints(
     golden.points,
     seed,
-    SEMANTIC_FUZZ_FAILURE_POINT_COUNT,
+    SEMANTIC_FUZZ_CONFIG.failurePointCount,
   );
   expect(sampledPoints.length).toBeGreaterThan(0);
 
@@ -108,8 +120,7 @@ async function runSemanticFuzzScenario(
       toolExecutors: {
         echo_tool(args) {
           executorInvocations++;
-          const text = typeof args === "object" && args && "text" in args ? String(args.text) : "";
-          return `tool-result::${text}`;
+          return `tool-result::${readEchoToolText(args)}`;
         },
       },
       initialMessages: scenario.initialMessages,
@@ -148,36 +159,58 @@ function compareSemanticReplay(
   if (replay.executorInvocations !== scenario.uniqueToolCallCount) {
     return `Seed ${seed}: point ${point.ordinal} (${point.label}) executed tools ${replay.executorInvocations} times instead of ${scenario.uniqueToolCallCount}`;
   }
-  if (JSON.stringify(replay.normalizedMessages) !== JSON.stringify(golden.normalizedMessages)) {
+  if (!isDeepStrictEqual(replay.normalizedMessages, golden.normalizedMessages)) {
     return `Seed ${seed}: message mismatch after point ${point.ordinal} (${point.label})`;
   }
-  if (JSON.stringify(replay.turnSummary) !== JSON.stringify(golden.turnSummary)) {
+  if (!isDeepStrictEqual(replay.turnSummary, golden.turnSummary)) {
     return `Seed ${seed}: turn mismatch after point ${point.ordinal} (${point.label})`;
+  }
+  const replayToolResultSet = [...new Set(replay.observedToolResults)].sort();
+  const goldenToolResultSet = [...new Set(golden.observedToolResults)].sort();
+  if (!isDeepStrictEqual(replayToolResultSet, goldenToolResultSet)) {
+    return `Seed ${seed}: backend-observed tool result set diverged after point ${point.ordinal} (${point.label})`;
   }
   return null;
 }
 
-function resolveSemanticFuzzSeeds(rawCount: string | undefined): number[] {
-  const trimmed = rawCount?.trim();
-  if (!trimmed) return buildSemanticFuzzSeeds(DEFAULT_SEMANTIC_FUZZ_COUNT);
-
-  const count = Number(trimmed);
-  if (!Number.isInteger(count) || count <= 0) {
-    throw new Error("SEMANTIC_FUZZ_COUNT must be a positive integer");
-  }
-
-  return buildSemanticFuzzSeeds(count);
+function resolveSemanticFuzzConfig(
+  rawSeedCount: string | undefined,
+  rawFailurePointCount: string | undefined,
+): { seeds: number[]; failurePointCount: number } {
+  return {
+    seeds: buildSemanticFuzzSeeds(
+      resolvePositiveInteger(rawSeedCount, {
+        envName: "SEMANTIC_FUZZ_COUNT",
+        defaultValue: DEFAULT_SEMANTIC_FUZZ_COUNT,
+        maxValue: MAX_SEMANTIC_FUZZ_COUNT,
+      }),
+    ),
+    failurePointCount: resolvePositiveInteger(rawFailurePointCount, {
+      envName: "SEMANTIC_FUZZ_FAILURE_POINT_COUNT",
+      defaultValue: DEFAULT_SEMANTIC_FUZZ_FAILURE_POINT_COUNT,
+      maxValue: MAX_SEMANTIC_FUZZ_FAILURE_POINT_COUNT,
+    }),
+  };
 }
 
-function resolveSemanticFuzzFailurePointCount(rawCount: string | undefined): number {
+function resolvePositiveInteger(
+  rawCount: string | undefined,
+  options: {
+    envName: string;
+    defaultValue: number;
+    maxValue: number;
+  },
+): number {
   const trimmed = rawCount?.trim();
-  if (!trimmed) return DEFAULT_SEMANTIC_FUZZ_FAILURE_POINT_COUNT;
+  if (!trimmed) return options.defaultValue;
 
   const count = Number(trimmed);
   if (!Number.isInteger(count) || count <= 0) {
-    throw new Error("SEMANTIC_FUZZ_FAILURE_POINT_COUNT must be a positive integer");
+    throw new Error(`${options.envName} must be a positive integer`);
   }
-
+  if (count > options.maxValue) {
+    throw new Error(`${options.envName} must be <= ${options.maxValue}`);
+  }
   return count;
 }
 

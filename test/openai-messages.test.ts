@@ -130,6 +130,24 @@ describe("parseMessages", () => {
     expect(result.toolResults).toHaveLength(1);
   });
 
+  test("malformed assistant tool calls do not crash parsing", () => {
+    const result = parseMessages([
+      msg({ role: "user", content: "Q1" }),
+      msg({
+        role: "assistant",
+        content: "Calling something.",
+        tool_calls: [{ id: "tc-bad", type: "function" } as any],
+      }),
+      msg({ role: "tool", content: "tool output", tool_call_id: "tc-bad" }),
+      msg({ role: "user", content: "Q2" }),
+    ]);
+
+    expect(result.userText).toBe("Q2");
+    expect(result.turns).toHaveLength(1);
+    expect(result.turns[0]!.assistantText).toContain("[Tool unknown()]");
+    expect(result.turns[0]!.assistantText).toContain("tool output");
+  });
+
   test("single user message with no history", () => {
     const result = parseMessages([msg({ role: "user", content: "Just one question" })]);
     expect(result.userText).toBe("Just one question");

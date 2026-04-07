@@ -21,10 +21,10 @@ import {
   type ToolResultInfo,
   textContent,
 } from "./openai-messages";
-import type { PumpResult } from "./openai-stream";
 import {
   collectNonStreamingResponse,
   createSSECtx,
+  type PumpResult,
   pumpSession,
   SSE_HEADERS,
   type SSECtx,
@@ -66,6 +66,24 @@ interface ChatCompletionRequest {
   max_tokens?: number;
   tools?: OpenAIToolDef[];
   tool_choice?: unknown;
+}
+
+function isOpenAIMessageArray(value: unknown): value is OpenAIMessage[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (message) =>
+        message !== null &&
+        typeof message === "object" &&
+        typeof (message as { role?: unknown }).role === "string",
+    )
+  );
+}
+
+function isChatCompletionRequest(value: unknown): value is ChatCompletionRequest {
+  if (!value || typeof value !== "object") return false;
+  const request = value as { model?: unknown; messages?: unknown };
+  return typeof request.model === "string" && isOpenAIMessageArray(request.messages);
 }
 
 interface CursorRequestPayload {
@@ -173,31 +191,7 @@ export async function startProxy(
       }
 
       if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
-        try {
-          const body = (await req.json()) as ChatCompletionRequest;
-          if (!proxyAccessTokenProvider) throw new Error("Access token provider not configured");
-          const accessToken = await proxyAccessTokenProvider();
-          const sessionId = req.headers.get("x-session-affinity") ?? undefined;
-          const parentSessionId = req.headers.get("x-parent-session-id") ?? undefined;
-          const opencodeAgent = req.headers.get("x-opencode-agent") ?? undefined;
-          return handleChatCompletion(
-            body,
-            accessToken,
-            proxyRuntimeConfig,
-            sessionId,
-            parentSessionId,
-            opencodeAgent,
-          );
-        } catch (err) {
-          logError("chat completion failed", errorDetails(err));
-          const message = err instanceof Error ? err.message : String(err);
-          return new Response(
-            JSON.stringify({
-              error: { message, type: "server_error", code: "internal_error" },
-            }),
-            { status: 500, headers: { "Content-Type": "application/json" } },
-          );
-        }
+        return handleChatCompletionFetch(req);
       }
 
       return jsonError("Not Found", "not_found", 404);
@@ -207,6 +201,40 @@ export async function startProxy(
   proxyPort = proxyServer.port;
   if (!proxyPort) throw new Error("Failed to bind proxy to a port");
   return proxyPort;
+}
+
+async function handleChatCompletionFetch(req: Request): Promise<Response> {
+  try {
+    const body = await req.json();
+    if (!isChatCompletionRequest(body)) {
+      return jsonError("Invalid chat completion request", "invalid_request");
+    }
+    if (!proxyAccessTokenProvider) throw new Error("Access token provider not configured");
+    const accessToken = await proxyAccessTokenProvider();
+    const sessionId = req.headers.get("x-session-affinity") ?? undefined;
+    const parentSessionId = req.headers.get("x-parent-session-id") ?? undefined;
+    const opencodeAgent = req.headers.get("x-opencode-agent") ?? undefined;
+    return handleChatCompletion(
+      body,
+      accessToken,
+      proxyRuntimeConfig,
+      sessionId,
+      parentSessionId,
+      opencodeAgent,
+    );
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      return jsonError("Invalid JSON body", "invalid_json");
+    }
+    logError("chat completion failed", errorDetails(err));
+    const message = err instanceof Error ? err.message : String(err);
+    return new Response(
+      JSON.stringify({
+        error: { message, type: "server_error", code: "internal_error" },
+      }),
+      { status: 500, headers: { "Content-Type": "application/json" } },
+    );
+  }
 }
 
 export function stopProxy(): void {
@@ -356,7 +384,7 @@ export function prepareStoredConversationForRequest(
 
   const historicCheckpoint = stored.checkpointHistory.get(fp);
   if (historicCheckpoint) {
-    logDebug(`checkpoint-history hit for fp=${fp}`);
+    logDebug("checkpoint history hit", { fp });
     stored.checkpoint = historicCheckpoint;
     return { checkpoint: historicCheckpoint, didReset: false };
   }
@@ -364,7 +392,7 @@ export function prepareStoredConversationForRequest(
   if (fp) {
     const archivedCheckpoint = stored.checkpointArchive.get(fp);
     if (archivedCheckpoint) {
-      logDebug(`checkpoint-archive hit for fp=${fp}`);
+      logDebug("checkpoint archive hit", { fp });
       stored.checkpoint = archivedCheckpoint;
       return { checkpoint: archivedCheckpoint, didReset: false };
     }
@@ -385,7 +413,7 @@ function buildCursorRequest(
   modelId: string,
   systemPrompt: string,
   userText: string,
-  turns: Array<{ userText: string; assistantText: string }>,
+  turns: Turn[],
   conversationId: string,
   checkpoint: Uint8Array | null,
   existingBlobStore?: Map<string, Uint8Array>,
@@ -398,8 +426,11 @@ function buildCursorRequest(
   blobStore.set(Buffer.from(systemBlobId).toString("hex"), systemBytes);
 
   let conversationState: ReturnType<typeof create<typeof ConversationStateStructureSchema>>;
-  if (checkpoint) {
-    conversationState = fromBinary(ConversationStateStructureSchema, checkpoint);
+  const decodedCheckpoint = checkpoint
+    ? decodeCheckpointState(checkpoint, "buildCursorRequest")
+    : null;
+  if (decodedCheckpoint) {
+    conversationState = decodedCheckpoint;
   } else {
     const turnBytes: Uint8Array[] = [];
     for (const turn of turns) {
@@ -484,9 +515,9 @@ function buildResumeRequest(
 ): CursorRequestPayload {
   const blobStore = new Map<string, Uint8Array>(existingBlobStore);
 
-  const conversationState = checkpoint
-    ? fromBinary(ConversationStateStructureSchema, checkpoint)
-    : create(ConversationStateStructureSchema, {});
+  const conversationState =
+    (checkpoint ? decodeCheckpointState(checkpoint, "buildResumeRequest") : null) ??
+    create(ConversationStateStructureSchema, {});
 
   const action = create(ConversationActionSchema, {
     action: {
@@ -530,6 +561,49 @@ function createModelDetails(modelId: string) {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+function decodeCheckpointState(
+  checkpoint: Uint8Array,
+  context: string,
+): ReturnType<typeof create<typeof ConversationStateStructureSchema>> | null {
+  try {
+    return fromBinary(ConversationStateStructureSchema, checkpoint);
+  } catch (error) {
+    logWarn("Ignoring invalid stored checkpoint", {
+      context,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+function sanitizeStoredCheckpointForBuild(
+  stored: StoredConversation,
+  checkpoint: Uint8Array | null,
+  convKey: string,
+  runtimeConfig: Partial<CursorRuntimeConfig>,
+  context: string,
+): Uint8Array | null {
+  if (!checkpoint) return null;
+  if (decodeCheckpointState(checkpoint, context)) return checkpoint;
+  stored.checkpoint = null;
+  for (const [fp, candidate] of stored.checkpointHistory) {
+    if (buffersEqual(candidate, checkpoint)) stored.checkpointHistory.delete(fp);
+  }
+  for (const [fp, candidate] of stored.checkpointArchive) {
+    if (buffersEqual(candidate, checkpoint)) stored.checkpointArchive.delete(fp);
+  }
+  persistConversation(convKey, stored, runtimeConfig);
+  return null;
+}
+
+function buffersEqual(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index++) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
 function makeCheckpointCallback(
   convKey: string,
   runtimeConfig: Partial<CursorRuntimeConfig>,
@@ -544,6 +618,44 @@ function makeCheckpointCallback(
     stored.lastAccessMs = Date.now();
     persistConversation(convKey, stored, runtimeConfig);
   };
+}
+
+function buildAutoResumePayload(options: {
+  stored: StoredConversation | undefined;
+  convKey: string;
+  runtimeConfig: Partial<CursorRuntimeConfig>;
+  modelId: string;
+  mcpTools: McpToolDefinition[];
+  rebuildRequest?: () => CursorRequestPayload;
+  attempt: number;
+}): CursorRequestPayload | null {
+  const { stored, convKey, runtimeConfig, modelId, mcpTools, rebuildRequest, attempt } = options;
+  if (stored?.checkpoint) {
+    const safeCheckpoint = sanitizeStoredCheckpointForBuild(
+      stored,
+      stored.checkpoint,
+      convKey,
+      runtimeConfig,
+      "auto-resume",
+    );
+    if (safeCheckpoint) {
+      return buildResumeRequest(
+        modelId,
+        stored.conversationId,
+        safeCheckpoint,
+        stored.blobStore,
+        mcpTools,
+      );
+    }
+  }
+
+  if (!rebuildRequest) return null;
+  logDebug("no checkpoint for resume, rebuilding original request", {
+    attempt,
+  });
+  const payload = rebuildRequest();
+  payload.mcpTools = mcpTools;
+  return payload;
 }
 
 /**
@@ -562,7 +674,7 @@ async function pumpWithAutoResume(
   let resumeCount = 0;
   let currentSession = session;
 
-  for (let attempt = 0; attempt <= MAX_AUTO_RESUMES; attempt++) {
+  while (true) {
     const result = await pumpSession(currentSession, ctx);
 
     if (result.outcome === "done") {
@@ -604,23 +716,15 @@ async function pumpWithAutoResume(
       }
 
       const stored = getConversationState(convKey, currentSession.runtimeConfig);
-      let payload: CursorRequestPayload | null = null;
-
-      if (stored?.checkpoint) {
-        payload = buildResumeRequest(
-          modelId,
-          stored.conversationId,
-          stored.checkpoint,
-          stored.blobStore,
-          mcpTools,
-        );
-      } else if (rebuildRequest) {
-        logDebug("no checkpoint for resume, rebuilding original request", {
-          attempt: resumeCount,
-        });
-        payload = rebuildRequest();
-        payload.mcpTools = mcpTools;
-      }
+      const payload = buildAutoResumePayload({
+        stored,
+        convKey,
+        runtimeConfig: currentSession.runtimeConfig,
+        modelId,
+        mcpTools,
+        rebuildRequest,
+        attempt: resumeCount,
+      });
 
       if (payload) {
         currentSession = new CursorSession({
@@ -639,8 +743,6 @@ async function pumpWithAutoResume(
 
     return result;
   }
-
-  return { outcome: "done" };
 }
 
 /** Write an unrecoverable retry result to the SSE context. */
@@ -727,6 +829,13 @@ function handleChatCompletion(
   const mcpTools = buildMcpToolDefinitions(tools);
   const effectiveUserText =
     userText || (toolResults.length > 0 ? toolResults.map((r) => r.content).join("\n") : "");
+  const safeCheckpoint = sanitizeStoredCheckpointForBuild(
+    stored,
+    preparedConversation.checkpoint,
+    convKey,
+    runtimeConfig,
+    "chat-completion",
+  );
 
   const payload = buildCursorRequest(
     modelId,
@@ -734,7 +843,7 @@ function handleChatCompletion(
     effectiveUserText,
     turns,
     stored.conversationId,
-    preparedConversation.checkpoint,
+    safeCheckpoint,
     stored.blobStore,
   );
   payload.mcpTools = mcpTools;
@@ -853,7 +962,7 @@ interface StreamingPumpOpts {
   runtimeConfig: Partial<CursorRuntimeConfig>;
   systemPrompt?: string;
   effectiveUserText?: string;
-  turns?: Array<{ userText: string; assistantText: string }>;
+  turns?: Turn[];
   mcpTools?: McpToolDefinition[];
   onSession: (s: CursorSession) => void;
 }
@@ -888,13 +997,20 @@ async function runStreamingPump(opts: StreamingPumpOpts): Promise<void> {
 
     const rebuildRequest = () => {
       const stored = resolveConversationState(convKey, opts.runtimeConfig);
+      const safeCheckpoint = sanitizeStoredCheckpointForBuild(
+        stored,
+        stored.checkpoint,
+        convKey,
+        opts.runtimeConfig,
+        "stream-rebuild",
+      );
       return buildCursorRequest(
         modelId,
         systemPrompt ?? "",
         effectiveUserText ?? "",
         turns ?? [],
         stored.conversationId,
-        stored.checkpoint,
+        safeCheckpoint,
         stored.blobStore,
       );
     };
@@ -956,7 +1072,7 @@ function handleStreamingWithRetry(
   runtimeConfig: Partial<CursorRuntimeConfig>,
   systemPrompt?: string,
   effectiveUserText?: string,
-  turns?: Array<{ userText: string; assistantText: string }>,
+  turns?: Turn[],
   mcpTools?: McpToolDefinition[],
 ): Response {
   const completionId = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 28)}`;

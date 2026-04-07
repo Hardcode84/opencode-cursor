@@ -1,4 +1,11 @@
+import { isDeepStrictEqual } from "node:util";
 import type { OpenAIMessage, OpenAIToolDef } from "../../src/openai-messages";
+import {
+  createEchoTools,
+  exchangeRequestContext,
+  findLatestUserText,
+  formatEchoToolHistory,
+} from "./conversation-test-helpers";
 import type {
   FakeCommunicationPoint,
   FakeCursorBackend,
@@ -44,6 +51,13 @@ export interface SemanticFuzzScenarioState {
   observedToolResults: string[];
 }
 
+export interface SemanticFuzzTurnSummary {
+  userText: string;
+  assistantText: string;
+  reasoningText: string;
+  requestCount: number;
+}
+
 export function generateSemanticFuzzScenario(seed: number): SemanticFuzzScenario {
   const rng = createRng(seed);
   const turnCount = 2 + rng.nextInt(3);
@@ -82,22 +96,7 @@ export function generateSemanticFuzzScenario(seed: number): SemanticFuzzScenario
 }
 
 export function createSemanticFuzzTools(): OpenAIToolDef[] {
-  return [
-    {
-      type: "function",
-      function: {
-        name: "echo_tool",
-        description: "Echo text back to the caller",
-        parameters: {
-          type: "object",
-          properties: {
-            text: { type: "string" },
-          },
-          required: ["text"],
-        },
-      },
-    },
-  ];
+  return createEchoTools();
 }
 
 export function installSemanticFuzzScenario(
@@ -150,7 +149,7 @@ export function validateSemanticFuzzResponse(
     }
     const actualIds = (assistant.tool_calls ?? []).map((toolCall) => toolCall.id);
     const expectedIds = batch.toolCalls.map((toolCall) => toolCall.id);
-    if (JSON.stringify(actualIds) !== JSON.stringify(expectedIds)) {
+    if (!isDeepStrictEqual(actualIds, expectedIds)) {
       return `Unexpected tool call IDs for ${turn.userText} batch ${batchIndex + 1}`;
     }
   }
@@ -161,7 +160,7 @@ export function validateSemanticFuzzResponse(
   const actualCompletedToolResults = toolMessages.map((message) =>
     typeof message.content === "string" ? message.content : JSON.stringify(message.content),
   );
-  if (JSON.stringify(actualCompletedToolResults) !== JSON.stringify(expectedCompletedToolResults)) {
+  if (!isDeepStrictEqual(actualCompletedToolResults, expectedCompletedToolResults)) {
     return `Unexpected completed tool results for ${turn.userText}`;
   }
 
@@ -176,8 +175,8 @@ export function validateSemanticFuzzResponse(
     return trace.finishReason === "tool_calls" &&
       trace.reasoning === batch.introReasoning &&
       trace.content === batch.introContent &&
-      JSON.stringify(actualTraceIds) === JSON.stringify(expectedTraceIds) &&
-      JSON.stringify(actualTraceArgs) === JSON.stringify(expectedTraceArgs)
+      isDeepStrictEqual(actualTraceIds, expectedTraceIds) &&
+      isDeepStrictEqual(actualTraceArgs, expectedTraceArgs)
       ? null
       : `Tool batch response incomplete for ${turn.userText}`;
   }
@@ -209,15 +208,14 @@ export function sampleSemanticFailurePoints(
 
   for (const pattern of preferredPatterns) {
     if (pickedOrdinals.size >= maxSampleCount) break;
-    const match = points.find((point) => pattern.test(point.label));
+    const match = points.find((point) => pattern.test(pointLabelSuffix(point.label)));
     if (match) pickedOrdinals.add(match.ordinal);
   }
 
   const safePoints = points.filter(
     (point) =>
-      point.label === "client.runRequest" ||
-      point.label.includes(":server.") ||
-      point.label.startsWith("server."),
+      pointLabelSuffix(point.label) === "client.runRequest" ||
+      pointLabelSuffix(point.label).startsWith("server."),
   );
   const rng = createRng(seed ^ 0x85ebca6b);
   while (pickedOrdinals.size < Math.min(maxSampleCount, safePoints.length)) {
@@ -229,7 +227,9 @@ export function sampleSemanticFailurePoints(
     .sort((a, b) => a.ordinal - b.ordinal);
 }
 
-export function summarizeSemanticTurns(turns: ConversationDriverTurnTrace[]) {
+export function summarizeSemanticTurns(
+  turns: ConversationDriverTurnTrace[],
+): SemanticFuzzTurnSummary[] {
   return turns.map((turn) => ({
     userText: turn.userText,
     assistantText: turn.assistantText,
@@ -271,7 +271,10 @@ function buildTurn(
 ): SemanticFuzzTurn {
   const turnLabel = `seed${seed}-turn${turnIndex + 1}`;
   const useToolBatch = overrides.forceToolBatch ?? rng.nextBoolean();
-  const batches = useToolBatch ? [buildBatch(seed, turnIndex, rng)] : [];
+  const batchCount = useToolBatch ? 1 + rng.nextInt(2) : 0;
+  const batches = Array.from({ length: batchCount }, (_, batchIndex) =>
+    buildBatch(seed, turnIndex, batchIndex, rng),
+  );
   const toolSummary =
     batches.length > 0
       ? batches.flatMap((batch) => batch.toolCalls.map((toolCall) => toolCall.result)).join(" | ")
@@ -287,21 +290,27 @@ function buildTurn(
   };
 }
 
-function buildBatch(seed: number, turnIndex: number, rng: Rng): SemanticFuzzBatch {
+function buildBatch(
+  seed: number,
+  turnIndex: number,
+  batchIndex: number,
+  rng: Rng,
+): SemanticFuzzBatch {
   const turnLabel = `seed${seed}-turn${turnIndex + 1}`;
+  const batchLabel = `${turnLabel}-batch-${batchIndex + 1}`;
   const callCount = 1 + rng.nextInt(2);
   const toolCalls: SemanticFuzzToolCall[] = [];
   for (let callIndex = 0; callIndex < callCount; callIndex++) {
-    const text = `${turnLabel}-tool-${callIndex + 1}`;
+    const text = `${batchLabel}-tool-${callIndex + 1}`;
     toolCalls.push({
-      id: `${turnLabel}-tool-call-${callIndex + 1}`,
+      id: `${batchLabel}-tool-call-${callIndex + 1}`,
       text,
       result: `tool-result::${text}`,
     });
   }
   return {
-    introReasoning: `Plan ${turnLabel} batch 1.`,
-    introContent: `Calling tools for ${turnLabel}. `,
+    introReasoning: `Plan ${turnLabel} batch ${batchIndex + 1}.`,
+    introContent: `Calling tools for ${turnLabel} batch ${batchIndex + 1}. `,
     toolCalls,
   };
 }
@@ -323,17 +332,17 @@ async function playSemanticBatches(
   turnIndex: number,
   turn: SemanticFuzzTurn,
 ): Promise<void> {
-  for (const batch of turn.batches) {
+  for (const [batchIndex, batch] of turn.batches.entries()) {
     emitBatchPrelude(connection, batch);
     if (connection.interrupted) return;
 
-    emitBatchToolCalls(connection, turnIndex, batch);
+    emitBatchToolCalls(connection, turnIndex, batchIndex, batch);
     if (connection.interrupted) return;
 
     connection.sendConversationCheckpoint(completedHistoryTurns(scenario, turnIndex));
     if (connection.interrupted) return;
 
-    await awaitBatchResults(connection, state, turnIndex, batch);
+    await awaitBatchResults(connection, state, turnIndex, batchIndex, batch);
     if (connection.interrupted) return;
   }
 }
@@ -347,6 +356,7 @@ function emitBatchPrelude(connection: FakeRunConnection, batch: SemanticFuzzBatc
 function emitBatchToolCalls(
   connection: FakeRunConnection,
   turnIndex: number,
+  batchIndex: number,
   batch: SemanticFuzzBatch,
 ): void {
   for (const [callIndex, toolCall] of batch.toolCalls.entries()) {
@@ -355,7 +365,7 @@ function emitBatchToolCalls(
       { text: toolCall.text },
       {
         toolCallId: toolCall.id,
-        execId: toolExecId(turnIndex, callIndex),
+        execId: toolExecId(turnIndex, batchIndex, callIndex),
       },
     );
     if (connection.interrupted) return;
@@ -366,10 +376,11 @@ async function awaitBatchResults(
   connection: FakeRunConnection,
   state: SemanticFuzzScenarioState,
   turnIndex: number,
+  batchIndex: number,
   batch: SemanticFuzzBatch,
 ): Promise<void> {
   for (const [callIndex, toolCall] of batch.toolCalls.entries()) {
-    const execId = toolExecId(turnIndex, callIndex);
+    const execId = toolExecId(turnIndex, batchIndex, callIndex);
     const mcpResult = await connection.waitForMcpResult(execId);
     if (mcpResult.text !== toolCall.result) {
       throw new Error(
@@ -417,7 +428,7 @@ function historyAssistantText(batches: SemanticFuzzBatch[], finalContent: string
   for (const batch of batches) {
     text += batch.introContent;
     for (const toolCall of batch.toolCalls) {
-      text += `\n[Tool echo_tool(${JSON.stringify({ text: toolCall.text })})]\n${toolCall.result}\n`;
+      text += formatEchoToolHistory(toolCall.text, toolCall.result);
     }
   }
   text += finalContent;
@@ -436,7 +447,7 @@ function assertExpectedRunHistory(
   run: FakeRunRequestSnapshot,
 ): void {
   const expectedTurns = expectedRunHistory(scenario, turnIndex, run);
-  if (JSON.stringify(run.turns) === JSON.stringify(expectedTurns)) return;
+  if (isDeepStrictEqual(run.turns, expectedTurns)) return;
   throw new Error(
     `Unexpected run history for seed ${scenario.seed} turn ${turnIndex + 1}: expected ${JSON.stringify(expectedTurns)}, got ${JSON.stringify(run.turns)}`,
   );
@@ -452,15 +463,6 @@ function shouldStartAtFinalOnly(
   );
 }
 
-function findLatestUserText(messages: ReadonlyArray<OpenAIMessage>): string | null {
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const message = messages[index]!;
-    if (message.role !== "user") continue;
-    return typeof message.content === "string" ? message.content : JSON.stringify(message.content);
-  }
-  return null;
-}
-
 function messagesAfterLatestUser(
   messages: ReadonlyArray<OpenAIMessage>,
 ): ReadonlyArray<OpenAIMessage> {
@@ -470,24 +472,19 @@ function messagesAfterLatestUser(
   return [];
 }
 
-async function exchangeRequestContext(
-  connection: FakeRunConnection,
-  execMessageId: number,
-): Promise<boolean> {
-  connection.sendRequestContextArgs(execMessageId);
-  if (connection.interrupted) return false;
-  await connection.waitForRequestContextResult(execMessageId);
-  return !connection.interrupted;
-}
-
 interface Rng {
   next: () => number;
   nextInt: (limit: number) => number;
   nextBoolean: () => boolean;
 }
 
-function toolExecId(turnIndex: number, callIndex: number): number {
-  return 20_000 + turnIndex * 100 + callIndex;
+function toolExecId(turnIndex: number, batchIndex: number, callIndex: number): number {
+  return 20_000 + turnIndex * 1_000 + batchIndex * 100 + callIndex;
+}
+
+function pointLabelSuffix(label: string): string {
+  const lastColon = label.lastIndexOf(":");
+  return lastColon >= 0 ? label.slice(lastColon + 1) : label;
 }
 
 function createRng(seed: number): Rng {

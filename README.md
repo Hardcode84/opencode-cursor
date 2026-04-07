@@ -154,14 +154,15 @@ The project uses **semantic fuzzing**, not raw byte fuzzing, as its primary fuzz
 - Scenarios are generated from fixed seeds so failures are reproducible.
 - `SEMANTIC_FUZZ_COUNT` controls how many seeded scenarios are generated; if it is unset, the suite falls back to its built-in default seed count.
 - `SEMANTIC_FUZZ_FAILURE_POINT_COUNT` controls how many semantic communication points are replayed per seed; if it is unset, the suite falls back to its built-in default sample size.
-- Each seed produces a small conversation in the currently supported recoverable space: multiple turns, optional tool-use turns, and 1-2 tool calls in a batch.
+- Total replay work grows roughly as `seed_count * (1 + failure_point_count)`, since each seed runs one golden pass plus one replay per sampled failure point.
+- Each seed produces a small conversation in the currently supported recoverable space: multiple turns, optional tool-use turns, and 1-2 tool batches per turn with 1-2 tool calls in each batch.
 - The suite first runs a golden conversation, records the semantic communication points, then replays sampled points with a single injected upstream `reset` or `destroy`.
 - The main invariants are:
   - final normalized conversation matches the golden run
   - per-turn assistant/reasoning output matches the golden run
   - frontend tool execution remains at-most-once for each unique `tool_call_id`
 
-The semantic fuzz generator is intentionally bounded for CI stability. More complex multi-batch / multi-resume flows are still covered by dedicated deterministic tests such as `conversation-advanced-coverage.test.ts`.
+The semantic fuzz generator is intentionally bounded for CI stability. `SEMANTIC_FUZZ_COUNT` is capped at `100` and `SEMANTIC_FUZZ_FAILURE_POINT_COUNT` is capped at `64`. More complex multi-batch / multi-resume flows are still covered by dedicated deterministic tests such as `conversation-advanced-coverage.test.ts`.
 
 ### Pre-commit checks
 
@@ -194,6 +195,8 @@ updates.
 | `CURSOR_PROXY_DEBUG` | `0` | Set to `1` to enable verbose console logging |
 | `CURSOR_API_URL` | `https://api2.cursor.sh` | Override Cursor API base URL |
 | `CURSOR_AGENT_URL` | `https://agentn.us.api5.cursor.sh` | Override Cursor agent streaming URL |
+| `SEMANTIC_FUZZ_COUNT` | `5` | Number of seeded semantic fuzz scenarios to generate when running `test/conversation-semantic-fuzz.test.ts` |
+| `SEMANTIC_FUZZ_FAILURE_POINT_COUNT` | `8` | Number of semantic communication points to replay per fuzz seed in `test/conversation-semantic-fuzz.test.ts` |
 
 ## MITM proxy (tools/)
 
@@ -204,4 +207,5 @@ agent traffic for protocol analysis. See the file header for setup instructions.
 
 - [OpenCode](https://opencode.ai)
 - [Bun](https://bun.sh)
+- Node.js 18+ compatible runtime APIs (the test harness uses `node:http2`)
 - Active [Cursor](https://cursor.com) subscription

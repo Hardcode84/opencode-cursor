@@ -469,7 +469,7 @@ export async function callCursorUnaryRpc(
   let settled = false;
 
   const session = h2Connect(connectUrl);
-  const timeoutMs = options.timeoutMs ?? 5_000;
+  const timeoutMs = options.timeoutMs && options.timeoutMs > 0 ? options.timeoutMs : 5_000;
   const timeout =
     timeoutMs > 0
       ? setTimeout(() => {

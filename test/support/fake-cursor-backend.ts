@@ -37,6 +37,7 @@ import {
 import {
   CONNECT_END_STREAM_FLAG,
   createConnectFrameParser,
+  decodeConnectUnaryBody,
   frameConnectMessage,
 } from "../../src/protocol";
 
@@ -44,8 +45,6 @@ export interface FakeCursorModel {
   id: string;
   name: string;
   reasoning?: boolean;
-  contextWindow?: number;
-  maxTokens?: number;
 }
 
 export interface FakeUnaryRequest {
@@ -87,11 +86,15 @@ type FailureMode = "reset" | "destroy";
 type RunHandler = (connection: FakeRunConnection) => void | Promise<void>;
 
 interface Waiter {
+  cursorKey: string;
   predicate: (message: AgentClientMessage) => boolean;
   resolve: (message: AgentClientMessage) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 }
+
+const MAX_UNARY_BODY_BYTES = 1_000_000;
+const UNARY_BODY_TIMEOUT_MS = 1_000;
 
 function frameUnaryPayload(payload: Uint8Array): Buffer {
   return Buffer.from(frameConnectMessage(payload));
@@ -239,7 +242,7 @@ function decodeMcpResult(message: AgentClientMessage): FakeMcpResultSnapshot {
 export class FakeRunConnection {
   readonly clientMessages: AgentClientMessage[] = [];
   private readonly waiters: Waiter[] = [];
-  private readCursor = 0;
+  private readonly cursors = new Map<string, number>();
   private closedResolvers: Array<() => void> = [];
   private _closed = false;
   private _interrupted = false;
@@ -287,13 +290,12 @@ export class FakeRunConnection {
   waitForClientMessage(
     predicate: (message: AgentClientMessage) => boolean = () => true,
     timeoutMs = 1_000,
+    cursorKey = "any",
   ): Promise<AgentClientMessage> {
-    for (let i = this.readCursor; i < this.clientMessages.length; i++) {
-      const candidate = this.clientMessages[i]!;
-      if (predicate(candidate)) {
-        this.readCursor = i + 1;
-        return Promise.resolve(candidate);
-      }
+    const immediateMatch = this.findMatchingMessage(predicate, cursorKey);
+    if (immediateMatch) {
+      this.cursors.set(cursorKey, immediateMatch.index + 1);
+      return Promise.resolve(immediateMatch.message);
     }
 
     return new Promise((resolve, reject) => {
@@ -301,39 +303,57 @@ export class FakeRunConnection {
         this.removeWaiter(waiter);
         reject(new Error(`Timed out waiting for client message after ${timeoutMs}ms`));
       }, timeoutMs);
-      const waiter: Waiter = { predicate, resolve, reject, timer };
+      const waiter: Waiter = { cursorKey, predicate, resolve, reject, timer };
       this.waiters.push(waiter);
     });
   }
 
   waitForClientMessageCase(messageCase: string, timeoutMs = 1_000): Promise<AgentClientMessage> {
-    return this.waitForClientMessage((message) => message.message.case === messageCase, timeoutMs);
+    return this.waitForClientMessage(
+      (message) => message.message.case === messageCase,
+      timeoutMs,
+      `case:${messageCase}`,
+    );
   }
 
   async waitForRunRequest(timeoutMs = 1_000): Promise<FakeRunRequestSnapshot> {
-    return decodeRunRequest(await this.waitForClientMessageCase("runRequest", timeoutMs));
+    return decodeRunRequest(
+      await this.waitForClientMessage(
+        (message) => message.message.case === "runRequest",
+        timeoutMs,
+        "runRequest",
+      ),
+    );
   }
 
   async waitForRequestContextResult(
     execMessageId?: number,
     timeoutMs = 1_000,
   ): Promise<AgentClientMessage> {
-    return this.waitForClientMessage((message) => {
-      if (message.message.case !== "execClientMessage") return false;
-      if (message.message.value.message.case !== "requestContextResult") return false;
-      return execMessageId == null || message.message.value.id === execMessageId;
-    }, timeoutMs);
+    return this.waitForClientMessage(
+      (message) => {
+        if (message.message.case !== "execClientMessage") return false;
+        if (message.message.value.message.case !== "requestContextResult") return false;
+        return execMessageId == null || message.message.value.id === execMessageId;
+      },
+      timeoutMs,
+      "requestContextResult",
+    );
   }
 
   async waitForMcpResult(
     execMessageId?: number,
     timeoutMs = 1_000,
   ): Promise<FakeMcpResultSnapshot> {
-    const message = await this.waitForClientMessage((candidate) => {
-      if (candidate.message.case !== "execClientMessage") return false;
-      if (candidate.message.value.message.case !== "mcpResult") return false;
-      return execMessageId == null || candidate.message.value.id === execMessageId;
-    }, timeoutMs);
+    const message = await this.waitForClientMessage(
+      (candidate) => {
+        if (candidate.message.case !== "execClientMessage") return false;
+        if (candidate.message.value.message.case !== "mcpResult") return false;
+        return execMessageId == null || candidate.message.value.id === execMessageId;
+      },
+      timeoutMs,
+      "mcpResult",
+    );
     return decodeMcpResult(message);
   }
 
@@ -341,11 +361,15 @@ export class FakeRunConnection {
     execMessageId?: number,
     timeoutMs = 1_000,
   ): Promise<AgentClientMessage> {
-    return this.waitForClientMessage((message) => {
-      if (message.message.case !== "execClientControlMessage") return false;
-      if (message.message.value.message.case !== "streamClose") return false;
-      return execMessageId == null || message.message.value.message.value.id === execMessageId;
-    }, timeoutMs);
+    return this.waitForClientMessage(
+      (message) => {
+        if (message.message.case !== "execClientControlMessage") return false;
+        if (message.message.value.message.case !== "streamClose") return false;
+        return execMessageId == null || message.message.value.message.value.id === execMessageId;
+      },
+      timeoutMs,
+      "execStreamClose",
+    );
   }
 
   waitForClose(timeoutMs = 1_000): Promise<void> {
@@ -522,6 +546,23 @@ export class FakeRunConnection {
     if (index >= 0) this.waiters.splice(index, 1);
   }
 
+  private findMatchingMessage(
+    predicate: (message: AgentClientMessage) => boolean,
+    cursorKey: string,
+  ): { message: AgentClientMessage; index: number } | null {
+    for (
+      let index = this.cursors.get(cursorKey) ?? 0;
+      index < this.clientMessages.length;
+      index++
+    ) {
+      const candidate = this.clientMessages[index]!;
+      if (predicate(candidate)) {
+        return { message: candidate, index };
+      }
+    }
+    return null;
+  }
+
   private recordClientPoint(message: AgentClientMessage): void {
     this.failAtPoint(describeClientMessage(message));
   }
@@ -540,18 +581,15 @@ export class FakeRunConnection {
   private resolveWaiters(): void {
     for (let i = 0; i < this.waiters.length; ) {
       const waiter = this.waiters[i]!;
-      let resolved = false;
-      for (let j = this.readCursor; j < this.clientMessages.length; j++) {
-        const candidate = this.clientMessages[j]!;
-        if (!waiter.predicate(candidate)) continue;
-        this.readCursor = j + 1;
-        clearTimeout(waiter.timer);
-        this.waiters.splice(i, 1);
-        waiter.resolve(candidate);
-        resolved = true;
-        break;
+      const match = this.findMatchingMessage(waiter.predicate, waiter.cursorKey);
+      if (!match) {
+        i++;
+        continue;
       }
-      if (!resolved) i++;
+      this.cursors.set(waiter.cursorKey, match.index + 1);
+      clearTimeout(waiter.timer);
+      this.waiters.splice(i, 1);
+      waiter.resolve(match.message);
     }
   }
 }
@@ -599,6 +637,10 @@ export class FakeCursorBackend {
 
   get runCount(): number {
     return this.runConnections.length;
+  }
+
+  latestRunConnection(): FakeRunConnection | undefined {
+    return this.runConnections.at(-1);
   }
 
   get didInjectFailure(): boolean {
@@ -677,21 +719,67 @@ export class FakeCursorBackend {
       return;
     }
 
-    const body = await this.readBody(stream);
+    let body: Uint8Array;
+    try {
+      body = await this.readBody(stream);
+    } catch {
+      try {
+        stream.respond({ ":status": 400 });
+        stream.end();
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
     this.unaryRequests.push({ path, headers, body });
-    this.respondUnary(stream, path);
+    this.respondUnary(stream, path, body);
   }
 
   private async readBody(stream: ServerHttp2Stream): Promise<Uint8Array> {
     const chunks: Buffer[] = [];
-    await new Promise<void>((resolve) => {
-      stream.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
-      stream.on("end", resolve);
+    let totalBytes = 0;
+    return new Promise<Uint8Array>((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        stream.off("data", onData);
+        stream.off("end", onEnd);
+        stream.off("error", onError);
+        stream.off("aborted", onAborted);
+        stream.off("close", onClose);
+      };
+      const fail = (error: Error) => {
+        cleanup();
+        reject(error);
+      };
+      const onData = (chunk: Buffer | Uint8Array) => {
+        const buffer = Buffer.from(chunk);
+        totalBytes += buffer.length;
+        if (totalBytes > MAX_UNARY_BODY_BYTES) {
+          fail(new Error("Unary request body exceeded maximum size"));
+          return;
+        }
+        chunks.push(buffer);
+      };
+      const onEnd = () => {
+        cleanup();
+        resolve(new Uint8Array(Buffer.concat(chunks)));
+      };
+      const onError = (error: Error) => fail(error);
+      const onAborted = () => fail(new Error("Unary request stream aborted"));
+      const onClose = () => fail(new Error("Unary request stream closed before end"));
+      const timer = setTimeout(() => {
+        fail(new Error("Timed out reading unary request body"));
+      }, UNARY_BODY_TIMEOUT_MS);
+
+      stream.on("data", onData);
+      stream.on("end", onEnd);
+      stream.on("error", onError);
+      stream.on("aborted", onAborted);
+      stream.on("close", onClose);
     });
-    return new Uint8Array(Buffer.concat(chunks));
   }
 
-  private respondUnary(stream: ServerHttp2Stream, path: string): void {
+  private respondUnary(stream: ServerHttp2Stream, path: string, requestBody: Uint8Array): void {
     if (path === "/aiserver.v1.AiService/AvailableModels") {
       const body = frameUnaryPayload(
         toBinary(
@@ -736,11 +824,12 @@ export class FakeCursorBackend {
     }
 
     if (path === "/aiserver.v1.AiService/GetEffectiveTokenLimit") {
-      const body = frameUnaryPayload(
-        encodeTokenLimit(this.tokenLimits.get("test-model") ?? 200_000),
+      const modelId = decodeTokenLimitModelId(requestBody);
+      const responseBody = frameUnaryPayload(
+        encodeTokenLimit(this.tokenLimits.get(modelId ?? "test-model") ?? 200_000),
       );
       stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
-      stream.end(body);
+      stream.end(responseBody);
       return;
     }
 
@@ -802,4 +891,49 @@ function describeServerMessage(
     return `server.interactionUpdate.${message.message.value.message.case ?? "unknown"}`;
   }
   return `server.${message.message.case ?? "unknown"}`;
+}
+
+function decodeTokenLimitModelId(body: Uint8Array): string | null {
+  const payload = decodeConnectUnaryBody(body) ?? body;
+  let offset = 0;
+  if (payload[offset++] !== 0x0a) return null;
+  const outer = readLengthDelimited(payload, offset);
+  if (!outer) return null;
+  offset = 0;
+  if (outer.bytes[offset++] !== 0x0a) return null;
+  const inner = readLengthDelimited(outer.bytes, offset);
+  if (!inner) return null;
+  return new TextDecoder().decode(inner.bytes);
+}
+
+function readLengthDelimited(
+  bytes: Uint8Array,
+  offset: number,
+): { bytes: Uint8Array; nextOffset: number } | null {
+  const length = readVarint(bytes, offset);
+  if (!length) return null;
+  const endOffset = length.nextOffset + length.value;
+  if (endOffset > bytes.length) return null;
+  return {
+    bytes: bytes.subarray(length.nextOffset, endOffset),
+    nextOffset: endOffset,
+  };
+}
+
+function readVarint(
+  bytes: Uint8Array,
+  offset: number,
+): { value: number; nextOffset: number } | null {
+  let value = 0;
+  let shift = 0;
+  let nextOffset = offset;
+  while (nextOffset < bytes.length) {
+    const byte = bytes[nextOffset++]!;
+    value |= (byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) {
+      return { value, nextOffset };
+    }
+    shift += 7;
+  }
+  return null;
 }

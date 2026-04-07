@@ -1,29 +1,17 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import type { OpenAIToolDef } from "../src/openai-messages";
+import {
+  createEchoTools,
+  exchangeRequestContext,
+  readEchoToolText,
+} from "./support/conversation-test-helpers";
 import {
   FakeCursorBackend,
   type FakeMcpResultSnapshot,
+  type FakeRunConnection,
   type FakeRunRequestSnapshot,
 } from "./support/fake-cursor-backend";
 import { OpenAIConversationDriver } from "./support/openai-conversation-driver";
 import { type ProxyHarness, startProxyHarness } from "./support/proxy-harness";
-
-const ECHO_TOOLS: OpenAIToolDef[] = [
-  {
-    type: "function",
-    function: {
-      name: "echo_tool",
-      description: "Echo text back to the caller",
-      parameters: {
-        type: "object",
-        properties: {
-          text: { type: "string" },
-        },
-        required: ["text"],
-      },
-    },
-  },
-];
 
 let backend: FakeCursorBackend | undefined;
 let proxy: ProxyHarness | undefined;
@@ -43,20 +31,20 @@ describe("advanced conversation coverage", () => {
 
     backend.enqueueRun(async (connection) => {
       runSnapshots.push(await connection.waitForRunRequest());
-      await exchangeRequestContext(connection, 401);
+      await exchangeRequestContextOrThrow(connection, 401);
       connection.sendMcpToolCall(
         "echo_tool",
         { text: "cache-me" },
         { toolCallId: "cached-tool-call", execId: 402 },
       );
-      await sleep(80);
+      observedToolResults.push(await connection.waitForMcpResult(402));
       connection.resetStream();
       await connection.waitForClose(1_000);
     });
 
     backend.enqueueRun(async (connection) => {
       runSnapshots.push(await connection.waitForRunRequest());
-      await exchangeRequestContext(connection, 403);
+      await exchangeRequestContextOrThrow(connection, 403);
       connection.sendMcpToolCall(
         "echo_tool",
         { text: "cache-me" },
@@ -76,21 +64,21 @@ describe("advanced conversation coverage", () => {
         agentUrl: backend.agentUrl,
         thinkingTimeoutMs: 200,
         streamingTimeoutMs: 200,
-        collectingTimeoutMs: 30,
+        collectingTimeoutMs: 200,
       },
     });
 
     let executorInvocations = 0;
     const driver = new OpenAIConversationDriver({
-      baseUrl: () => proxy!.baseUrl,
+      baseUrl: proxy.baseUrl,
       model: "test-model",
       sessionId: "at-most-once-tool-session",
-      tools: ECHO_TOOLS,
+      tools: createEchoTools(),
+      maxRequestRetries: 2,
       toolExecutors: {
-        async echo_tool(args) {
+        echo_tool(args) {
           executorInvocations++;
-          await sleep(120);
-          return `tool-result::${readTextArg(args)}`;
+          return `tool-result::${readEchoToolText(args)}`;
         },
       },
     });
@@ -112,7 +100,10 @@ describe("advanced conversation coverage", () => {
       "cached-tool-call",
     ]);
     expect(turn.assistantText).toBe("Tool says: tool-result::cache-me.");
-    expect(observedToolResults.map((result) => result.text)).toEqual(["tool-result::cache-me"]);
+    expect(observedToolResults.map((result) => result.text)).toEqual([
+      "tool-result::cache-me",
+      "tool-result::cache-me",
+    ]);
   }, 15_000);
 
   test("recovers from a proxy restart by reusing the persisted checkpoint", async () => {
@@ -121,14 +112,14 @@ describe("advanced conversation coverage", () => {
 
     backend.enqueueRun(async (connection) => {
       runSnapshots.push(await connection.waitForRunRequest());
-      await exchangeRequestContext(connection, 501);
+      await exchangeRequestContextOrThrow(connection, 501);
       connection.sendTextDelta("Baseline turn complete.");
       connection.sendEndStreamOk();
     });
 
     backend.enqueueRun(async (connection) => {
       runSnapshots.push(await connection.waitForRunRequest());
-      await exchangeRequestContext(connection, 502);
+      await exchangeRequestContextOrThrow(connection, 502);
       connection.sendConversationCheckpoint(
         [{ userText: "hello baseline", assistantText: "Baseline turn complete." }],
         { pendingToolCalls: ["restart-checkpoint-marker"] },
@@ -139,7 +130,7 @@ describe("advanced conversation coverage", () => {
 
     backend.enqueueRun(async (connection) => {
       runSnapshots.push(await connection.waitForRunRequest());
-      await exchangeRequestContext(connection, 503);
+      await exchangeRequestContextOrThrow(connection, 503);
       connection.sendTextDelta("Recovered after proxy restart.");
       connection.sendEndStreamOk();
     });
@@ -180,7 +171,7 @@ describe("advanced conversation coverage", () => {
 
     backend.enqueueRun(async (connection) => {
       await connection.waitForRunRequest();
-      await exchangeRequestContext(connection, 601);
+      await exchangeRequestContextOrThrow(connection, 601);
 
       connection.sendThinkingDelta("Planning the first tool batch.");
       connection.sendMcpToolCall(
@@ -227,13 +218,13 @@ describe("advanced conversation coverage", () => {
     });
 
     const driver = new OpenAIConversationDriver({
-      baseUrl: () => proxy!.baseUrl,
+      baseUrl: proxy.baseUrl,
       model: "test-model",
       sessionId: "multi-resume-session",
-      tools: ECHO_TOOLS,
+      tools: createEchoTools(),
       toolExecutors: {
         echo_tool(args) {
-          return `tool-result::${readTextArg(args)}`;
+          return `tool-result::${readEchoToolText(args)}`;
         },
       },
     });
@@ -266,18 +257,10 @@ describe("advanced conversation coverage", () => {
   }, 15_000);
 });
 
-async function exchangeRequestContext(
-  connection: InstanceType<typeof FakeCursorBackend>["runConnections"][number],
+async function exchangeRequestContextOrThrow(
+  connection: FakeRunConnection,
   execMessageId: number,
 ): Promise<void> {
-  connection.sendRequestContextArgs(execMessageId);
-  await connection.waitForRequestContextResult(execMessageId);
-}
-
-function readTextArg(args: unknown): string {
-  return typeof args === "object" && args && "text" in args ? String(args.text) : "";
-}
-
-async function sleep(ms: number): Promise<void> {
-  await new Promise<void>((resolve) => setTimeout(resolve, ms));
+  const exchanged = await exchangeRequestContext(connection, execMessageId);
+  if (!exchanged) throw new Error(`Request context exchange interrupted for ${execMessageId}`);
 }

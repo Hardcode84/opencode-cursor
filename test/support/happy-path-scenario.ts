@@ -1,4 +1,10 @@
-import type { OpenAIMessage, OpenAIToolDef } from "../../src/openai-messages";
+import type { OpenAIMessage } from "../../src/openai-messages";
+import {
+  createEchoTools,
+  exchangeRequestContext,
+  findLatestUserText,
+  formatEchoToolHistory,
+} from "./conversation-test-helpers";
 import type {
   FakeCursorBackend,
   FakeRunConnection,
@@ -19,8 +25,8 @@ export const HAPPY_PATH_TURN_2_TEXT = "please use the tool for beta";
 export const HAPPY_PATH_TURN_3_TEXT = "what have we discussed so far?";
 export const HAPPY_PATH_TURN_1_ASSISTANT_TEXT = "Echo: hello alpha.";
 export const HAPPY_PATH_TURN_2_HISTORY_ASSISTANT_TEXT =
-  'Invoking echo_tool. \n[Tool echo_tool({"text":"beta payload"})]\n' +
-  "tool-result::beta payload\n" +
+  "Invoking echo_tool. " +
+  formatEchoToolHistory("beta payload", "tool-result::beta payload") +
   "Tool says: tool-result::beta payload.";
 
 export interface HappyPathScenarioState {
@@ -34,23 +40,8 @@ export interface HappyPathConversationOutcome {
   turn3: ConversationDriverTurnTrace;
 }
 
-export function createHappyPathTools(): OpenAIToolDef[] {
-  return [
-    {
-      type: "function",
-      function: {
-        name: "echo_tool",
-        description: "Echo text back to the caller",
-        parameters: {
-          type: "object",
-          properties: {
-            text: { type: "string" },
-          },
-          required: ["text"],
-        },
-      },
-    },
-  ];
+export function createHappyPathTools() {
+  return createEchoTools();
 }
 
 export function validateHappyPathResponse(
@@ -58,6 +49,7 @@ export function validateHappyPathResponse(
   trace: ConversationDriverRequestTrace,
 ): string | null {
   const latestUserText = findLatestUserText(messages);
+  if (!latestUserText) return "Happy-path request missing latest user";
   const hasToolResult = hasToolResultAfterLatestUser(messages);
 
   if (latestUserText === HAPPY_PATH_TURN_1_TEXT) {
@@ -98,7 +90,7 @@ export function validateHappyPathResponse(
       : "Turn 3 summary incomplete";
   }
 
-  return null;
+  return `Unexpected happy-path user turn ${JSON.stringify(latestUserText)}`;
 }
 
 export function installHappyPathScenario(
@@ -207,16 +199,6 @@ async function handleTurn3(
   connection.sendEndStreamOk();
 }
 
-async function exchangeRequestContext(
-  connection: FakeRunConnection,
-  execMessageId: number,
-): Promise<boolean> {
-  connection.sendRequestContextArgs(execMessageId);
-  if (connection.interrupted) return false;
-  await connection.waitForRequestContextResult(execMessageId);
-  return !connection.interrupted;
-}
-
 function identifyTurn(run: FakeRunRequestSnapshot): "turn1" | "turn2" | "turn3" {
   if (run.userText === HAPPY_PATH_TURN_1_TEXT) return "turn1";
   if (run.userText === HAPPY_PATH_TURN_2_TEXT) return "turn2";
@@ -224,15 +206,6 @@ function identifyTurn(run: FakeRunRequestSnapshot): "turn1" | "turn2" | "turn3" 
   throw new Error(
     `Unexpected happy-path run request: user=${JSON.stringify(run.userText)} turns=${run.turns.length}`,
   );
-}
-
-function findLatestUserText(messages: ReadonlyArray<OpenAIMessage>): string | null {
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const message = messages[index]!;
-    if (message.role !== "user") continue;
-    return typeof message.content === "string" ? message.content : JSON.stringify(message.content);
-  }
-  return null;
 }
 
 function hasToolResultAfterLatestUser(messages: ReadonlyArray<OpenAIMessage>): boolean {

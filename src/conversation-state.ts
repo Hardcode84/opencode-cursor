@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { logDebug, logWarn } from "./logger";
 import { type CursorRuntimeConfig, resolveRuntimeConfig } from "./runtime-config";
@@ -16,7 +24,6 @@ export interface StoredConversation {
 interface ConversationCacheEntry {
   convKey: string;
   stored: StoredConversation;
-  diskDir: string;
   memoryTtlMs: number;
 }
 
@@ -46,9 +53,6 @@ function evictStaleConversations(): void {
   for (const [key, entry] of conversationStates) {
     if (now - entry.stored.lastAccessMs > entry.memoryTtlMs) {
       conversationStates.delete(key);
-      try {
-        unlinkSync(join(entry.diskDir, `${entry.convKey}.json`));
-      } catch {}
     }
   }
 }
@@ -74,6 +78,21 @@ function deserializeByteMap(obj: Record<string, string> | undefined): Map<string
   );
 }
 
+function writeConversationFileAtomically(path: string, data: SerializedConversation): void {
+  const tempPath = `${path}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(tempPath, JSON.stringify(data));
+    renameSync(tempPath, path);
+  } catch (error) {
+    try {
+      unlinkSync(tempPath);
+    } catch {
+      /* ignore cleanup failure */
+    }
+    throw error;
+  }
+}
+
 export function persistConversation(
   convKey: string,
   stored: StoredConversation,
@@ -81,6 +100,7 @@ export function persistConversation(
 ): void {
   const config = resolveRuntimeConfig(runtimeConfig);
   ensureConversationDiskDir(config);
+  const path = convDiskPath(convKey, config);
   const data: SerializedConversation = {
     conversationId: stored.conversationId,
     checkpoint: stored.checkpoint ? Buffer.from(stored.checkpoint).toString("base64") : null,
@@ -90,7 +110,7 @@ export function persistConversation(
     checkpointArchive: serializeByteMap(stored.checkpointArchive),
   };
   try {
-    writeFileSync(convDiskPath(convKey, config), JSON.stringify(data));
+    writeConversationFileAtomically(path, data);
   } catch (err) {
     logWarn("Failed to persist conversation to disk", { convKey, error: String(err) });
   }
@@ -121,6 +141,11 @@ function loadConversation(
     };
   } catch (err) {
     logDebug("Failed to load conversation from disk", { convKey, error: String(err) });
+    try {
+      unlinkSync(convDiskPath(convKey, runtimeConfig));
+    } catch {
+      /* ignore cleanup failure */
+    }
     return null;
   }
 }
@@ -140,7 +165,8 @@ function evictStaleDiskConversations(runtimeConfig: CursorRuntimeConfig): void {
 }
 
 /** Deterministic UUID derived from convKey so Cursor's server-side conversation
- *  persists across proxy restarts. Formats 16 bytes of SHA-256 as a v4-shaped UUID. */
+ *  persists across proxy restarts. Uses the first 128 bits of SHA-256, formatted
+ *  as a v4-shaped UUID. */
 export function deterministicConversationId(convKey: string): string {
   const hex = createHash("sha256").update(`cursor-conv-id:${convKey}`).digest("hex").slice(0, 32);
   return [
@@ -162,7 +188,6 @@ export function resolveConversationState(
   if (!entry) {
     entry = {
       convKey,
-      diskDir: config.conversationDiskDir,
       memoryTtlMs: config.conversationTtlMs,
       stored: loadConversation(convKey, config) ?? {
         conversationId: deterministicConversationId(convKey),
@@ -175,7 +200,6 @@ export function resolveConversationState(
     };
     conversationStates.set(key, entry);
   }
-  entry.diskDir = config.conversationDiskDir;
   entry.memoryTtlMs = config.conversationTtlMs;
   entry.stored.lastAccessMs = Date.now();
   evictStaleConversations();

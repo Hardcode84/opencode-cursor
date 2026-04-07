@@ -150,6 +150,22 @@ export type PumpResult =
   | { outcome: "batchReady" }
   | { outcome: "retry"; retryHint: RetryHint; error: string };
 
+function nonStreamingErrorResponse(message: string, code = "non_streaming_error"): Response {
+  return new Response(
+    JSON.stringify({
+      error: {
+        message,
+        type: "server_error",
+        code,
+      },
+    }),
+    {
+      status: 502,
+      headers: { "Content-Type": "application/json" },
+    },
+  );
+}
+
 /**
  * Drain events from a CursorSession and write them as SSE chunks.
  * Returns when the session emits batchReady (tool_calls pause) or done.
@@ -253,6 +269,12 @@ export async function collectNonStreamingResponse(
   const tagFilter = createThinkingTagFilter();
   let text = "";
   let usage: OpenAIUsage | null = null;
+
+  const finalizeSession = () => {
+    usage = pickBetterUsage(usage, buildUsage(session.outputTokens, session.totalTokens));
+    session.close();
+  };
+
   while (true) {
     const event = await session.next();
     if (event.type === "text" && !event.isThinking) {
@@ -260,13 +282,24 @@ export async function collectNonStreamingResponse(
       text += content;
     } else if (event.type === "usage") {
       usage = pickBetterUsage(usage, buildUsage(event.outputTokens, event.totalTokens));
+    } else if (event.type === "toolCall" || event.type === "batchReady") {
+      finalizeSession();
+      return nonStreamingErrorResponse(
+        "Unexpected tool activity while collecting a non-streaming response",
+        "unexpected_tool_activity",
+      );
     } else if (event.type === "done") {
+      if (event.retryHint || event.error) {
+        finalizeSession();
+        return nonStreamingErrorResponse(
+          event.error || "Cursor session ended before a non-streaming response was complete",
+        );
+      }
       text += tagFilter.flush().content;
       break;
     }
   }
-  usage = pickBetterUsage(usage, buildUsage(session.outputTokens, session.totalTokens));
-  session.close();
+  finalizeSession();
 
   return new Response(
     JSON.stringify({

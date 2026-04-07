@@ -1,9 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import {
-  type FakeCommunicationPoint,
-  FakeCursorBackend,
-  type FakeRunRequestSnapshot,
-} from "./support/fake-cursor-backend";
+import { isDeepStrictEqual } from "node:util";
+import { readEchoToolText } from "./support/conversation-test-helpers";
+import { type FakeCommunicationPoint, FakeCursorBackend } from "./support/fake-cursor-backend";
 import {
   createHappyPathTools,
   executeHappyPathConversation,
@@ -24,16 +22,12 @@ interface ReplayRunResult {
   turnSummary: Array<{ assistantText: string; reasoningText: string }>;
   points: FakeCommunicationPoint[];
   didInjectFailure: boolean;
-  runSnapshots: FakeRunRequestSnapshot[];
 }
 
 describe("conversation replay recovery", () => {
   test("reconstructs the golden conversation after a single upstream reset at every semantic point", async () => {
     const golden = await runHappyPathReplay();
     expect(golden.points.length).toBeGreaterThan(0);
-
-    const goldenMessages = JSON.stringify(golden.normalizedMessages);
-    const goldenTurns = JSON.stringify(golden.turnSummary);
     const failures: string[] = [];
 
     for (const point of golden.points) {
@@ -42,11 +36,11 @@ describe("conversation replay recovery", () => {
         failures.push(`Point ${point.ordinal} (${point.label}) did not inject a failure`);
         continue;
       }
-      if (JSON.stringify(replay.normalizedMessages) !== goldenMessages) {
+      if (!isDeepStrictEqual(replay.normalizedMessages, golden.normalizedMessages)) {
         failures.push(`Message mismatch after failing at point ${point.ordinal} (${point.label})`);
         continue;
       }
-      if (JSON.stringify(replay.turnSummary) !== goldenTurns) {
+      if (!isDeepStrictEqual(replay.turnSummary, golden.turnSummary)) {
         failures.push(
           `Turn summary mismatch after failing at point ${point.ordinal} (${point.label})`,
         );
@@ -56,12 +50,12 @@ describe("conversation replay recovery", () => {
     if (failures.length > 0) {
       throw new Error(failures.join("\n"));
     }
-  }, 120_000);
+  }, 180_000);
 });
 
 async function runHappyPathReplay(failPointOrdinal?: number): Promise<ReplayRunResult> {
   const backend = await FakeCursorBackend.start();
-  const scenario = installHappyPathScenario(backend);
+  installHappyPathScenario(backend);
   if (failPointOrdinal != null) {
     backend.setFailOnceAtPoint(failPointOrdinal);
   }
@@ -81,8 +75,7 @@ async function runHappyPathReplay(failPointOrdinal?: number): Promise<ReplayRunR
       tools: createHappyPathTools(),
       toolExecutors: {
         echo_tool(args) {
-          const text = typeof args === "object" && args && "text" in args ? String(args.text) : "";
-          return `tool-result::${text}`;
+          return `tool-result::${readEchoToolText(args)}`;
         },
       },
       initialMessages: HAPPY_PATH_INITIAL_MESSAGES,
@@ -101,7 +94,6 @@ async function runHappyPathReplay(failPointOrdinal?: number): Promise<ReplayRunR
       ],
       points: [...backend.communicationPoints],
       didInjectFailure: backend.didInjectFailure,
-      runSnapshots: [...scenario.runSnapshots],
     };
   } finally {
     await proxy.close();

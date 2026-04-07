@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { readEchoToolText } from "./support/conversation-test-helpers";
 import { FakeCursorBackend, type FakeRunRequestSnapshot } from "./support/fake-cursor-backend";
 import {
   createHappyPathTools,
@@ -46,8 +47,7 @@ describe("conversation happy path", () => {
       tools: createHappyPathTools(),
       toolExecutors: {
         echo_tool(args) {
-          const text = typeof args === "object" && args && "text" in args ? String(args.text) : "";
-          return `tool-result::${text}`;
+          return `tool-result::${readEchoToolText(args)}`;
         },
       },
       initialMessages: HAPPY_PATH_INITIAL_MESSAGES,

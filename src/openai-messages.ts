@@ -43,12 +43,43 @@ export interface ParsedMessages {
   toolResults: ToolResultInfo[];
 }
 
+function normalizeToolCall(raw: unknown): OpenAIToolCall | null {
+  if (!raw || typeof raw !== "object") return null;
+  const call = raw as {
+    id?: unknown;
+    function?: { name?: unknown; arguments?: unknown };
+  };
+  return {
+    id: typeof call.id === "string" ? call.id : "",
+    type: "function",
+    function: {
+      name: typeof call.function?.name === "string" ? call.function.name : "unknown",
+      arguments: typeof call.function?.arguments === "string" ? call.function.arguments : "",
+    },
+  };
+}
+
+function normalizeToolCalls(raw: unknown): OpenAIToolCall[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((call) => {
+    const normalized = normalizeToolCall(call);
+    return normalized ? [normalized] : [];
+  });
+}
+
 export function textContent(content: OpenAIMessage["content"]): string {
   if (content == null) return "";
   if (typeof content === "string") return content;
   return content
-    .filter((p) => p.type === "text" && p.text)
-    .map((p) => p.text!)
+    .filter(
+      (part): part is ContentPart =>
+        !!part &&
+        typeof part === "object" &&
+        part.type === "text" &&
+        typeof part.text === "string" &&
+        part.text.length > 0,
+    )
+    .map((part) => part.text)
     .join("\n");
 }
 
@@ -95,8 +126,9 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
     } else if (msg.role === "assistant") {
       const text = textContent(msg.content);
       if (text) pendingAssistant += text;
-      if (msg.tool_calls) pendingToolCalls.push(...msg.tool_calls);
-      if (pendingUser && !msg.tool_calls) {
+      const normalizedToolCalls = normalizeToolCalls(msg.tool_calls);
+      if (normalizedToolCalls.length > 0) pendingToolCalls.push(...normalizedToolCalls);
+      if (pendingUser && normalizedToolCalls.length === 0) {
         pairs.push({ userText: pendingUser, assistantText: pendingAssistant });
         pendingUser = "";
         pendingAssistant = "";
@@ -109,8 +141,8 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   if (pendingUser) {
     lastUserText = pendingUser;
   } else if (pairs.length > 0 && toolResults.length === 0) {
-    const last = pairs.pop()!;
-    lastUserText = last.userText;
+    const last = pairs.pop();
+    if (last) lastUserText = last.userText;
   }
 
   return { systemPrompt, userText: lastUserText, turns: pairs, toolResults };

@@ -10,7 +10,7 @@ export interface ConversationDriverToolExecution {
 export type ConversationDriverEvent =
   | { kind: "reasoning"; text: string }
   | { kind: "content"; text: string }
-  | { kind: "tool_call"; toolCall: OpenAIToolCall }
+  | { kind: "toolCall"; toolCall: OpenAIToolCall }
   | {
       kind: "usage";
       usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
@@ -91,7 +91,7 @@ export class OpenAIConversationDriver {
         });
 
         for (const toolCall of requestTrace.toolCalls) {
-          const args = toolCall.function.arguments ? JSON.parse(toolCall.function.arguments) : {};
+          const args = parseToolCallArguments(toolCall);
           const result = await this.resolveToolResult(toolCall, args);
           toolExecutions.push({
             toolCallId: toolCall.id,
@@ -267,7 +267,12 @@ function applyPayload(trace: ConversationDriverRequestTrace, payload: string): v
       delta?: {
         reasoning_content?: string;
         content?: string;
-        tool_calls?: OpenAIToolCall[];
+        tool_calls?: Array<{
+          index?: number;
+          id?: string;
+          type?: "function";
+          function?: { name?: string; arguments?: string };
+        }>;
       };
       finish_reason?: string | null;
     }>;
@@ -289,7 +294,12 @@ function applyChoice(
     delta?: {
       reasoning_content?: string;
       content?: string;
-      tool_calls?: OpenAIToolCall[];
+      tool_calls?: Array<{
+        index?: number;
+        id?: string;
+        type?: "function";
+        function?: { name?: string; arguments?: string };
+      }>;
     };
     finish_reason?: string | null;
   },
@@ -316,10 +326,72 @@ function appendContent(trace: ConversationDriverRequestTrace, text: string | und
   trace.events.push({ kind: "content", text });
 }
 
-function appendToolCalls(trace: ConversationDriverRequestTrace, toolCalls: OpenAIToolCall[]): void {
+function appendToolCalls(
+  trace: ConversationDriverRequestTrace,
+  toolCalls: Array<{
+    index?: number;
+    id?: string;
+    type?: "function";
+    function?: { name?: string; arguments?: string };
+  }>,
+): void {
   for (const toolCall of toolCalls) {
-    trace.toolCalls.push(toolCall);
-    trace.events.push({ kind: "tool_call", toolCall });
+    const index = resolveToolCallIndex(trace, toolCall);
+    const existing = trace.toolCalls[index];
+    const merged: OpenAIToolCall = {
+      id: typeof toolCall.id === "string" ? toolCall.id : (existing?.id ?? ""),
+      type: "function",
+      function: {
+        name:
+          typeof toolCall.function?.name === "string"
+            ? toolCall.function.name
+            : (existing?.function.name ?? "unknown"),
+        arguments:
+          typeof toolCall.function?.arguments === "string"
+            ? `${existing?.function.arguments ?? ""}${toolCall.function.arguments}`
+            : (existing?.function.arguments ?? ""),
+      },
+    };
+    if (index === trace.toolCalls.length) {
+      trace.toolCalls.push(merged);
+    } else {
+      trace.toolCalls[index] = merged;
+    }
+    trace.events.push({ kind: "toolCall", toolCall: merged });
+  }
+}
+
+function resolveToolCallIndex(
+  trace: ConversationDriverRequestTrace,
+  toolCall: {
+    index?: number;
+    id?: string;
+  },
+): number {
+  if (
+    Number.isInteger(toolCall.index) &&
+    toolCall.index !== undefined &&
+    toolCall.index >= 0 &&
+    toolCall.index <= trace.toolCalls.length
+  ) {
+    return toolCall.index;
+  }
+  if (typeof toolCall.id === "string") {
+    const existingIndex = trace.toolCalls.findIndex((candidate) => candidate.id === toolCall.id);
+    if (existingIndex >= 0) return existingIndex;
+  }
+  return trace.toolCalls.length;
+}
+
+function parseToolCallArguments(toolCall: OpenAIToolCall): unknown {
+  try {
+    return toolCall.function.arguments ? JSON.parse(toolCall.function.arguments) : {};
+  } catch (error) {
+    throw new Error(
+      `Tool call ${toolCall.id || toolCall.function.name} had invalid JSON arguments: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
   }
 }
 

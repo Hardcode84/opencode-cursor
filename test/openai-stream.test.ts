@@ -3,6 +3,17 @@ import { collectNonStreamingResponse, pumpSession, type SSECtx } from "../src/op
 
 type FakeEvent =
   | { type: "text"; text: string; isThinking: boolean }
+  | {
+      type: "toolCall";
+      exec: {
+        execId: string;
+        execMsgId: number;
+        toolCallId: string;
+        toolName: string;
+        decodedArgs: string;
+      };
+    }
+  | { type: "batchReady" }
   | { type: "usage"; outputTokens: number; totalTokens: number }
   | {
       type: "done";
@@ -146,6 +157,25 @@ describe("pumpSession usage", () => {
 
     expect(recorder.usages).toEqual([]);
   });
+
+  test("returns retry without emitting terminal SSE when the session can be resumed", async () => {
+    const session = new FakeSession(
+      [{ type: "done", error: "Cursor server timed out", retryHint: "timeout" }],
+      0,
+      0,
+    );
+    const recorder = createCtx();
+
+    const result = await pumpSession(session as any, recorder.ctx);
+
+    expect(result).toEqual({
+      outcome: "retry",
+      retryHint: "timeout",
+      error: "Cursor server timed out",
+    });
+    expect(recorder.doneCount).toBe(0);
+    expect(recorder.chunks).toEqual([]);
+  });
 });
 
 describe("collectNonStreamingResponse usage", () => {
@@ -182,6 +212,33 @@ describe("collectNonStreamingResponse usage", () => {
 
     expect(body.choices[0]?.message.content).toBe("answer");
     expect(body.usage).toBeUndefined();
+    expect(session.closed).toBe(true);
+  });
+
+  test("fails fast if unexpected tool activity appears in a non-streaming response", async () => {
+    const session = new FakeSession(
+      [
+        {
+          type: "toolCall",
+          exec: {
+            execId: "exec-1",
+            execMsgId: 1,
+            toolCallId: "tool-1",
+            toolName: "echo_tool",
+            decodedArgs: '{"text":"hello"}',
+          },
+        },
+      ],
+      0,
+      0,
+    );
+
+    const response = await collectNonStreamingResponse(session as any, "test-model");
+    const body = (await response.json()) as { error?: { code?: string; message?: string } };
+
+    expect(response.status).toBe(502);
+    expect(body.error?.code).toBe("unexpected_tool_activity");
+    expect(body.error?.message).toContain("Unexpected tool activity");
     expect(session.closed).toBe(true);
   });
 });

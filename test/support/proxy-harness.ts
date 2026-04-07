@@ -5,6 +5,8 @@ import { clearConversationStateCacheForTests } from "../../src/conversation-stat
 import { type CursorRuntimeConfig, resolveRuntimeConfig } from "../../src/runtime-config";
 import { startProxy, stopProxy } from "../../src/server";
 
+let activeHarnessCount = 0;
+
 export interface ProxyHarness {
   port: number;
   baseUrl: string;
@@ -24,8 +26,12 @@ export async function startProxyHarness(
     runtimeConfig?: Partial<CursorRuntimeConfig>;
   } = {},
 ): Promise<ProxyHarness> {
+  if (activeHarnessCount > 0) {
+    throw new Error("startProxyHarness only supports one active harness at a time");
+  }
+  activeHarnessCount++;
   clearConversationStateCacheForTests();
-  const managedConversationDiskDir = !options.runtimeConfig?.conversationDiskDir;
+  const ownsConversationDiskDir = !options.runtimeConfig?.conversationDiskDir;
   const conversationDiskDir =
     options.runtimeConfig?.conversationDiskDir ??
     mkdtempSync(join(tmpdir(), "opencode-cursor-tests-"));
@@ -35,6 +41,7 @@ export async function startProxyHarness(
     conversationDiskDir,
     ...options.runtimeConfig,
   });
+  let closed = false;
 
   const harness: ProxyHarness = {
     port: 0,
@@ -56,14 +63,22 @@ export async function startProxyHarness(
       harness.runtimeConfig = runtimeConfig;
     },
     async close() {
+      if (closed) return;
+      closed = true;
       stopProxy();
       clearConversationStateCacheForTests();
-      if (managedConversationDiskDir) {
+      if (ownsConversationDiskDir) {
         rmSync(conversationDiskDir, { recursive: true, force: true });
       }
+      activeHarnessCount = Math.max(0, activeHarnessCount - 1);
     },
   };
 
-  await harness.restart();
-  return harness;
+  try {
+    await harness.restart();
+    return harness;
+  } catch (error) {
+    await harness.close();
+    throw error;
+  }
 }
