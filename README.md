@@ -119,23 +119,47 @@ bun run bundle   # bun build — produces dist/index.js + dist/sdk-wrapper.js
 bun run deploy   # bundle + copy to ~/.config/opencode/plugins/
 ```
 
-### Tests
+### Testing strategy
 
 ```sh
-bun test          # run all unit tests
-bun test:smoke    # run integration smoke tests only
+bun test                                      # full unit + integration + fuzz suite
+bun run test:smoke                            # smoke script against a real proxy instance
+bun test test/conversation-replay-recovery.test.ts
+bun test test/conversation-semantic-fuzz.test.ts
+SEMANTIC_FUZZ_COUNT=50 bun test test/conversation-semantic-fuzz.test.ts
 ```
 
-Unit tests live in `test/` and cover pure/stateful logic with no network I/O:
+The test suite is intentionally layered:
 
-| File | What it covers |
-|------|----------------|
-| `protocol.test.ts` | Connect frame encoding/decoding, split reassembly, oversized frame rejection |
-| `thinking-filter.test.ts` | Thinking tag stripping, partial tag buffering across chunks, flush |
-| `native-tools.test.ts` | `fixMcpArgNames` remapping, `nativeToMcpRedirect` for every exec type |
-| `openai-messages.test.ts` | `parseMessages` (multi-turn, tool results), `selectToolsForChoice`, `textContent` |
-| `event-queue.test.ts` | EventQueue FIFO ordering, waiter resolution, high-water mark overflow |
-| `cursor-session.test.ts` | `classifyConnectError` error classification |
+| Layer | Representative files | What it validates |
+|------|-----------------------|-------------------|
+| Pure unit/state logic | `protocol.test.ts`, `openai-messages.test.ts`, `native-tools.test.ts`, `event-queue.test.ts`, `cursor-session.test.ts` | Frame parsing, message parsing, tool redirection, queue behavior, error classification |
+| Session/state-machine edge cases | `batch-flush.test.ts`, `openai-stream.test.ts`, `server-compaction.test.ts` | Batch flushing, SSE lifecycle, checkpoint history/archive restore, timeout and cancellation semantics |
+| Fake Cursor backend integration | `network-failures.test.ts`, `conversation-happy-path.test.ts`, `conversation-advanced-coverage.test.ts` | End-to-end proxy behavior against a scriptable HTTP/2 Connect backend, including timeouts, retries, tool-call resumes, restart recovery, and multi-resume tool batches |
+| Semantic replay recovery | `conversation-replay-recovery.test.ts` | Record a golden multi-turn conversation, then replay it while failing once at each semantic communication point and verify the reconstructed frontend conversation still matches |
+| Seeded semantic fuzzing | `conversation-semantic-fuzz.test.ts` | Generate deterministic multi-turn/tool-call scenarios, sample semantic failure points, inject resets/destroys, and assert final conversation equality plus at-most-once frontend tool execution |
+| Smoke script | `test/smoke.ts` | High-level plugin sanity checks: proxy startup, auth helpers, model discovery fallback, and export shape |
+
+The reusable test harness lives in `test/support/`:
+
+- `fake-cursor-backend.ts` implements a scriptable fake Cursor backend over HTTP/2 Connect + protobuf.
+- `openai-conversation-driver.ts` acts as a fake OpenAI frontend, including retry semantics and tool-result caching by `tool_call_id`.
+- `proxy-harness.ts` starts the local proxy with isolated runtime config and temporary conversation storage, and can restart it in-place to exercise disk-backed recovery.
+
+### Fuzzing
+
+The project uses **semantic fuzzing**, not raw byte fuzzing, as its primary fuzzing strategy.
+
+- Scenarios are generated from fixed seeds so failures are reproducible.
+- `SEMANTIC_FUZZ_COUNT` controls how many seeded scenarios are generated; if it is unset, the suite falls back to its built-in default seed count.
+- Each seed produces a small conversation in the currently supported recoverable space: multiple turns, optional tool-use turns, and 1-2 tool calls in a batch.
+- The suite first runs a golden conversation, records the semantic communication points, then replays sampled points with a single injected upstream `reset` or `destroy`.
+- The main invariants are:
+  - final normalized conversation matches the golden run
+  - per-turn assistant/reasoning output matches the golden run
+  - frontend tool execution remains at-most-once for each unique `tool_call_id`
+
+The semantic fuzz generator is intentionally bounded for CI stability. More complex multi-batch / multi-resume flows are still covered by dedicated deterministic tests such as `conversation-advanced-coverage.test.ts`.
 
 ### Pre-commit checks
 
