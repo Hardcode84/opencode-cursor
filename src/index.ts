@@ -65,11 +65,13 @@ export const CursorAuthPlugin: Plugin = async (input: PluginInput): Promise<Hook
         }
 
         const discovery = await getCursorModels(accessToken);
-        if (discovery.usedFallback) {
+        if (discovery.source === "fallback") {
           logWarn(
             "Model discovery failed -- using hardcoded fallback list. " +
               "Some models may be missing or outdated.",
           );
+        } else if (discovery.source === "get_usable_models") {
+          logWarn("AvailableModels RPC unavailable -- context windows may be inaccurate.");
         }
         const models = discovery.models;
 

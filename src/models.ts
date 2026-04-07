@@ -1,59 +1,61 @@
 /**
- * Cursor model discovery via GetUsableModels.
- * Uses the H2 bridge for transport. Falls back to a hardcoded list
- * when discovery fails.
+ * Cursor model discovery.
+ *
+ * 1. AvailableModels RPC → model list + capabilities.
+ * 2. GetEffectiveTokenLimit RPC (parallel) → per-model context window.
+ * 3. Fallback: GetUsableModels + hardcoded MODEL_LIMITS.
  */
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
-import { z } from "zod";
 import { callCursorUnaryRpc } from "./cursor-session";
-import { GetUsableModelsRequestSchema, GetUsableModelsResponseSchema } from "./proto/agent_pb";
-import { CONNECT_END_STREAM_FLAG } from "./protocol";
+import { logDebug, logWarn } from "./logger";
+import {
+  GetUsableModelsRequestSchema,
+  type GetUsableModelsResponse,
+  GetUsableModelsResponseSchema,
+} from "./proto/agent_pb";
+import {
+  AvailableModelsRequestSchema,
+  type AvailableModelsResponse,
+  type AvailableModelsResponse_AvailableModel,
+  AvailableModelsResponseSchema,
+} from "./proto/aiserver_pb";
+import { decodeConnectUnaryBody } from "./protocol";
 
-// TODO: switch to aiserver.v1.AvailableModels which returns per-model
-// context_token_limit and context_token_limit_for_max_mode fields.
-// agent.v1.GetUsableModels lacks context window info entirely.
+const AVAILABLE_MODELS_PATH = "/aiserver.v1.AiService/AvailableModels";
 const GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
+const GET_EFFECTIVE_TOKEN_LIMIT_PATH = "/aiserver.v1.AiService/GetEffectiveTokenLimit";
 
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 const DEFAULT_MAX_TOKENS = 64_000;
+const AVAILABLE_MODELS_TIMEOUT_MS = 8_000;
+const TOKEN_LIMIT_TIMEOUT_MS = 5_000;
+const TOKEN_LIMIT_CONCURRENCY = 12;
 
+/** Last-resort hardcoded fallback (values from GetEffectiveTokenLimit). */
 const MODEL_LIMITS: Record<string, { context?: number; maxTokens?: number }> = {
-  // Claude -- 1M variants
+  "claude-4-sonnet": { context: 1_000_000 },
   "claude-4-sonnet-1m": { context: 1_000_000 },
-  "claude-4.5-opus": { context: 200_000, maxTokens: 128_000 },
-  "claude-4.6-opus": { context: 200_000, maxTokens: 128_000 },
-  "claude-4.6-opus-fast": { context: 200_000, maxTokens: 128_000 },
-  "claude-4.6-opus-high": { context: 200_000, maxTokens: 128_000 },
-  // GPT -- larger contexts
-  "gpt-5.2": { context: 400_000, maxTokens: 128_000 },
-  "gpt-5.2-codex": { context: 400_000, maxTokens: 128_000 },
-  "gpt-5.3-codex": { context: 400_000, maxTokens: 128_000 },
-  "gpt-5.4": { context: 272_000, maxTokens: 128_000 },
-  "gpt-5.4-medium": { context: 272_000, maxTokens: 128_000 },
-  // Gemini -- 1M+
-  "gemini-3-pro": { context: 1_000_000 },
-  "gemini-3.1-pro": { context: 1_000_000 },
-  "gemini-3-flash": { context: 1_000_000 },
+  "claude-4.5-haiku": { context: 200_000 },
+  "claude-4.5-opus": { context: 1_000_000 },
+  "claude-4.5-sonnet": { context: 1_000_000 },
+  "claude-4.6-opus": { context: 1_000_000 },
+  "claude-4.6-sonnet": { context: 1_000_000 },
+  "composer-1.5": { context: 1_000_000 },
+  "composer-2": { context: 200_000 },
   "gemini-2.5-flash": { context: 1_000_000 },
+  "gemini-3-flash": { context: 1_000_000 },
+  "gemini-3.1-pro": { context: 1_000_000 },
+  "gpt-5.1": { context: 272_000 },
+  "gpt-5.1-codex-max": { context: 272_000 },
+  "gpt-5.1-codex-mini": { context: 272_000 },
+  "gpt-5.2": { context: 272_000 },
+  "gpt-5.2-codex": { context: 272_000 },
+  "gpt-5.3-codex": { context: 272_000 },
+  "gpt-5.3-codex-spark-preview": { context: 128_000 },
+  "gpt-5.4": { context: 922_000 },
+  "gpt-5.4-mini": { context: 272_000 },
+  "gpt-5.4-nano": { context: 272_000 },
 };
-
-const CursorModelDetailsSchema = z.object({
-  modelId: z.string(),
-  displayName: z.string().optional().catch(undefined),
-  displayNameShort: z.string().optional().catch(undefined),
-  displayModelId: z.string().optional().catch(undefined),
-  aliases: z
-    .array(z.unknown())
-    .optional()
-    .catch([])
-    .transform((aliases) =>
-      (aliases ?? []).filter((alias: unknown): alias is string => typeof alias === "string"),
-    ),
-  thinkingDetails: z.unknown().optional(),
-  maxMode: z.boolean().optional().catch(undefined),
-});
-
-type CursorModelDetails = z.infer<typeof CursorModelDetailsSchema>;
 
 export interface CursorModel {
   id: string;
@@ -64,7 +66,6 @@ export interface CursorModel {
 }
 
 const FALLBACK_MODELS: CursorModel[] = [
-  // Composer models
   {
     id: "composer-1",
     name: "Composer 1",
@@ -76,62 +77,44 @@ const FALLBACK_MODELS: CursorModel[] = [
     id: "composer-1.5",
     name: "Composer 1.5",
     reasoning: true,
-    contextWindow: 200_000,
+    contextWindow: 1_000_000,
     maxTokens: 64_000,
   },
-  // Claude models
   {
     id: "claude-4.6-opus-high",
     name: "Claude 4.6 Opus",
     reasoning: true,
-    contextWindow: 200_000,
+    contextWindow: 1_000_000,
     maxTokens: 128_000,
   },
   {
     id: "claude-4.6-sonnet-medium",
     name: "Claude 4.6 Sonnet",
     reasoning: true,
-    contextWindow: 200_000,
+    contextWindow: 1_000_000,
     maxTokens: 64_000,
   },
   {
     id: "claude-4.5-sonnet",
     name: "Claude 4.5 Sonnet",
     reasoning: true,
-    contextWindow: 200_000,
+    contextWindow: 1_000_000,
     maxTokens: 64_000,
   },
-  // GPT models
   {
     id: "gpt-5.4-medium",
     name: "GPT-5.4",
     reasoning: true,
+    contextWindow: 922_000,
+    maxTokens: 128_000,
+  },
+  {
+    id: "gpt-5.2",
+    name: "GPT-5.2",
+    reasoning: true,
     contextWindow: 272_000,
     maxTokens: 128_000,
   },
-  { id: "gpt-5.2", name: "GPT-5.2", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
-  {
-    id: "gpt-5.2-codex",
-    name: "GPT-5.2 Codex",
-    reasoning: true,
-    contextWindow: 400_000,
-    maxTokens: 128_000,
-  },
-  {
-    id: "gpt-5.3-codex",
-    name: "GPT-5.3 Codex",
-    reasoning: true,
-    contextWindow: 400_000,
-    maxTokens: 128_000,
-  },
-  {
-    id: "gpt-5.3-codex-spark-preview",
-    name: "GPT-5.3 Codex Spark",
-    reasoning: true,
-    contextWindow: 128_000,
-    maxTokens: 128_000,
-  },
-  // Other models
   {
     id: "gemini-3.1-pro",
     name: "Gemini 3.1 Pro",
@@ -139,55 +122,318 @@ const FALLBACK_MODELS: CursorModel[] = [
     contextWindow: 1_000_000,
     maxTokens: 64_000,
   },
-  {
-    id: "grok-code-fast-1",
-    name: "Grok Code Fast 1",
-    reasoning: false,
-    contextWindow: 128_000,
-    maxTokens: 64_000,
-  },
 ];
 
-async function fetchCursorUsableModels(apiKey: string): Promise<CursorModel[] | null> {
-  try {
-    const requestPayload = create(GetUsableModelsRequestSchema, {});
-    const requestBody = toBinary(GetUsableModelsRequestSchema, requestPayload);
+// ---------------------------------------------------------------------------
+// GetEffectiveTokenLimit RPC — manual wire encoding
+// ---------------------------------------------------------------------------
 
+/** Encode a protobuf varint. */
+export function encodeVarint(value: number): Uint8Array {
+  const bytes: number[] = [];
+  let v = value >>> 0;
+  while (v > 0x7f) {
+    bytes.push((v & 0x7f) | 0x80);
+    v >>>= 7;
+  }
+  bytes.push(v);
+  return new Uint8Array(bytes);
+}
+
+/**
+ * Encode GetEffectiveTokenLimitRequest.
+ * Wire layout: field 1 (model_details message) → field 1 (model_id string).
+ * The server only needs model_id; extra ModelDetails fields are rejected.
+ */
+export function encodeTokenLimitRequest(modelId: string): Uint8Array {
+  const id = new TextEncoder().encode(modelId);
+  const idLen = encodeVarint(id.length);
+  const inner = new Uint8Array(1 + idLen.length + id.length);
+  inner[0] = 0x0a; // field 1, wire type 2
+  inner.set(idLen, 1);
+  inner.set(id, 1 + idLen.length);
+
+  const innerLen = encodeVarint(inner.length);
+  const outer = new Uint8Array(1 + innerLen.length + inner.length);
+  outer[0] = 0x0a; // field 1, wire type 2
+  outer.set(innerLen, 1);
+  outer.set(inner, 1 + innerLen.length);
+  return outer;
+}
+
+/** Decode varint starting at offset. Returns [value, newOffset]. */
+function readVarint(buf: Uint8Array, off: number): [number, number] {
+  let val = 0;
+  let shift = 0;
+  while (off < buf.length) {
+    const b = buf[off++]!;
+    val |= (b & 0x7f) << shift;
+    shift += 7;
+    if ((b & 0x80) === 0) break;
+  }
+  return [val >>> 0, off];
+}
+
+/**
+ * Decode GetEffectiveTokenLimitResponse.
+ * Handles both raw protobuf and Connect-framed responses.
+ */
+export function decodeTokenLimitResponse(body: Uint8Array): number | null {
+  if (body.length === 0) return null;
+  if (body[0] === 0x7b) return null; // '{' = JSON error
+
+  const parsed = parseTokenLimitField(body);
+  if (parsed !== null) return parsed;
+
+  // Try Connect framing unwrap
+  const unframed = decodeConnectUnaryBody(body);
+  if (unframed) return parseTokenLimitField(unframed);
+
+  return null;
+}
+
+function parseTokenLimitField(buf: Uint8Array): number | null {
+  if (buf.length < 2) return null;
+  const tag = buf[0]!;
+  if (tag >> 3 !== 1 || (tag & 7) !== 0) return null;
+  const [val] = readVarint(buf, 1);
+  return val > 0 ? val : null;
+}
+
+async function fetchTokenLimit(apiKey: string, modelId: string): Promise<number | null> {
+  try {
+    const response = await callCursorUnaryRpc({
+      accessToken: apiKey,
+      rpcPath: GET_EFFECTIVE_TOKEN_LIMIT_PATH,
+      requestBody: encodeTokenLimitRequest(modelId),
+      timeoutMs: TOKEN_LIMIT_TIMEOUT_MS,
+    });
+    if (response.timedOut || response.exitCode !== 0) {
+      logDebug("[models] GetEffectiveTokenLimit failed", {
+        model: modelId,
+        timedOut: response.timedOut,
+        exitCode: response.exitCode,
+      });
+      return null;
+    }
+    return decodeTokenLimitResponse(response.body);
+  } catch (err) {
+    logDebug("[models] GetEffectiveTokenLimit error", {
+      model: modelId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+/** Fetch token limits for multiple models in parallel with bounded concurrency. */
+async function fetchTokenLimits(apiKey: string, modelIds: string[]): Promise<Map<string, number>> {
+  const limits = new Map<string, number>();
+  const queue = [...modelIds];
+  let idx = 0;
+
+  async function worker() {
+    while (idx < queue.length) {
+      const i = idx++;
+      const modelId = queue[i]!;
+      const limit = await fetchTokenLimit(apiKey, modelId);
+      if (limit !== null) limits.set(modelId, limit);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(TOKEN_LIMIT_CONCURRENCY, queue.length) }, () =>
+    worker(),
+  );
+  await Promise.all(workers);
+  return limits;
+}
+
+// ---------------------------------------------------------------------------
+// Primary path: AvailableModels + GetEffectiveTokenLimit
+// ---------------------------------------------------------------------------
+
+async function fetchAvailableModels(apiKey: string): Promise<CursorModel[] | null> {
+  try {
+    const req = create(AvailableModelsRequestSchema, {
+      includeLongContextModels: true,
+      includeHiddenModels: true,
+    });
+
+    const response = await callCursorUnaryRpc({
+      accessToken: apiKey,
+      rpcPath: AVAILABLE_MODELS_PATH,
+      requestBody: toBinary(AvailableModelsRequestSchema, req),
+      timeoutMs: AVAILABLE_MODELS_TIMEOUT_MS,
+    });
+
+    if (response.timedOut || response.exitCode !== 0 || response.body.length === 0) {
+      logWarn("[models] AvailableModels RPC failed", {
+        timedOut: response.timedOut,
+        exitCode: response.exitCode,
+        bodyLen: response.body.length,
+      });
+      return null;
+    }
+
+    const decoded = decodeConnectResponse<AvailableModelsResponse>(
+      AvailableModelsResponseSchema,
+      response.body,
+    );
+    if (!decoded || decoded.models.length === 0) {
+      logWarn("[models] AvailableModels returned empty");
+      return null;
+    }
+
+    const modelIds = decoded.models.map((m) => m.name).filter(Boolean);
+    const tokenLimits = await fetchTokenLimits(apiKey, modelIds);
+
+    logDebug("[models] GetEffectiveTokenLimit results", {
+      requested: modelIds.length,
+      resolved: tokenLimits.size,
+    });
+
+    const models = decoded.models
+      .map((m) => normalizeAvailableModel(m, tokenLimits))
+      .filter((m): m is CursorModel => m !== null);
+
+    logDebug("[models] AvailableModels discovery complete", {
+      total: decoded.models.length,
+      usable: models.length,
+    });
+    return models.length > 0 ? models : null;
+  } catch (err) {
+    logWarn("[models] AvailableModels RPC error", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+function normalizeAvailableModel(
+  m: AvailableModelsResponse_AvailableModel,
+  tokenLimits: Map<string, number>,
+): CursorModel | null {
+  const id = m.name?.trim();
+  if (!id) return null;
+
+  const serverLimit = tokenLimits.get(id);
+  const context = serverLimit ?? fallbackContext(id);
+
+  return {
+    id,
+    name: m.clientDisplayName?.trim() || id,
+    reasoning: m.supportsThinking === true,
+    contextWindow: context,
+    maxTokens: DEFAULT_MAX_TOKENS,
+  };
+}
+
+function fallbackContext(modelId: string): number {
+  const exact = MODEL_LIMITS[modelId];
+  if (exact?.context) return exact.context;
+
+  const base = modelId.replace(
+    /-(max-thinking|thinking|max|high|medium|low|fast|xhigh|none)$/g,
+    "",
+  );
+  if (base !== modelId) {
+    const baseLimits = MODEL_LIMITS[base];
+    if (baseLimits?.context) return baseLimits.context;
+  }
+
+  return DEFAULT_CONTEXT_WINDOW;
+}
+
+// ---------------------------------------------------------------------------
+// Fallback: agent.v1.GetUsableModels (no context window info)
+// ---------------------------------------------------------------------------
+
+async function fetchGetUsableModels(apiKey: string): Promise<CursorModel[] | null> {
+  try {
+    const requestBody = toBinary(
+      GetUsableModelsRequestSchema,
+      create(GetUsableModelsRequestSchema, {}),
+    );
     const response = await callCursorUnaryRpc({
       accessToken: apiKey,
       rpcPath: GET_USABLE_MODELS_PATH,
       requestBody,
     });
 
-    if (response.timedOut || response.exitCode !== 0 || response.body.length === 0) {
-      return null;
-    }
+    if (response.timedOut || response.exitCode !== 0 || response.body.length === 0) return null;
 
-    const decoded = decodeGetUsableModelsResponse(response.body);
+    const decoded = decodeConnectResponse<GetUsableModelsResponse>(
+      GetUsableModelsResponseSchema,
+      response.body,
+    );
     if (!decoded) return null;
 
-    const models = normalizeCursorModels(decoded.models);
+    const models = normalizeLegacyModels(decoded.models);
     return models.length > 0 ? models : null;
   } catch {
     return null;
   }
 }
 
+function normalizeLegacyModels(models: readonly unknown[]): CursorModel[] {
+  const byId = new Map<string, CursorModel>();
+  for (const model of models) {
+    const m = model as Record<string, unknown>;
+    const id = (typeof m.modelId === "string" ? m.modelId : "").trim();
+    if (!id) continue;
+
+    const ctx = fallbackContext(id);
+    const exactLimits = MODEL_LIMITS[id];
+
+    byId.set(id, {
+      id,
+      name: pickLegacyName(m, id),
+      reasoning: Boolean(m.thinkingDetails),
+      contextWindow: ctx,
+      maxTokens: exactLimits?.maxTokens ?? DEFAULT_MAX_TOKENS,
+    });
+  }
+  return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function pickLegacyName(model: Record<string, unknown>, fallbackId: string): string {
+  for (const key of ["displayName", "displayNameShort", "displayModelId"]) {
+    const v = model[key];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return fallbackId;
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
 export interface ModelDiscoveryResult {
   models: CursorModel[];
-  usedFallback: boolean;
+  source: "available_models" | "get_usable_models" | "fallback";
 }
 
 let cachedResult: ModelDiscoveryResult | null = null;
 
 export async function getCursorModels(apiKey: string): Promise<ModelDiscoveryResult> {
   if (cachedResult) return cachedResult;
-  const discovered = await fetchCursorUsableModels(apiKey);
-  const usedFallback = !discovered || discovered.length === 0;
-  cachedResult = {
-    models: usedFallback ? FALLBACK_MODELS : discovered,
-    usedFallback,
-  };
+
+  const available = await fetchAvailableModels(apiKey);
+  if (available && available.length > 0) {
+    cachedResult = { models: available, source: "available_models" };
+    logDebug("[models] Using AvailableModels", { count: available.length });
+    return cachedResult;
+  }
+
+  const usable = await fetchGetUsableModels(apiKey);
+  if (usable && usable.length > 0) {
+    cachedResult = { models: usable, source: "get_usable_models" };
+    logWarn("[models] Fell back to GetUsableModels", { count: usable.length });
+    return cachedResult;
+  }
+
+  cachedResult = { models: FALLBACK_MODELS, source: "fallback" };
+  logWarn("[models] Using hardcoded fallback models");
   return cachedResult;
 }
 
@@ -196,115 +442,23 @@ export function clearModelCache(): void {
   cachedResult = null;
 }
 
-function decodeGetUsableModelsResponse(payload: Uint8Array): {
-  models: readonly unknown[];
-} | null {
+// ---------------------------------------------------------------------------
+// Connect-protocol decode helpers
+// ---------------------------------------------------------------------------
+
+function decodeConnectResponse<T>(
+  schema: Parameters<typeof fromBinary>[0],
+  payload: Uint8Array,
+): T | null {
   try {
-    return fromBinary(GetUsableModelsResponseSchema, payload);
+    return fromBinary(schema, payload) as T;
   } catch {
     const framedBody = decodeConnectUnaryBody(payload);
     if (!framedBody) return null;
     try {
-      return fromBinary(GetUsableModelsResponseSchema, framedBody);
+      return fromBinary(schema, framedBody) as T;
     } catch {
       return null;
     }
   }
-}
-
-function decodeConnectUnaryBody(payload: Uint8Array): Uint8Array | null {
-  if (payload.length < 5) return null;
-
-  let offset = 0;
-  while (offset + 5 <= payload.length) {
-    const flags = payload[offset]!;
-    const view = new DataView(
-      payload.buffer,
-      payload.byteOffset + offset,
-      payload.byteLength - offset,
-    );
-    const messageLength = view.getUint32(1, false);
-    const frameEnd = offset + 5 + messageLength;
-    if (frameEnd > payload.length) return null;
-
-    // Compression flag
-    if ((flags & 0b0000_0001) !== 0) return null;
-
-    if ((flags & CONNECT_END_STREAM_FLAG) === 0) {
-      return payload.subarray(offset + 5, frameEnd);
-    }
-
-    offset = frameEnd;
-  }
-
-  return null;
-}
-
-function normalizeCursorModels(models: readonly unknown[]): CursorModel[] {
-  if (models.length === 0) return [];
-
-  const byId = new Map<string, CursorModel>();
-  for (const model of models) {
-    const normalized = normalizeSingleModel(model);
-    if (normalized) byId.set(normalized.id, normalized);
-  }
-  return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
-}
-
-function normalizeSingleModel(model: unknown): CursorModel | null {
-  const parsed = CursorModelDetailsSchema.safeParse(model);
-  if (!parsed.success) return null;
-
-  const details = parsed.data;
-  const id = details.modelId.trim();
-  if (!id) return null;
-
-  const limits = resolveModelLimits(id, details.maxMode);
-  return {
-    id,
-    name: pickDisplayName(details, id),
-    reasoning: Boolean(details.thinkingDetails),
-    contextWindow: limits.context,
-    maxTokens: limits.maxTokens,
-  };
-}
-
-function resolveModelLimits(
-  modelId: string,
-  maxMode?: boolean,
-): { context: number; maxTokens: number } {
-  const isMax = maxMode || /-max(?:-|$)/.test(modelId);
-  const exact = MODEL_LIMITS[modelId];
-  if (exact) {
-    let context = exact.context ?? DEFAULT_CONTEXT_WINDOW;
-    if (isMax) context = Math.max(context, 1_000_000);
-    return { context, maxTokens: exact.maxTokens ?? DEFAULT_MAX_TOKENS };
-  }
-  // Strip suffixes like "-max-thinking", "-thinking", "-max" and retry
-  const base = modelId.replace(/-(max-thinking|thinking|max|high|medium|low|fast|xhigh)$/g, "");
-  if (base !== modelId) {
-    const baseLimits = MODEL_LIMITS[base];
-    if (baseLimits) {
-      let context = baseLimits.context ?? DEFAULT_CONTEXT_WINDOW;
-      if (isMax) context = Math.max(context, 1_000_000);
-      return { context, maxTokens: baseLimits.maxTokens ?? DEFAULT_MAX_TOKENS };
-    }
-  }
-  return { context: isMax ? 1_000_000 : DEFAULT_CONTEXT_WINDOW, maxTokens: DEFAULT_MAX_TOKENS };
-}
-
-function pickDisplayName(model: CursorModelDetails, fallbackId: string): string {
-  const candidates = [
-    model.displayName,
-    model.displayNameShort,
-    model.displayModelId,
-    ...model.aliases,
-    fallbackId,
-  ];
-  for (const candidate of candidates) {
-    if (typeof candidate !== "string") continue;
-    const trimmed = candidate.trim();
-    if (trimmed) return trimmed;
-  }
-  return fallbackId;
 }

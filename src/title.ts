@@ -4,6 +4,7 @@ import { logInfo } from "./logger";
 import { textContent } from "./openai-messages";
 import { SSE_HEADERS } from "./openai-stream";
 import { NameAgentRequestSchema, NameAgentResponseSchema } from "./proto/agent_pb";
+import { decodeConnectUnaryBody } from "./protocol";
 
 const TITLE_REQUEST_MARKER = "Generate a title for this conversation:";
 
@@ -79,8 +80,7 @@ export async function handleTitleGenerationRequest(
     if (response.timedOut || response.exitCode !== 0) {
       title = deriveFallbackTitle(sourceText);
     } else {
-      let payload = response.body;
-      if (payload.length > 5 && payload[0] === 0x00) payload = payload.slice(5);
+      const payload = decodeConnectUnaryBody(response.body) ?? response.body;
       const decoded = fromBinary(NameAgentResponseSchema, payload);
       title = finalizeTitle(decoded.name) || deriveFallbackTitle(sourceText);
     }

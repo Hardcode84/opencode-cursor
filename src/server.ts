@@ -348,16 +348,10 @@ function buildCursorRequest(
     },
   });
 
-  const modelDetails = create(ModelDetailsSchema, {
-    modelId,
-    displayModelId: modelId,
-    displayName: modelId,
-  });
-
   const runRequest = create(AgentRunRequestSchema, {
     conversationState,
     action,
-    modelDetails,
+    modelDetails: createModelDetails(modelId),
     conversationId,
   });
 
@@ -396,16 +390,10 @@ function buildResumeRequest(
     },
   });
 
-  const modelDetails = create(ModelDetailsSchema, {
-    modelId,
-    displayModelId: modelId,
-    displayName: modelId,
-  });
-
   const runRequest = create(AgentRunRequestSchema, {
     conversationState,
     action,
-    modelDetails,
+    modelDetails: createModelDetails(modelId),
     conversationId,
   });
 
@@ -418,6 +406,15 @@ function buildResumeRequest(
     blobStore,
     mcpTools,
   };
+}
+
+function createModelDetails(modelId: string) {
+  return create(ModelDetailsSchema, {
+    modelId,
+    displayModelId: modelId,
+    displayName: modelId,
+    maxMode: true,
+  });
 }
 
 // ---------------------------------------------------------------------------

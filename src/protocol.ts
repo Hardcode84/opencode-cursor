@@ -42,6 +42,31 @@ export function createConnectFrameParser(
   };
 }
 
+/** Extract the first data frame from a Connect unary response (5-byte header + payload). */
+export function decodeConnectUnaryBody(payload: Uint8Array): Uint8Array | null {
+  if (payload.length < 5) return null;
+
+  let offset = 0;
+  while (offset + 5 <= payload.length) {
+    const flags = payload[offset]!;
+    const view = new DataView(
+      payload.buffer,
+      payload.byteOffset + offset,
+      payload.byteLength - offset,
+    );
+    const messageLength = view.getUint32(1, false);
+    const frameEnd = offset + 5 + messageLength;
+    if (frameEnd > payload.length) return null;
+    if ((flags & 0b0000_0001) !== 0) return null;
+    if ((flags & CONNECT_END_STREAM_FLAG) === 0) {
+      return payload.subarray(offset + 5, frameEnd);
+    }
+    offset = frameEnd;
+  }
+
+  return null;
+}
+
 export function parseConnectEndStream(data: Uint8Array): Error | null {
   try {
     const payload = JSON.parse(new TextDecoder().decode(data));
