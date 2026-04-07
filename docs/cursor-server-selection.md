@@ -133,11 +133,11 @@ entirely from `getCursorCreds()` (Cursor host API) and hardcoded defaults
 
 ## Implications for Our Proxy
 
-Our proxy now uses `api2.cursor.sh` directly for API calls and
-`api5.cursor.sh` as its default agent host. That is closer to real Cursor
-hostnames, but it still does not mirror the credential-driven routing from
-`getCursorCreds()`. The `api3/4/5/gcpp → api2` rewrite when HTTP/2 is
-unavailable is the only "failover" logic that exists in the real agent.
+Our proxy now uses `api2.cursor.sh` directly for API calls and as the default
+agent host. That matches the original upstream fork more closely, but it still
+does not mirror the credential-driven routing from `getCursorCreds()`. The
+`api3/4/5/gcpp → api2` rewrite when HTTP/2 is unavailable is the only
+"failover" logic that exists in the real agent.
 
 Our `CURSOR_API_URL` / `CURSOR_AGENT_URL` env overrides are proxy-specific
 and have no counterpart in the Cursor agent.

@@ -196,7 +196,7 @@ updates.
 |----------|---------|-------------|
 | `CURSOR_PROXY_DEBUG` | `0` | Set to `1` to enable verbose console logging |
 | `CURSOR_API_URL` | `https://api2.cursor.sh` | Override Cursor API base URL |
-| `CURSOR_AGENT_URL` | `https://api5.cursor.sh` | Override Cursor agent streaming URL |
+| `CURSOR_AGENT_URL` | `https://api2.cursor.sh` | Override Cursor agent streaming URL |
 | `SEMANTIC_FUZZ_COUNT` | `5` | Number of seeded semantic fuzz scenarios to generate when running `test/conversation-semantic-fuzz.test.ts` |
 | `SEMANTIC_FUZZ_FAILURE_POINT_COUNT` | `8` | Number of semantic communication points to replay per fuzz seed in `test/conversation-semantic-fuzz.test.ts` |
 

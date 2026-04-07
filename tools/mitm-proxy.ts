@@ -6,7 +6,7 @@
  *
  * Setup:
  *   1. bun tools/mitm-proxy.ts --gen-certs
- *   2. sudo -- sh -c 'echo "127.0.0.1 api5.cursor.sh" >> /etc/hosts'
+ *   2. sudo -- sh -c 'echo "127.0.0.1 api2.cursor.sh" >> /etc/hosts'
  *   3. sudo bun tools/mitm-proxy.ts
  *   4. NODE_EXTRA_CA_CERTS=$PWD/tools/certs/ca.pem cursor .
  *   5. Use Cursor, then remove hosts entry.
@@ -17,7 +17,7 @@
  *
  * Env vars:
  *   MITM_PORT       — listen port (default: 443)
- *   MITM_TARGET     — upstream host (default: api5.cursor.sh)
+ *   MITM_TARGET     — upstream host (default: api2.cursor.sh)
  *   MITM_TARGET_IP  — skip DNS, connect to this IP
  *   MITM_CAPTURES   — capture dir (default: /tmp/mitm-captures)
  */
@@ -28,7 +28,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, createWriteStream }
 import { execSync } from "node:child_process";
 import { resolve, join } from "node:path";
 
-const TARGET_HOST = process.env.MITM_TARGET || "api5.cursor.sh";
+const TARGET_HOST = process.env.MITM_TARGET || "api2.cursor.sh";
 const LISTEN_PORT = parseInt(process.env.MITM_PORT || "443");
 const CERT_DIR = join(resolve(import.meta.dir), "certs");
 const CAPTURE_DIR = process.env.MITM_CAPTURES || "/tmp/mitm-captures";
