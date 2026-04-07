@@ -17,12 +17,8 @@ import {
   type McpToolDefinition,
 } from "./proto/agent_pb";
 import { createConnectFrameParser, frameConnectMessage, parseConnectEndStream } from "./protocol";
+import { type CursorRuntimeConfig, resolveRuntimeConfig } from "./runtime-config";
 
-const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
-const CURSOR_AGENT_URL = process.env.CURSOR_AGENT_URL ?? "https://agentn.us.api5.cursor.sh";
-const CURSOR_CLIENT_VERSION = "cli-2026.03.30-a5d3e17";
-const THINKING_TIMEOUT_MS = 30_000;
-const STREAMING_TIMEOUT_MS = 15_000;
 const CLOSE_OK = 0;
 const CLOSE_ERR = 1;
 
@@ -56,6 +52,7 @@ export interface SessionOptions {
   mcpTools: McpToolDefinition[];
   cloudRule?: string;
   convKey: string;
+  runtimeConfig?: Partial<CursorRuntimeConfig>;
   onCheckpoint?: (bytes: Uint8Array, blobStore: Map<string, Uint8Array>) => void;
   /** @internal Test-only: override collecting-state inactivity timeout (ms). */
   _testCollectingTimeoutMs?: number;
@@ -92,6 +89,7 @@ export class CursorSession implements BridgeWriter {
   readonly blobStore: Map<string, Uint8Array>;
   readonly accessToken: string;
   readonly options: SessionOptions;
+  readonly runtimeConfig: CursorRuntimeConfig;
 
   constructor(options: SessionOptions) {
     this.queue = new EventQueue<SessionEvent>({
@@ -103,6 +101,7 @@ export class CursorSession implements BridgeWriter {
     this.options = options;
     this.blobStore = options.blobStore;
     this.accessToken = options.accessToken;
+    this.runtimeConfig = resolveRuntimeConfig(options.runtimeConfig);
 
     this.streamState = {
       toolCallIndex: 0,
@@ -115,7 +114,7 @@ export class CursorSession implements BridgeWriter {
       lastDeltaType: null,
     };
 
-    const { connectUrl, authority } = resolveCursorH2Target(CURSOR_AGENT_URL);
+    const { connectUrl, authority } = resolveCursorH2Target(this.runtimeConfig.agentUrl);
     const requestId = randomUUID();
     const traceId = randomBytes(16).toString("hex");
     const spanId = randomBytes(8).toString("hex");
@@ -140,7 +139,7 @@ export class CursorSession implements BridgeWriter {
       "user-agent": "connect-es/1.6.1",
       authorization: `Bearer ${this.accessToken}`,
       "x-ghost-mode": "true",
-      "x-cursor-client-version": CURSOR_CLIENT_VERSION,
+      "x-cursor-client-version": this.runtimeConfig.clientVersion,
       "x-cursor-client-type": "cli",
       "x-request-id": requestId,
       "x-original-request-id": requestId,
@@ -323,15 +322,17 @@ export class CursorSession implements BridgeWriter {
     // or the H2 connection drops. Heartbeats keep the wire warm.
     if (this.batchState === "flushed") return;
     // Collecting with pending execs: non-sliding deadline so heartbeats can't prevent flush.
-    // Reuses THINKING_TIMEOUT_MS -- same ceiling as the idle-before-first-token phase.
     if (this.batchState === "collecting" && this.pendingExecs.length > 0) {
       if (this.inactivityTimer) return;
-      const ms = this.options._testCollectingTimeoutMs ?? THINKING_TIMEOUT_MS;
+      const ms = this.options._testCollectingTimeoutMs ?? this.runtimeConfig.collectingTimeoutMs;
       this.inactivityTimer = setTimeout(() => this.onInactivityFire(), ms);
       return;
     }
     this.clearInactivityTimer();
-    const ms = this.timerPhase === "thinking" ? THINKING_TIMEOUT_MS : STREAMING_TIMEOUT_MS;
+    const ms =
+      this.timerPhase === "thinking"
+        ? this.runtimeConfig.thinkingTimeoutMs
+        : this.runtimeConfig.streamingTimeoutMs;
     this.inactivityTimer = setTimeout(() => this.onInactivityFire(), ms);
   }
 
@@ -449,12 +450,14 @@ interface CursorUnaryRpcOptions {
   requestBody: Uint8Array;
   url?: string;
   timeoutMs?: number;
+  runtimeConfig?: Partial<CursorRuntimeConfig>;
 }
 
 export async function callCursorUnaryRpc(
   options: CursorUnaryRpcOptions,
 ): Promise<{ body: Uint8Array; exitCode: number; timedOut: boolean }> {
-  const { connectUrl, authority } = resolveCursorH2Target(options.url ?? CURSOR_API_URL);
+  const runtimeConfig = resolveRuntimeConfig(options.runtimeConfig);
+  const { connectUrl, authority } = resolveCursorH2Target(options.url ?? runtimeConfig.apiUrl);
   const requestId = randomUUID();
   const { promise, resolve } = Promise.withResolvers<{
     body: Uint8Array;
@@ -499,7 +502,7 @@ export async function callCursorUnaryRpc(
     "user-agent": "connect-es/1.6.1",
     authorization: `Bearer ${options.accessToken}`,
     "x-ghost-mode": "true",
-    "x-cursor-client-version": CURSOR_CLIENT_VERSION,
+    "x-cursor-client-version": runtimeConfig.clientVersion,
     "x-cursor-client-type": "cli",
     "x-request-id": requestId,
   };

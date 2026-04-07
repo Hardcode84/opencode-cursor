@@ -5,6 +5,7 @@ import { textContent } from "./openai-messages";
 import { SSE_HEADERS } from "./openai-stream";
 import { NameAgentRequestSchema, NameAgentResponseSchema } from "./proto/agent_pb";
 import { decodeConnectUnaryBody } from "./protocol";
+import type { CursorRuntimeConfig } from "./runtime-config";
 
 const TITLE_REQUEST_MARKER = "Generate a title for this conversation:";
 
@@ -64,6 +65,7 @@ export async function handleTitleGenerationRequest(
   accessToken: string,
   modelId: string,
   stream: boolean,
+  runtimeConfig?: Partial<CursorRuntimeConfig>,
 ): Promise<Response> {
   let title: string;
   try {
@@ -76,6 +78,7 @@ export async function handleTitleGenerationRequest(
       rpcPath: "/agent.v1.AgentService/NameAgent",
       requestBody,
       timeoutMs: 5_000,
+      runtimeConfig,
     });
     if (response.timedOut || response.exitCode !== 0) {
       title = deriveFallbackTitle(sourceText);

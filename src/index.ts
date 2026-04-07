@@ -16,6 +16,7 @@ import {
 } from "./auth";
 import { configureLogger, logWarn } from "./logger";
 import { type CursorModel, getCursorModels } from "./models";
+import { resolveRuntimeConfig } from "./runtime-config";
 import { startProxy } from "./server";
 
 const SDK_WRAPPER_PATH = `file://${resolve(dirname(fileURLToPath(import.meta.url)), "opencode-cursor-sdk.js")}`;
@@ -28,6 +29,7 @@ const CURSOR_PROVIDER_ID = "cursor";
  */
 export const CursorAuthPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
   configureLogger(input);
+  const runtimeConfig = resolveRuntimeConfig();
   let proxyPort: number | null = null;
   let cursorModelList: CursorModel[] | null = null;
 
@@ -51,7 +53,7 @@ export const CursorAuthPlugin: Plugin = async (input: PluginInput): Promise<Hook
         // Ensure we have a valid access token, refreshing if expired
         let accessToken = auth.access;
         if (!accessToken || auth.expires < Date.now()) {
-          const refreshed = await refreshCursorToken(auth.refresh);
+          const refreshed = await refreshCursorToken(auth.refresh, runtimeConfig);
           await input.client.auth.set({
             path: { id: CURSOR_PROVIDER_ID },
             body: {
@@ -64,7 +66,7 @@ export const CursorAuthPlugin: Plugin = async (input: PluginInput): Promise<Hook
           accessToken = refreshed.access;
         }
 
-        const discovery = await getCursorModels(accessToken);
+        const discovery = await getCursorModels(accessToken, runtimeConfig);
         if (discovery.source === "fallback") {
           logWarn(
             "Model discovery failed -- using hardcoded fallback list. " +
@@ -75,28 +77,32 @@ export const CursorAuthPlugin: Plugin = async (input: PluginInput): Promise<Hook
         }
         const models = discovery.models;
 
-        const port = await startProxy(async () => {
-          const currentAuth = await getAuth();
-          if (currentAuth.type !== "oauth") {
-            throw new Error("Cursor auth not configured");
-          }
+        const port = await startProxy(
+          async () => {
+            const currentAuth = await getAuth();
+            if (currentAuth.type !== "oauth") {
+              throw new Error("Cursor auth not configured");
+            }
 
-          if (!currentAuth.access || currentAuth.expires < Date.now()) {
-            const refreshed = await refreshCursorToken(currentAuth.refresh);
-            await input.client.auth.set({
-              path: { id: CURSOR_PROVIDER_ID },
-              body: {
-                type: "oauth",
-                refresh: refreshed.refresh,
-                access: refreshed.access,
-                expires: refreshed.expires,
-              },
-            });
-            return refreshed.access;
-          }
+            if (!currentAuth.access || currentAuth.expires < Date.now()) {
+              const refreshed = await refreshCursorToken(currentAuth.refresh, runtimeConfig);
+              await input.client.auth.set({
+                path: { id: CURSOR_PROVIDER_ID },
+                body: {
+                  type: "oauth",
+                  refresh: refreshed.refresh,
+                  access: refreshed.access,
+                  expires: refreshed.expires,
+                },
+              });
+              return refreshed.access;
+            }
 
-          return currentAuth.access;
-        }, models);
+            return currentAuth.access;
+          },
+          models,
+          runtimeConfig,
+        );
 
         proxyPort = port;
         cursorModelList = models;
@@ -128,14 +134,18 @@ export const CursorAuthPlugin: Plugin = async (input: PluginInput): Promise<Hook
           type: "oauth",
           label: "Login with Cursor",
           async authorize() {
-            const { verifier, uuid, loginUrl } = await generateCursorAuthParams();
+            const { verifier, uuid, loginUrl } = await generateCursorAuthParams(runtimeConfig);
 
             return {
               url: loginUrl,
               instructions: "Complete login in your browser. This window will close automatically.",
               method: "auto" as const,
               async callback() {
-                const { accessToken, refreshToken } = await pollCursorAuth(uuid, verifier);
+                const { accessToken, refreshToken } = await pollCursorAuth(
+                  uuid,
+                  verifier,
+                  runtimeConfig,
+                );
 
                 return {
                   type: "success" as const,

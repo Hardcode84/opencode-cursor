@@ -1,9 +1,5 @@
 import { generatePKCE } from "./pkce";
-
-const CURSOR_LOGIN_URL = "https://cursor.com/loginDeepControl";
-const CURSOR_POLL_URL = "https://api2.cursor.sh/auth/poll";
-const CURSOR_REFRESH_URL =
-  process.env.CURSOR_REFRESH_URL ?? "https://api2.cursor.sh/auth/exchange_user_api_key";
+import { type CursorRuntimeConfig, resolveRuntimeConfig } from "./runtime-config";
 
 const POLL_MAX_ATTEMPTS = 150;
 const POLL_BASE_DELAY = 1000;
@@ -23,7 +19,10 @@ export interface CursorCredentials {
   expires: number;
 }
 
-export async function generateCursorAuthParams(): Promise<CursorAuthParams> {
+export async function generateCursorAuthParams(
+  runtimeConfig?: Partial<CursorRuntimeConfig>,
+): Promise<CursorAuthParams> {
+  const config = resolveRuntimeConfig(runtimeConfig);
   const { verifier, challenge } = await generatePKCE();
   const uuid = crypto.randomUUID();
 
@@ -34,14 +33,16 @@ export async function generateCursorAuthParams(): Promise<CursorAuthParams> {
     redirectTarget: "cli",
   });
 
-  const loginUrl = `${CURSOR_LOGIN_URL}?${params.toString()}`;
+  const loginUrl = `${config.loginUrl}?${params.toString()}`;
   return { verifier, challenge, uuid, loginUrl };
 }
 
 export async function pollCursorAuth(
   uuid: string,
   verifier: string,
+  runtimeConfig?: Partial<CursorRuntimeConfig>,
 ): Promise<{ accessToken: string; refreshToken: string }> {
+  const config = resolveRuntimeConfig(runtimeConfig);
   let delay = POLL_BASE_DELAY;
   let consecutiveErrors = 0;
 
@@ -49,7 +50,7 @@ export async function pollCursorAuth(
     await Bun.sleep(delay);
 
     try {
-      const response = await fetch(`${CURSOR_POLL_URL}?uuid=${uuid}&verifier=${verifier}`);
+      const response = await fetch(`${config.pollUrl}?uuid=${uuid}&verifier=${verifier}`);
 
       if (response.status === 404) {
         consecutiveErrors = 0;
@@ -86,8 +87,12 @@ export async function pollCursorAuth(
   throw new Error("Cursor authentication polling timeout");
 }
 
-export async function refreshCursorToken(refreshToken: string): Promise<CursorCredentials> {
-  const response = await fetch(CURSOR_REFRESH_URL, {
+export async function refreshCursorToken(
+  refreshToken: string,
+  runtimeConfig?: Partial<CursorRuntimeConfig>,
+): Promise<CursorCredentials> {
+  const config = resolveRuntimeConfig(runtimeConfig);
+  const response = await fetch(config.refreshUrl, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${refreshToken}`,

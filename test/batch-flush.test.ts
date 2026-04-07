@@ -308,7 +308,7 @@ describe("batch flush: requestContextArgs does not premature-flush", () => {
 
     // Now checkpoint arrives -- should flush both execs together
     mockH2Stream.emit("data", makeCheckpointFrame());
-    const { found, events } = await drainUntil(session, "batchReady");
+    const { found } = await drainUntil(session, "batchReady");
     expect(found).toBe(true);
     expect(session.flushedExecs.length).toBe(2);
   });

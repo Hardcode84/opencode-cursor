@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { logDebug, logWarn } from "./logger";
+import { type CursorRuntimeConfig, resolveRuntimeConfig } from "./runtime-config";
 
 export interface StoredConversation {
   conversationId: string;
@@ -13,39 +13,47 @@ export interface StoredConversation {
   checkpointArchive: Map<string, Uint8Array>;
 }
 
-const conversationStates = new Map<string, StoredConversation>();
-const CONVERSATION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+interface ConversationCacheEntry {
+  convKey: string;
+  stored: StoredConversation;
+  diskDir: string;
+  memoryTtlMs: number;
+}
+
+const conversationStates = new Map<string, ConversationCacheEntry>();
+
+function conversationCacheKey(convKey: string, runtimeConfig: CursorRuntimeConfig): string {
+  return `${runtimeConfig.conversationDiskDir}\0${convKey}`;
+}
+
+function ensureConversationDiskDir(runtimeConfig: CursorRuntimeConfig): void {
+  try {
+    mkdirSync(runtimeConfig.conversationDiskDir, { recursive: true });
+  } catch (err) {
+    logWarn("Failed to create conversation directory", {
+      dir: runtimeConfig.conversationDiskDir,
+      error: String(err),
+    });
+  }
+}
+
+function convDiskPath(convKey: string, runtimeConfig: CursorRuntimeConfig): string {
+  return join(runtimeConfig.conversationDiskDir, `${convKey}.json`);
+}
 
 function evictStaleConversations(): void {
   const now = Date.now();
-  for (const [key, stored] of conversationStates) {
-    if (now - stored.lastAccessMs > CONVERSATION_TTL_MS) {
+  for (const [key, entry] of conversationStates) {
+    if (now - entry.stored.lastAccessMs > entry.memoryTtlMs) {
       conversationStates.delete(key);
       try {
-        unlinkSync(convDiskPath(key));
+        unlinkSync(join(entry.diskDir, `${entry.convKey}.json`));
       } catch {}
     }
   }
 }
 
 // --- Disk persistence for conversation state across process restarts ---
-
-const CONV_DISK_DIR = join(
-  process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"),
-  "opencode",
-  "cursor-conversations",
-);
-try {
-  mkdirSync(CONV_DISK_DIR, { recursive: true });
-} catch (err) {
-  logWarn("Failed to create conversation directory", { dir: CONV_DISK_DIR, error: String(err) });
-}
-
-const CONV_DISK_TTL_MS = 24 * 60 * 60 * 1000; // 24h on-disk TTL
-
-function convDiskPath(convKey: string): string {
-  return join(CONV_DISK_DIR, `${convKey}.json`);
-}
 
 interface SerializedConversation {
   conversationId: string;
@@ -66,7 +74,13 @@ function deserializeByteMap(obj: Record<string, string> | undefined): Map<string
   );
 }
 
-export function persistConversation(convKey: string, stored: StoredConversation): void {
+export function persistConversation(
+  convKey: string,
+  stored: StoredConversation,
+  runtimeConfig?: Partial<CursorRuntimeConfig>,
+): void {
+  const config = resolveRuntimeConfig(runtimeConfig);
+  ensureConversationDiskDir(config);
   const data: SerializedConversation = {
     conversationId: stored.conversationId,
     checkpoint: stored.checkpoint ? Buffer.from(stored.checkpoint).toString("base64") : null,
@@ -76,18 +90,24 @@ export function persistConversation(convKey: string, stored: StoredConversation)
     checkpointArchive: serializeByteMap(stored.checkpointArchive),
   };
   try {
-    writeFileSync(convDiskPath(convKey), JSON.stringify(data));
+    writeFileSync(convDiskPath(convKey, config), JSON.stringify(data));
   } catch (err) {
     logWarn("Failed to persist conversation to disk", { convKey, error: String(err) });
   }
 }
 
-function loadConversation(convKey: string): StoredConversation | null {
+function loadConversation(
+  convKey: string,
+  runtimeConfig: CursorRuntimeConfig,
+): StoredConversation | null {
+  ensureConversationDiskDir(runtimeConfig);
   try {
-    const raw: SerializedConversation = JSON.parse(readFileSync(convDiskPath(convKey), "utf-8"));
-    if (Date.now() - raw.savedMs > CONV_DISK_TTL_MS) {
+    const raw: SerializedConversation = JSON.parse(
+      readFileSync(convDiskPath(convKey, runtimeConfig), "utf-8"),
+    );
+    if (Date.now() - raw.savedMs > runtimeConfig.conversationDiskTtlMs) {
       try {
-        unlinkSync(convDiskPath(convKey));
+        unlinkSync(convDiskPath(convKey, runtimeConfig));
       } catch {}
       return null;
     }
@@ -105,14 +125,15 @@ function loadConversation(convKey: string): StoredConversation | null {
   }
 }
 
-function evictStaleDiskConversations(): void {
+function evictStaleDiskConversations(runtimeConfig: CursorRuntimeConfig): void {
+  ensureConversationDiskDir(runtimeConfig);
   try {
     const now = Date.now();
-    for (const name of readdirSync(CONV_DISK_DIR)) {
+    for (const name of readdirSync(runtimeConfig.conversationDiskDir)) {
       if (!name.endsWith(".json")) continue;
-      const full = join(CONV_DISK_DIR, name);
+      const full = join(runtimeConfig.conversationDiskDir, name);
       try {
-        if (now - statSync(full).mtimeMs > CONV_DISK_TTL_MS) unlinkSync(full);
+        if (now - statSync(full).mtimeMs > runtimeConfig.conversationDiskTtlMs) unlinkSync(full);
       } catch {}
     }
   } catch {}
@@ -131,34 +152,59 @@ export function deterministicConversationId(convKey: string): string {
   ].join("-");
 }
 
-export function resolveConversationState(convKey: string): StoredConversation {
-  let stored = conversationStates.get(convKey);
-  if (!stored) {
-    stored = loadConversation(convKey) ?? {
-      conversationId: deterministicConversationId(convKey),
-      checkpoint: null,
-      blobStore: new Map(),
-      lastAccessMs: Date.now(),
-      checkpointHistory: new Map(),
-      checkpointArchive: new Map(),
+export function resolveConversationState(
+  convKey: string,
+  runtimeConfig?: Partial<CursorRuntimeConfig>,
+): StoredConversation {
+  const config = resolveRuntimeConfig(runtimeConfig);
+  const key = conversationCacheKey(convKey, config);
+  let entry = conversationStates.get(key);
+  if (!entry) {
+    entry = {
+      convKey,
+      diskDir: config.conversationDiskDir,
+      memoryTtlMs: config.conversationTtlMs,
+      stored: loadConversation(convKey, config) ?? {
+        conversationId: deterministicConversationId(convKey),
+        checkpoint: null,
+        blobStore: new Map(),
+        lastAccessMs: Date.now(),
+        checkpointHistory: new Map(),
+        checkpointArchive: new Map(),
+      },
     };
-    conversationStates.set(convKey, stored);
+    conversationStates.set(key, entry);
   }
-  stored.lastAccessMs = Date.now();
+  entry.diskDir = config.conversationDiskDir;
+  entry.memoryTtlMs = config.conversationTtlMs;
+  entry.stored.lastAccessMs = Date.now();
   evictStaleConversations();
-  evictStaleDiskConversations();
-  return stored;
+  evictStaleDiskConversations(config);
+  return entry.stored;
 }
 
-export function getConversationState(convKey: string): StoredConversation | undefined {
-  return conversationStates.get(convKey);
+export function getConversationState(
+  convKey: string,
+  runtimeConfig?: Partial<CursorRuntimeConfig>,
+): StoredConversation | undefined {
+  const config = resolveRuntimeConfig(runtimeConfig);
+  return conversationStates.get(conversationCacheKey(convKey, config))?.stored;
 }
 
-export function invalidateConversationState(convKey: string): void {
-  conversationStates.delete(convKey);
+export function invalidateConversationState(
+  convKey: string,
+  runtimeConfig?: Partial<CursorRuntimeConfig>,
+): void {
+  const config = resolveRuntimeConfig(runtimeConfig);
+  conversationStates.delete(conversationCacheKey(convKey, config));
   try {
-    unlinkSync(convDiskPath(convKey));
+    unlinkSync(convDiskPath(convKey, config));
   } catch {}
+}
+
+/** @internal Test-only. */
+export function clearConversationStateCacheForTests(): void {
+  conversationStates.clear();
 }
 
 export type Turn = { userText: string; assistantText: string };

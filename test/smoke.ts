@@ -423,9 +423,8 @@ async function testExpiredTokenRefreshBeforeDiscovery(
       },
     },
   } as any);
-  const provider = { models: {} as Record<string, unknown> } as any;
-
-  await hooks.auth!.loader(async () => authState, provider);
+  await hooks.auth!.loader(async () => authState);
+  const providerModels = await hooks.provider!.models!();
 
   assertEqual(writes.length, 1, "Expected refreshed auth to be persisted once");
   assert(
@@ -442,7 +441,7 @@ async function testExpiredTokenRefreshBeforeDiscovery(
     `Expected discovery to use the refreshed token, got ${JSON.stringify(backend.getDiscoveryAuthHeaders())}`,
   );
   assertArrayEqual(
-    Object.keys(provider.models),
+    Object.keys(providerModels),
     ["fresh-model"],
     "Expected provider models to come from successful discovery",
   );
@@ -467,17 +466,16 @@ async function testDiscoveryFallbackAndSuccess(modules: TestModules, backend: Te
       },
     },
   } as any);
-  const provider = { models: { stale: { id: "stale" } } } as any;
 
   // Failed discovery should fall back to hardcoded models
   modules.clearModelCache();
   backend.setDiscoveryMode("empty");
-  const degradedConfig = await hooks.auth!.loader(async () => authState, provider);
+  const degradedConfig = await hooks.auth!.loader(async () => authState);
+  const degradedProviderModels = await hooks.provider!.models!();
   assert(
-    Object.keys(provider.models).length > 0,
+    Object.keys(degradedProviderModels).length > 0,
     "Expected fallback models to be registered when discovery fails",
   );
-  assert(!("stale" in provider.models), "Expected stale models to be replaced");
   const degradedModelsRes = await fetch(`${degradedConfig.baseURL}/models`);
   assertEqual(degradedModelsRes.status, 200, "Expected degraded /v1/models to succeed");
   const degradedModelsBody = await degradedModelsRes.json();
@@ -490,9 +488,10 @@ async function testDiscoveryFallbackAndSuccess(modules: TestModules, backend: Te
     { id: "real-model-a", name: "Real Model A" },
     { id: "real-model-b", name: "Real Model B", reasoning: true },
   ]);
-  const discoveredConfig = await hooks.auth!.loader(async () => authState, provider);
+  const discoveredConfig = await hooks.auth!.loader(async () => authState);
+  const discoveredProviderModels = await hooks.provider!.models!();
   assertArrayEqual(
-    Object.keys(provider.models).sort(),
+    Object.keys(discoveredProviderModels).sort(),
     ["real-model-a", "real-model-b"],
     "Expected successful discovery to replace fallback models",
   );

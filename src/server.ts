@@ -46,12 +46,11 @@ import {
   UserMessageActionSchema,
   UserMessageSchema,
 } from "./proto/agent_pb";
+import { type CursorRuntimeConfig, resolveRuntimeConfig } from "./runtime-config";
 import { buildTitleSourceText, detectTitleRequest, handleTitleGenerationRequest } from "./title";
 
 const MAX_BLOB_RETRIES = 2;
 const MAX_AUTO_RESUMES = 5;
-const SESSION_TTL_MS = 5 * 60 * 1000;
-const FLUSHED_MAX_LIFETIME_MS = 60 * 60 * 1000;
 const CHECKPOINT_HISTORY_LIMIT = 30;
 const CHECKPOINT_ARCHIVE_LIMIT = 60;
 
@@ -89,9 +88,9 @@ const activeSessions = new Map<string, ActiveSession>();
 
 function evictStaleSessions(): void {
   const now = Date.now();
-  const ttlCutoff = now - SESSION_TTL_MS;
-  const flushedCutoff = now - FLUSHED_MAX_LIFETIME_MS;
   for (const [key, active] of activeSessions) {
+    const ttlCutoff = now - active.session.runtimeConfig.activeSessionTtlMs;
+    const flushedCutoff = now - active.session.runtimeConfig.flushedSessionMaxLifetimeMs;
     if (!active.session.alive) {
       activeSessions.delete(key);
       continue;
@@ -135,6 +134,7 @@ let proxyServer: ReturnType<typeof Bun.serve> | undefined;
 let proxyPort: number | undefined;
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
 let proxyModels: Array<{ id: string; name: string }> = [];
+let proxyRuntimeConfig: CursorRuntimeConfig = resolveRuntimeConfig();
 
 function buildOpenAIModelList(models: ReadonlyArray<{ id: string; name: string }>) {
   return models.map((model) => ({
@@ -152,9 +152,11 @@ export function getProxyPort(): number | undefined {
 export async function startProxy(
   getAccessToken: () => Promise<string>,
   models: ReadonlyArray<{ id: string; name: string }> = [],
+  runtimeConfig?: Partial<CursorRuntimeConfig>,
 ): Promise<number> {
   proxyAccessTokenProvider = getAccessToken;
   proxyModels = models.map((m) => ({ id: m.id, name: m.name }));
+  proxyRuntimeConfig = resolveRuntimeConfig(runtimeConfig);
   if (proxyServer && proxyPort) return proxyPort;
 
   proxyServer = Bun.serve({
@@ -178,7 +180,14 @@ export async function startProxy(
           const sessionId = req.headers.get("x-session-affinity") ?? undefined;
           const parentSessionId = req.headers.get("x-parent-session-id") ?? undefined;
           const opencodeAgent = req.headers.get("x-opencode-agent") ?? undefined;
-          return handleChatCompletion(body, accessToken, sessionId, parentSessionId, opencodeAgent);
+          return handleChatCompletion(
+            body,
+            accessToken,
+            proxyRuntimeConfig,
+            sessionId,
+            parentSessionId,
+            opencodeAgent,
+          );
         } catch (err) {
           logError("chat completion failed", errorDetails(err));
           const message = err instanceof Error ? err.message : String(err);
@@ -209,11 +218,11 @@ export function stopProxy(): void {
     proxyModels = [];
   }
   for (const { session, convKey } of activeSessions.values()) {
-    const stored = getConversationState(convKey);
+    const stored = getConversationState(convKey, session.runtimeConfig);
     if (stored) {
       for (const [k, v] of session.blobStore) stored.blobStore.set(k, v);
       stored.lastAccessMs = Date.now();
-      persistConversation(convKey, stored);
+      persistConversation(convKey, stored, session.runtimeConfig);
     }
     session.close();
   }
@@ -523,14 +532,17 @@ function createModelDetails(modelId: string) {
 
 function makeCheckpointCallback(
   convKey: string,
+  runtimeConfig: Partial<CursorRuntimeConfig>,
 ): (bytes: Uint8Array, blobStore: Map<string, Uint8Array>) => void {
   return (bytes, blobStore) => {
     // Re-resolve if the entry was evicted while session was alive
-    const stored = getConversationState(convKey) ?? resolveConversationState(convKey);
+    const stored =
+      getConversationState(convKey, runtimeConfig) ??
+      resolveConversationState(convKey, runtimeConfig);
     stored.checkpoint = bytes;
     for (const [k, v] of blobStore) stored.blobStore.set(k, v);
     stored.lastAccessMs = Date.now();
-    persistConversation(convKey, stored);
+    persistConversation(convKey, stored, runtimeConfig);
   };
 }
 
@@ -591,7 +603,7 @@ async function pumpWithAutoResume(
         });
       }
 
-      const stored = getConversationState(convKey);
+      const stored = getConversationState(convKey, currentSession.runtimeConfig);
       let payload: CursorRequestPayload | null = null;
 
       if (stored?.checkpoint) {
@@ -618,7 +630,8 @@ async function pumpWithAutoResume(
           mcpTools: payload.mcpTools,
           cloudRule,
           convKey,
-          onCheckpoint: makeCheckpointCallback(convKey),
+          runtimeConfig: currentSession.runtimeConfig,
+          onCheckpoint: makeCheckpointCallback(convKey, currentSession.runtimeConfig),
         });
         continue;
       }
@@ -645,6 +658,7 @@ function writeRetryError(ctx: SSECtx, result: PumpResult): void {
 function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
+  runtimeConfig: Partial<CursorRuntimeConfig>,
   sessionId?: string,
   parentSessionId?: string,
   opencodeAgent?: string,
@@ -658,6 +672,7 @@ function handleChatCompletion(
         accessToken,
         body.model,
         body.stream !== false,
+        runtimeConfig,
       );
     }
   }
@@ -694,10 +709,10 @@ function handleChatCompletion(
   const isFirstMessage = turns.length === 0 && toolResults.length === 0;
   if (isFirstMessage) {
     logDebug(`new conversation - clearing stale state for key ${convKey}`);
-    invalidateConversationState(convKey);
+    invalidateConversationState(convKey, runtimeConfig);
   }
 
-  const stored = resolveConversationState(convKey);
+  const stored = resolveConversationState(convKey, runtimeConfig);
 
   const preparedConversation = prepareStoredConversationForRequest(stored, turns, opencodeAgent);
   if (preparedConversation.didReset) {
@@ -706,7 +721,7 @@ function handleChatCompletion(
       sessionId,
       parentSessionId,
     });
-    persistConversation(convKey, stored);
+    persistConversation(convKey, stored, runtimeConfig);
   }
 
   const mcpTools = buildMcpToolDefinitions(tools);
@@ -736,7 +751,14 @@ function handleChatCompletion(
   });
 
   if (body.stream === false) {
-    return handleNonStreamingResponse(payload, accessToken, modelId, convKey, systemPrompt);
+    return handleNonStreamingResponse(
+      payload,
+      accessToken,
+      modelId,
+      convKey,
+      runtimeConfig,
+      systemPrompt,
+    );
   }
 
   return handleStreamingWithRetry(
@@ -745,6 +767,7 @@ function handleChatCompletion(
     modelId,
     bridgeKey,
     convKey,
+    runtimeConfig,
     systemPrompt,
     effectiveUserText,
     turns,
@@ -827,6 +850,7 @@ interface StreamingPumpOpts {
   modelId: string;
   bridgeKey: string;
   convKey: string;
+  runtimeConfig: Partial<CursorRuntimeConfig>;
   systemPrompt?: string;
   effectiveUserText?: string;
   turns?: Array<{ userText: string; assistantText: string }>;
@@ -857,12 +881,13 @@ async function runStreamingPump(opts: StreamingPumpOpts): Promise<void> {
       mcpTools: currentPayload.mcpTools,
       cloudRule: systemPrompt,
       convKey,
-      onCheckpoint: makeCheckpointCallback(convKey),
+      runtimeConfig: opts.runtimeConfig,
+      onCheckpoint: makeCheckpointCallback(convKey, opts.runtimeConfig),
     });
     onSession(session);
 
     const rebuildRequest = () => {
-      const stored = resolveConversationState(convKey);
+      const stored = resolveConversationState(convKey, opts.runtimeConfig);
       return buildCursorRequest(
         modelId,
         systemPrompt ?? "",
@@ -887,9 +912,9 @@ async function runStreamingPump(opts: StreamingPumpOpts): Promise<void> {
     if (result.retryHint === "blob_not_found" && blobAttempt < MAX_BLOB_RETRIES) {
       if (blobAttempt === 0) {
         logWarn("blob not found - soft retry: nulling checkpoint", { convKey });
-        const stored2 = resolveConversationState(convKey);
+        const stored2 = resolveConversationState(convKey, opts.runtimeConfig);
         stored2.checkpoint = null;
-        persistConversation(convKey, stored2);
+        persistConversation(convKey, stored2, opts.runtimeConfig);
         currentPayload = buildCursorRequest(
           modelId,
           systemPrompt ?? "",
@@ -901,8 +926,8 @@ async function runStreamingPump(opts: StreamingPumpOpts): Promise<void> {
         );
       } else {
         logWarn("blob not found again - hard retry: full invalidation", { convKey });
-        invalidateConversationState(convKey);
-        const fresh = resolveConversationState(convKey);
+        invalidateConversationState(convKey, opts.runtimeConfig);
+        const fresh = resolveConversationState(convKey, opts.runtimeConfig);
         currentPayload = buildCursorRequest(
           modelId,
           systemPrompt ?? "",
@@ -928,6 +953,7 @@ function handleStreamingWithRetry(
   modelId: string,
   bridgeKey: string,
   convKey: string,
+  runtimeConfig: Partial<CursorRuntimeConfig>,
   systemPrompt?: string,
   effectiveUserText?: string,
   turns?: Array<{ userText: string; assistantText: string }>,
@@ -951,6 +977,7 @@ function handleStreamingWithRetry(
             modelId,
             bridgeKey,
             convKey,
+            runtimeConfig,
             systemPrompt,
             effectiveUserText,
             turns,
@@ -1030,6 +1057,7 @@ async function handleNonStreamingResponse(
   accessToken: string,
   modelId: string,
   convKey: string,
+  runtimeConfig: Partial<CursorRuntimeConfig>,
   systemPrompt?: string,
 ): Promise<Response> {
   const session = new CursorSession({
@@ -1039,7 +1067,8 @@ async function handleNonStreamingResponse(
     mcpTools: payload.mcpTools,
     cloudRule: systemPrompt,
     convKey,
-    onCheckpoint: makeCheckpointCallback(convKey),
+    runtimeConfig,
+    onCheckpoint: makeCheckpointCallback(convKey, runtimeConfig),
   });
   return collectNonStreamingResponse(session, modelId);
 }

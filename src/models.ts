@@ -20,6 +20,7 @@ import {
   AvailableModelsResponseSchema,
 } from "./proto/aiserver_pb";
 import { decodeConnectUnaryBody } from "./protocol";
+import { type CursorRuntimeConfig, resolveRuntimeConfig } from "./runtime-config";
 
 const AVAILABLE_MODELS_PATH = "/aiserver.v1.AiService/AvailableModels";
 const GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
@@ -200,13 +201,18 @@ function parseTokenLimitField(buf: Uint8Array): number | null {
   return val > 0 ? val : null;
 }
 
-async function fetchTokenLimit(apiKey: string, modelId: string): Promise<number | null> {
+async function fetchTokenLimit(
+  apiKey: string,
+  modelId: string,
+  runtimeConfig?: Partial<CursorRuntimeConfig>,
+): Promise<number | null> {
   try {
     const response = await callCursorUnaryRpc({
       accessToken: apiKey,
       rpcPath: GET_EFFECTIVE_TOKEN_LIMIT_PATH,
       requestBody: encodeTokenLimitRequest(modelId),
       timeoutMs: TOKEN_LIMIT_TIMEOUT_MS,
+      runtimeConfig,
     });
     if (response.timedOut || response.exitCode !== 0) {
       logDebug("[models] GetEffectiveTokenLimit failed", {
@@ -227,7 +233,11 @@ async function fetchTokenLimit(apiKey: string, modelId: string): Promise<number 
 }
 
 /** Fetch token limits for multiple models in parallel with bounded concurrency. */
-async function fetchTokenLimits(apiKey: string, modelIds: string[]): Promise<Map<string, number>> {
+async function fetchTokenLimits(
+  apiKey: string,
+  modelIds: string[],
+  runtimeConfig?: Partial<CursorRuntimeConfig>,
+): Promise<Map<string, number>> {
   const limits = new Map<string, number>();
   const queue = [...modelIds];
   let idx = 0;
@@ -236,7 +246,7 @@ async function fetchTokenLimits(apiKey: string, modelIds: string[]): Promise<Map
     while (idx < queue.length) {
       const i = idx++;
       const modelId = queue[i]!;
-      const limit = await fetchTokenLimit(apiKey, modelId);
+      const limit = await fetchTokenLimit(apiKey, modelId, runtimeConfig);
       if (limit !== null) limits.set(modelId, limit);
     }
   }
@@ -252,7 +262,10 @@ async function fetchTokenLimits(apiKey: string, modelIds: string[]): Promise<Map
 // Primary path: AvailableModels + GetEffectiveTokenLimit
 // ---------------------------------------------------------------------------
 
-async function fetchAvailableModels(apiKey: string): Promise<CursorModel[] | null> {
+async function fetchAvailableModels(
+  apiKey: string,
+  runtimeConfig?: Partial<CursorRuntimeConfig>,
+): Promise<CursorModel[] | null> {
   try {
     const req = create(AvailableModelsRequestSchema, {
       includeLongContextModels: true,
@@ -264,6 +277,7 @@ async function fetchAvailableModels(apiKey: string): Promise<CursorModel[] | nul
       rpcPath: AVAILABLE_MODELS_PATH,
       requestBody: toBinary(AvailableModelsRequestSchema, req),
       timeoutMs: AVAILABLE_MODELS_TIMEOUT_MS,
+      runtimeConfig,
     });
 
     if (response.timedOut || response.exitCode !== 0 || response.body.length === 0) {
@@ -285,7 +299,7 @@ async function fetchAvailableModels(apiKey: string): Promise<CursorModel[] | nul
     }
 
     const modelIds = decoded.models.map((m) => m.name).filter(Boolean);
-    const tokenLimits = await fetchTokenLimits(apiKey, modelIds);
+    const tokenLimits = await fetchTokenLimits(apiKey, modelIds, runtimeConfig);
 
     logDebug("[models] GetEffectiveTokenLimit results", {
       requested: modelIds.length,
@@ -348,7 +362,10 @@ function fallbackContext(modelId: string): number {
 // Fallback: agent.v1.GetUsableModels (no context window info)
 // ---------------------------------------------------------------------------
 
-async function fetchGetUsableModels(apiKey: string): Promise<CursorModel[] | null> {
+async function fetchGetUsableModels(
+  apiKey: string,
+  runtimeConfig?: Partial<CursorRuntimeConfig>,
+): Promise<CursorModel[] | null> {
   try {
     const requestBody = toBinary(
       GetUsableModelsRequestSchema,
@@ -358,6 +375,7 @@ async function fetchGetUsableModels(apiKey: string): Promise<CursorModel[] | nul
       accessToken: apiKey,
       rpcPath: GET_USABLE_MODELS_PATH,
       requestBody,
+      runtimeConfig,
     });
 
     if (response.timedOut || response.exitCode !== 0 || response.body.length === 0) return null;
@@ -413,33 +431,42 @@ export interface ModelDiscoveryResult {
   source: "available_models" | "get_usable_models" | "fallback";
 }
 
-let cachedResult: ModelDiscoveryResult | null = null;
+const cachedResults = new Map<string, ModelDiscoveryResult>();
 
-export async function getCursorModels(apiKey: string): Promise<ModelDiscoveryResult> {
+export async function getCursorModels(
+  apiKey: string,
+  runtimeConfig?: Partial<CursorRuntimeConfig>,
+): Promise<ModelDiscoveryResult> {
+  const config = resolveRuntimeConfig(runtimeConfig);
+  const cacheKey = config.apiUrl;
+  const cachedResult = cachedResults.get(cacheKey);
   if (cachedResult) return cachedResult;
 
-  const available = await fetchAvailableModels(apiKey);
+  const available = await fetchAvailableModels(apiKey, config);
   if (available && available.length > 0) {
-    cachedResult = { models: available, source: "available_models" };
+    const result = { models: available, source: "available_models" as const };
+    cachedResults.set(cacheKey, result);
     logDebug("[models] Using AvailableModels", { count: available.length });
-    return cachedResult;
+    return result;
   }
 
-  const usable = await fetchGetUsableModels(apiKey);
+  const usable = await fetchGetUsableModels(apiKey, config);
   if (usable && usable.length > 0) {
-    cachedResult = { models: usable, source: "get_usable_models" };
+    const result = { models: usable, source: "get_usable_models" as const };
+    cachedResults.set(cacheKey, result);
     logWarn("[models] Fell back to GetUsableModels", { count: usable.length });
-    return cachedResult;
+    return result;
   }
 
-  cachedResult = { models: FALLBACK_MODELS, source: "fallback" };
+  const result = { models: FALLBACK_MODELS, source: "fallback" as const };
+  cachedResults.set(cacheKey, result);
   logWarn("[models] Using hardcoded fallback models");
-  return cachedResult;
+  return result;
 }
 
 /** @internal Test-only. */
 export function clearModelCache(): void {
-  cachedResult = null;
+  cachedResults.clear();
 }
 
 // ---------------------------------------------------------------------------
