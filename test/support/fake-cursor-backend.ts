@@ -10,9 +10,14 @@ import { encodeVarint } from "../../src/models";
 import {
   type AgentClientMessage,
   AgentClientMessageSchema,
+  AgentConversationTurnStructureSchema,
+  AgentRunRequestSchema,
   AgentServerMessageSchema,
+  AssistantMessageSchema,
   type ConversationStateStructure,
   ConversationStateStructureSchema,
+  ConversationStepSchema,
+  ConversationTurnStructureSchema,
   ExecServerMessageSchema,
   GetUsableModelsResponseSchema,
   InteractionUpdateSchema,
@@ -23,6 +28,7 @@ import {
   TextDeltaUpdateSchema,
   ThinkingDeltaUpdateSchema,
   TokenDeltaUpdateSchema,
+  UserMessageSchema,
 } from "../../src/proto/agent_pb";
 import {
   AvailableModelsResponse_AvailableModelSchema,
@@ -48,6 +54,27 @@ export interface FakeUnaryRequest {
   body: Uint8Array;
 }
 
+export interface FakeConversationTurnSnapshot {
+  userText: string;
+  assistantText: string;
+}
+
+export interface FakeRunRequestSnapshot {
+  conversationId: string;
+  modelId: string;
+  actionCase: string;
+  userText: string;
+  turns: FakeConversationTurnSnapshot[];
+  raw: AgentClientMessage;
+}
+
+export interface FakeMcpResultSnapshot {
+  execMessageId: number;
+  execId: string;
+  text: string;
+  raw: AgentClientMessage;
+}
+
 type RunHandler = (connection: FakeRunConnection) => void | Promise<void>;
 
 interface Waiter {
@@ -71,6 +98,129 @@ function encodeTokenLimit(limit: number): Uint8Array {
 
 function encodeValue(value: unknown): Uint8Array {
   return toBinary(ValueSchema, fromJson(ValueSchema, value));
+}
+
+function buildConversationState(turns: FakeConversationTurnSnapshot[]): ConversationStateStructure {
+  const turnBytes = turns.map((turn, index) => {
+    const userMessageBytes = toBinary(
+      UserMessageSchema,
+      create(UserMessageSchema, {
+        text: turn.userText,
+        messageId: `fake-user-${index + 1}`,
+      }),
+    );
+    const stepBytes = turn.assistantText
+      ? [
+          toBinary(
+            ConversationStepSchema,
+            create(ConversationStepSchema, {
+              message: {
+                case: "assistantMessage",
+                value: create(AssistantMessageSchema, { text: turn.assistantText }),
+              },
+            }),
+          ),
+        ]
+      : [];
+    return toBinary(
+      ConversationTurnStructureSchema,
+      create(ConversationTurnStructureSchema, {
+        turn: {
+          case: "agentConversationTurn",
+          value: create(AgentConversationTurnStructureSchema, {
+            userMessage: userMessageBytes,
+            steps: stepBytes,
+          }),
+        },
+      }),
+    );
+  });
+
+  return create(ConversationStateStructureSchema, {
+    turns: turnBytes,
+    rootPromptMessagesJson: [],
+    todos: [],
+    pendingToolCalls: [],
+    previousWorkspaceUris: [],
+    fileStates: {},
+    fileStatesV2: {},
+    summaryArchives: [],
+    turnTimings: [],
+    subagentStates: {},
+    selfSummaryCount: 0,
+    readPaths: [],
+  });
+}
+
+function decodeConversationTurns(
+  state: ConversationStateStructure | undefined,
+): FakeConversationTurnSnapshot[] {
+  if (!state) return [];
+  return state.turns.flatMap((turnBytes) => {
+    const turn = fromBinary(ConversationTurnStructureSchema, turnBytes);
+    if (turn.turn.case !== "agentConversationTurn") return [];
+    const agentTurn = turn.turn.value;
+    const userMessage = fromBinary(UserMessageSchema, agentTurn.userMessage);
+    const assistantText = agentTurn.steps
+      .map((stepBytes) => fromBinary(ConversationStepSchema, stepBytes))
+      .flatMap((step) =>
+        step.message.case === "assistantMessage" ? [step.message.value.text || ""] : [],
+      )
+      .join("");
+    return [
+      {
+        userText: userMessage.text || "",
+        assistantText,
+      },
+    ];
+  });
+}
+
+function decodeRunRequest(message: AgentClientMessage): FakeRunRequestSnapshot {
+  if (message.message.case !== "runRequest") {
+    throw new Error(`Expected runRequest, got ${message.message.case ?? "undefined"}`);
+  }
+  const runRequest = fromBinary(
+    AgentRunRequestSchema,
+    toBinary(AgentRunRequestSchema, message.message.value),
+  );
+  const actionCase = runRequest.action?.action.case ?? "";
+  const userText =
+    actionCase === "userMessageAction"
+      ? runRequest.action?.action.value.userMessage?.text || ""
+      : "";
+  return {
+    conversationId: runRequest.conversationId || "",
+    modelId: runRequest.modelDetails?.modelId || "",
+    actionCase,
+    userText,
+    turns: decodeConversationTurns(runRequest.conversationState),
+    raw: message,
+  };
+}
+
+function decodeMcpResult(message: AgentClientMessage): FakeMcpResultSnapshot {
+  if (
+    message.message.case !== "execClientMessage" ||
+    message.message.value.message.case !== "mcpResult"
+  ) {
+    throw new Error(
+      `Expected execClientMessage.mcpResult, got ${message.message.case ?? "undefined"}`,
+    );
+  }
+  const result = message.message.value.message.value;
+  const text =
+    result.result.case === "success"
+      ? result.result.value.content
+          .flatMap((item) => (item.content.case === "text" ? [item.content.value.text] : []))
+          .join("")
+      : "";
+  return {
+    execMessageId: message.message.value.id,
+    execId: message.message.value.execId,
+    text,
+    raw: message,
+  };
 }
 
 export class FakeRunConnection {
@@ -132,6 +282,44 @@ export class FakeRunConnection {
 
   waitForClientMessageCase(messageCase: string, timeoutMs = 1_000): Promise<AgentClientMessage> {
     return this.waitForClientMessage((message) => message.message.case === messageCase, timeoutMs);
+  }
+
+  async waitForRunRequest(timeoutMs = 1_000): Promise<FakeRunRequestSnapshot> {
+    return decodeRunRequest(await this.waitForClientMessageCase("runRequest", timeoutMs));
+  }
+
+  async waitForRequestContextResult(
+    execMessageId?: number,
+    timeoutMs = 1_000,
+  ): Promise<AgentClientMessage> {
+    return this.waitForClientMessage((message) => {
+      if (message.message.case !== "execClientMessage") return false;
+      if (message.message.value.message.case !== "requestContextResult") return false;
+      return execMessageId == null || message.message.value.id === execMessageId;
+    }, timeoutMs);
+  }
+
+  async waitForMcpResult(
+    execMessageId?: number,
+    timeoutMs = 1_000,
+  ): Promise<FakeMcpResultSnapshot> {
+    const message = await this.waitForClientMessage((candidate) => {
+      if (candidate.message.case !== "execClientMessage") return false;
+      if (candidate.message.value.message.case !== "mcpResult") return false;
+      return execMessageId == null || candidate.message.value.id === execMessageId;
+    }, timeoutMs);
+    return decodeMcpResult(message);
+  }
+
+  async waitForExecStreamClose(
+    execMessageId?: number,
+    timeoutMs = 1_000,
+  ): Promise<AgentClientMessage> {
+    return this.waitForClientMessage((message) => {
+      if (message.message.case !== "execClientControlMessage") return false;
+      if (message.message.value.message.case !== "streamClose") return false;
+      return execMessageId == null || message.message.value.message.value.id === execMessageId;
+    }, timeoutMs);
   }
 
   waitForClose(timeoutMs = 1_000): Promise<void> {
@@ -207,6 +395,10 @@ export class FakeRunConnection {
         value: create(ConversationStateStructureSchema, state),
       },
     });
+  }
+
+  sendConversationCheckpoint(turns: FakeConversationTurnSnapshot[]): void {
+    this.sendCheckpoint(buildConversationState(turns));
   }
 
   sendEndStreamError(code: string, message: string): void {
