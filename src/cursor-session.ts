@@ -31,12 +31,8 @@ export type SessionEvent =
   | { type: "usage"; outputTokens: number; totalTokens: number }
   | { type: "done"; error?: string; retryHint?: RetryHint };
 
-function resolveCursorH2Target(baseUrl: string): { connectUrl: string; authority?: string } {
-  const isApi2 = baseUrl.includes("api2.cursor.sh");
-  return {
-    connectUrl: isApi2 ? baseUrl.replace("api2.cursor.sh", "api2direct.cursor.sh") : baseUrl,
-    authority: isApi2 ? "api2.cursor.sh" : undefined,
-  };
+function resolveCursorH2Target(baseUrl: string): { connectUrl: string } {
+  return { connectUrl: baseUrl };
 }
 
 export function classifyConnectError(errorMessage: string): RetryHint | undefined {
@@ -114,7 +110,7 @@ export class CursorSession implements BridgeWriter {
       lastDeltaType: null,
     };
 
-    const { connectUrl, authority } = resolveCursorH2Target(this.runtimeConfig.agentUrl);
+    const { connectUrl } = resolveCursorH2Target(this.runtimeConfig.agentUrl);
     const requestId = randomUUID();
     const traceId = randomBytes(16).toString("hex");
     const spanId = randomBytes(8).toString("hex");
@@ -147,8 +143,6 @@ export class CursorSession implements BridgeWriter {
       "backend-traceparent": traceparent,
       "connect-protocol-version": "1",
     };
-    if (authority) headers[":authority"] = authority;
-
     this.h2Stream = this.h2Session.request(headers);
     this.write(frameConnectMessage(options.requestBytes));
 
@@ -458,7 +452,7 @@ export async function callCursorUnaryRpc(
   options: CursorUnaryRpcOptions,
 ): Promise<{ body: Uint8Array; exitCode: number; timedOut: boolean }> {
   const runtimeConfig = resolveRuntimeConfig(options.runtimeConfig);
-  const { connectUrl, authority } = resolveCursorH2Target(options.url ?? runtimeConfig.apiUrl);
+  const { connectUrl } = resolveCursorH2Target(options.url ?? runtimeConfig.apiUrl);
   const requestId = randomUUID();
   const { promise, resolve } = Promise.withResolvers<{
     body: Uint8Array;
@@ -507,8 +501,6 @@ export async function callCursorUnaryRpc(
     "x-cursor-client-type": "cli",
     "x-request-id": requestId,
   };
-  if (authority) headers[":authority"] = authority;
-
   const stream = session.request(headers);
   const chunks: Buffer[] = [];
   stream.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));

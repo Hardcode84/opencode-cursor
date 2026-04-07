@@ -5,7 +5,7 @@
 ```
 ┌──────────┐   OpenAI HTTP/SSE    ┌───────────┐   HTTP/2 Connect+Protobuf  ┌──────────────┐
 │ OpenCode │ ◄──────────────────► │   proxy   │ ◄────────────────────────► │ Cursor Server│
-│ (client) │   localhost:4011     │           │   api2direct.cursor.sh     │  (agent.v1)  │
+│ (client) │   localhost:4011     │           │      api5.cursor.sh        │  (agent.v1)  │
 └──────────┘                      └───────────┘                            └──────────────┘
 ```
 

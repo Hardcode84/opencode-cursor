@@ -33,7 +33,7 @@ export function resolveRuntimeConfig(
 ): CursorRuntimeConfig {
   return {
     apiUrl: process.env.CURSOR_API_URL ?? "https://api2.cursor.sh",
-    agentUrl: process.env.CURSOR_AGENT_URL ?? "https://agentn.us.api5.cursor.sh",
+    agentUrl: process.env.CURSOR_AGENT_URL ?? "https://api5.cursor.sh",
     loginUrl: process.env.CURSOR_LOGIN_URL ?? "https://cursor.com/loginDeepControl",
     pollUrl: process.env.CURSOR_POLL_URL ?? "https://api2.cursor.sh/auth/poll",
     refreshUrl:
