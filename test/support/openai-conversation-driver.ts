@@ -34,9 +34,21 @@ export interface ConversationDriverTurnTrace {
 }
 
 type ToolExecutor = (args: unknown, toolCall: OpenAIToolCall) => string | Promise<string>;
+type ResponseValidator = (
+  messages: ReadonlyArray<OpenAIMessage>,
+  trace: ConversationDriverRequestTrace,
+) => string | null;
+
+export interface NormalizedConversationMessage {
+  role: OpenAIMessage["role"];
+  content: string | null;
+  toolCallId?: string;
+  toolCalls?: Array<{ id: string; name: string; arguments: string }>;
+}
 
 export class OpenAIConversationDriver {
   readonly messages: OpenAIMessage[];
+  private readonly toolResultCache = new Map<string, string>();
 
   constructor(
     private readonly options: {
@@ -46,6 +58,8 @@ export class OpenAIConversationDriver {
       tools?: OpenAIToolDef[];
       toolExecutors?: Record<string, ToolExecutor>;
       initialMessages?: OpenAIMessage[];
+      maxRequestRetries?: number;
+      responseValidator?: ResponseValidator;
     },
   ) {
     this.messages = [...(options.initialMessages ?? [])];
@@ -75,12 +89,8 @@ export class OpenAIConversationDriver {
         });
 
         for (const toolCall of requestTrace.toolCalls) {
-          const executor = this.options.toolExecutors?.[toolCall.function.name];
-          if (!executor) {
-            throw new Error(`No tool executor registered for ${toolCall.function.name}`);
-          }
           const args = toolCall.function.arguments ? JSON.parse(toolCall.function.arguments) : {};
-          const result = await executor(args, toolCall);
+          const result = await this.resolveToolResult(toolCall, args);
           toolExecutions.push({
             toolCallId: toolCall.id,
             toolName: toolCall.function.name,
@@ -116,6 +126,33 @@ export class OpenAIConversationDriver {
   }
 
   private async postCurrentConversation(): Promise<ConversationDriverRequestTrace> {
+    const maxRetries = this.options.maxRequestRetries ?? 0;
+    let attempt = 0;
+    for (;;) {
+      try {
+        return await this.postCurrentConversationOnce();
+      } catch (error) {
+        if (!(error instanceof RetryableConversationRequestError) || attempt >= maxRetries) {
+          throw error;
+        }
+        attempt++;
+      }
+    }
+  }
+
+  private async resolveToolResult(toolCall: OpenAIToolCall, args: unknown): Promise<string> {
+    const cached = this.toolResultCache.get(toolCall.id);
+    if (cached !== undefined) return cached;
+    const executor = this.options.toolExecutors?.[toolCall.function.name];
+    if (!executor) {
+      throw new Error(`No tool executor registered for ${toolCall.function.name}`);
+    }
+    const result = await executor(args, toolCall);
+    this.toolResultCache.set(toolCall.id, result);
+    return result;
+  }
+
+  private async postCurrentConversationOnce(): Promise<ConversationDriverRequestTrace> {
     const response = await fetch(`${this.options.baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
@@ -134,34 +171,51 @@ export class OpenAIConversationDriver {
       throw new Error(`Chat completion failed with status ${response.status}`);
     }
     if (!response.body) {
-      throw new Error("Streaming response body missing");
+      throw new RetryableConversationRequestError("Streaming response body missing");
     }
 
-    return readSSE(response.body);
+    const trace = await readSSE(response.body);
+    if (isRetryableFailureTrace(trace)) {
+      throw new RetryableConversationRequestError(trace.content.trim());
+    }
+    const validatorMessage = this.options.responseValidator?.(this.messages, trace);
+    if (validatorMessage) {
+      throw new RetryableConversationRequestError(validatorMessage);
+    }
+    return trace;
   }
 }
 
 async function readSSE(
   stream: ReadableStream<Uint8Array>,
 ): Promise<ConversationDriverRequestTrace> {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let pending = "";
-  const trace = createEmptyTrace();
+  try {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let pending = "";
+    const trace = createEmptyTrace();
 
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    pending += decoder.decode(value, { stream: true });
-    const blocks = drainSseBlocks(pending);
-    pending = blocks.pending;
-    for (const payload of blocks.payloads) {
-      if (payload === "[DONE]") return trace;
-      applyPayload(trace, payload);
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      pending += decoder.decode(value, { stream: true });
+      const blocks = drainSseBlocks(pending);
+      pending = blocks.pending;
+      for (const payload of blocks.payloads) {
+        if (payload === "[DONE]") {
+          ensureTerminalTrace(trace);
+          return trace;
+        }
+        applyPayload(trace, payload);
+      }
     }
+  } catch (error) {
+    throw new RetryableConversationRequestError(
+      error instanceof Error ? error.message : String(error),
+    );
   }
 
-  return trace;
+  throw new RetryableConversationRequestError("Streaming response ended before [DONE]");
 }
 
 function extractDataPayload(block: string): string | null {
@@ -259,3 +313,45 @@ function appendToolCalls(trace: ConversationDriverRequestTrace, toolCalls: OpenA
     trace.events.push({ kind: "tool_call", toolCall });
   }
 }
+
+function ensureTerminalTrace(trace: ConversationDriverRequestTrace): void {
+  if (trace.finishReason === "stop" || trace.finishReason === "tool_calls") return;
+  throw new RetryableConversationRequestError(
+    `Streaming response missing terminal finish reason, got ${trace.finishReason ?? "null"}`,
+  );
+}
+
+function isRetryableFailureTrace(trace: ConversationDriverRequestTrace): boolean {
+  if (trace.finishReason !== "stop") return false;
+  const trimmedContent = trace.content.trim();
+  if (/^\[Error: .+\]$/s.test(trimmedContent)) return true;
+  return (
+    trimmedContent.length === 0 && trace.reasoning.length === 0 && trace.toolCalls.length === 0
+  );
+}
+
+export function normalizeConversationMessages(
+  messages: OpenAIMessage[],
+): NormalizedConversationMessage[] {
+  return messages.map((message) => ({
+    role: message.role,
+    content:
+      typeof message.content === "string"
+        ? message.content
+        : message.content
+          ? JSON.stringify(message.content)
+          : null,
+    ...(message.tool_call_id ? { toolCallId: message.tool_call_id } : {}),
+    ...(message.tool_calls
+      ? {
+          toolCalls: message.tool_calls.map((toolCall) => ({
+            id: toolCall.id,
+            name: toolCall.function.name,
+            arguments: toolCall.function.arguments,
+          })),
+        }
+      : {}),
+  }));
+}
+
+class RetryableConversationRequestError extends Error {}

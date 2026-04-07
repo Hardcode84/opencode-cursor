@@ -75,6 +75,14 @@ export interface FakeMcpResultSnapshot {
   raw: AgentClientMessage;
 }
 
+export interface FakeCommunicationPoint {
+  ordinal: number;
+  label: string;
+  connectionIndex: number;
+}
+
+type FailureMode = "reset" | "destroy";
+
 type RunHandler = (connection: FakeRunConnection) => void | Promise<void>;
 
 interface Waiter {
@@ -229,9 +237,13 @@ export class FakeRunConnection {
   private readCursor = 0;
   private closedResolvers: Array<() => void> = [];
   private _closed = false;
+  private _interrupted = false;
+  private contextTag = "";
 
   constructor(
+    private readonly backend: FakeCursorBackend,
     private readonly stream: ServerHttp2Stream,
+    readonly connectionIndex: number,
     readonly headers: IncomingHttpHeaders,
   ) {
     const frameParser = createConnectFrameParser(
@@ -239,6 +251,7 @@ export class FakeRunConnection {
         const message = fromBinary(AgentClientMessageSchema, bytes);
         this.clientMessages.push(message);
         this.resolveWaiters();
+        this.recordClientPoint(message);
       },
       () => {
         // Client-side endStream frames are unexpected here, but they still count
@@ -256,6 +269,14 @@ export class FakeRunConnection {
 
   get closed(): boolean {
     return this._closed;
+  }
+
+  get interrupted(): boolean {
+    return this._interrupted || this._closed;
+  }
+
+  setContextTag(tag: string): void {
+    this.contextTag = tag;
   }
 
   waitForClientMessage(
@@ -402,6 +423,7 @@ export class FakeRunConnection {
   }
 
   sendEndStreamError(code: string, message: string): void {
+    if (this.failAtPoint(`server.endStream.error.${code}`)) return;
     const payload = new TextEncoder().encode(JSON.stringify({ error: { code, message } }));
     this.writeFrame(payload, CONNECT_END_STREAM_FLAG);
     try {
@@ -412,6 +434,7 @@ export class FakeRunConnection {
   }
 
   sendEndStreamOk(): void {
+    if (this.failAtPoint("server.endStream.ok")) return;
     const payload = new TextEncoder().encode(JSON.stringify({}));
     this.writeFrame(payload, CONNECT_END_STREAM_FLAG);
     try {
@@ -465,6 +488,7 @@ export class FakeRunConnection {
   private sendServerMessage(
     message: Parameters<typeof create<typeof AgentServerMessageSchema>>[1],
   ): void {
+    if (this.failAtPoint(describeServerMessage(message))) return;
     this.writeFrame(toBinary(AgentServerMessageSchema, create(AgentServerMessageSchema, message)));
   }
 
@@ -490,6 +514,21 @@ export class FakeRunConnection {
     if (index >= 0) this.waiters.splice(index, 1);
   }
 
+  private recordClientPoint(message: AgentClientMessage): void {
+    this.failAtPoint(describeClientMessage(message));
+  }
+
+  private failAtPoint(label: string): boolean {
+    const failed = this.backend.recordPoint(
+      this,
+      this.contextTag ? `${this.contextTag}:${label}` : label,
+    );
+    if (failed) {
+      this._interrupted = true;
+    }
+    return failed;
+  }
+
   private resolveWaiters(): void {
     for (let i = 0; i < this.waiters.length; ) {
       const waiter = this.waiters[i]!;
@@ -512,6 +551,7 @@ export class FakeRunConnection {
 export class FakeCursorBackend {
   private readonly server = http2.createServer();
   private readonly runHandlers: RunHandler[] = [];
+  private defaultRunHandler: RunHandler | undefined;
   private availableModels: FakeCursorModel[] = [
     { id: "test-model", name: "Test Model", reasoning: true },
   ];
@@ -523,6 +563,10 @@ export class FakeCursorBackend {
 
   readonly unaryRequests: FakeUnaryRequest[] = [];
   readonly runConnections: FakeRunConnection[] = [];
+  readonly communicationPoints: FakeCommunicationPoint[] = [];
+  private failOnceAtOrdinal: number | null = null;
+  private failureMode: FailureMode = "reset";
+  private failureInjected = false;
 
   private constructor() {
     this.server.on("stream", (stream, headers) => {
@@ -549,6 +593,10 @@ export class FakeCursorBackend {
     return this.runConnections.length;
   }
 
+  get didInjectFailure(): boolean {
+    return this.failureInjected;
+  }
+
   setAvailableModels(models: FakeCursorModel[]): void {
     this.availableModels = [...models];
   }
@@ -567,6 +615,16 @@ export class FakeCursorBackend {
 
   enqueueRun(handler: RunHandler): void {
     this.runHandlers.push(handler);
+  }
+
+  setRunHandler(handler: RunHandler): void {
+    this.defaultRunHandler = handler;
+  }
+
+  setFailOnceAtPoint(ordinal: number, mode: FailureMode = "reset"): void {
+    this.failOnceAtOrdinal = ordinal;
+    this.failureMode = mode;
+    this.failureInjected = false;
   }
 
   async close(): Promise<void> {
@@ -588,9 +646,14 @@ export class FakeCursorBackend {
         ":status": 200,
         "content-type": "application/connect+proto",
       });
-      const connection = new FakeRunConnection(stream, headers);
+      const connection = new FakeRunConnection(
+        this,
+        stream,
+        this.runConnections.length + 1,
+        headers,
+      );
       this.runConnections.push(connection);
-      const handler = this.runHandlers.shift();
+      const handler = this.runHandlers.shift() ?? this.defaultRunHandler;
       if (!handler) {
         connection.sendEndStreamError("test_backend_error", "No run handler queued");
         return;
@@ -685,4 +748,50 @@ export class FakeCursorBackend {
     stream.respond({ ":status": 404 });
     stream.end();
   }
+
+  recordPoint(connection: FakeRunConnection, label: string): boolean {
+    const point: FakeCommunicationPoint = {
+      ordinal: this.communicationPoints.length,
+      label,
+      connectionIndex: connection.connectionIndex,
+    };
+    this.communicationPoints.push(point);
+
+    if (this.failOnceAtOrdinal === point.ordinal && !this.failureInjected && !connection.closed) {
+      this.failureInjected = true;
+      if (this.failureMode === "destroy") {
+        connection.destroy(new Error(`Injected failure at ${label}`));
+      } else {
+        connection.resetStream();
+      }
+      return true;
+    }
+
+    return false;
+  }
+}
+
+function describeClientMessage(message: AgentClientMessage): string {
+  if (message.message.case === "execClientMessage") {
+    return `client.execClientMessage.${message.message.value.message.case ?? "unknown"}`;
+  }
+  if (message.message.case === "execClientControlMessage") {
+    return `client.execClientControlMessage.${message.message.value.message.case ?? "unknown"}`;
+  }
+  if (message.message.case === "kvClientMessage") {
+    return `client.kvClientMessage.${message.message.value.message.case ?? "unknown"}`;
+  }
+  return `client.${message.message.case ?? "unknown"}`;
+}
+
+function describeServerMessage(
+  message: Parameters<typeof create<typeof AgentServerMessageSchema>>[1],
+): string {
+  if (message.message.case === "execServerMessage") {
+    return `server.execServerMessage.${message.message.value.message.case ?? "unknown"}`;
+  }
+  if (message.message.case === "interactionUpdate") {
+    return `server.interactionUpdate.${message.message.value.message.case ?? "unknown"}`;
+  }
+  return `server.${message.message.case ?? "unknown"}`;
 }

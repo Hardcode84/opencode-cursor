@@ -285,6 +285,7 @@ export class CursorSession implements BridgeWriter {
   }
 
   private finish(code: number): void {
+    const sawEndStream = this.streamState.endStreamSeen;
     if (this._alive) {
       this._alive = false;
       clearInterval(this.heartbeatTimer);
@@ -294,7 +295,7 @@ export class CursorSession implements BridgeWriter {
     if (!this.doneEventSent) {
       if (this.pendingExecs.length > 0) {
         this.pushDone({ type: "done", error: "session closed with pending tool calls" });
-      } else if (code !== CLOSE_OK) {
+      } else if (code !== CLOSE_OK || !sawEndStream) {
         this.pushDone({ type: "done", error: "bridge connection lost" });
       } else {
         this.pushDone({ type: "done" });
