@@ -38,6 +38,7 @@ type ResponseValidator = (
   messages: ReadonlyArray<OpenAIMessage>,
   trace: ConversationDriverRequestTrace,
 ) => string | null;
+type RetryHook = (attempt: number, error: Error) => void | Promise<void>;
 
 export interface NormalizedConversationMessage {
   role: OpenAIMessage["role"];
@@ -52,7 +53,7 @@ export class OpenAIConversationDriver {
 
   constructor(
     private readonly options: {
-      baseUrl: string;
+      baseUrl: string | (() => string);
       model: string;
       sessionId: string;
       tools?: OpenAIToolDef[];
@@ -60,6 +61,7 @@ export class OpenAIConversationDriver {
       initialMessages?: OpenAIMessage[];
       maxRequestRetries?: number;
       responseValidator?: ResponseValidator;
+      onRetry?: RetryHook;
     },
   ) {
     this.messages = [...(options.initialMessages ?? [])];
@@ -135,6 +137,7 @@ export class OpenAIConversationDriver {
         if (!(error instanceof RetryableConversationRequestError) || attempt >= maxRetries) {
           throw error;
         }
+        await this.options.onRetry?.(attempt + 1, error);
         attempt++;
       }
     }
@@ -153,7 +156,7 @@ export class OpenAIConversationDriver {
   }
 
   private async postCurrentConversationOnce(): Promise<ConversationDriverRequestTrace> {
-    const response = await fetch(`${this.options.baseUrl}/chat/completions`, {
+    const response = await fetch(`${this.resolveBaseUrl()}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -183,6 +186,12 @@ export class OpenAIConversationDriver {
       throw new RetryableConversationRequestError(validatorMessage);
     }
     return trace;
+  }
+
+  private resolveBaseUrl(): string {
+    return typeof this.options.baseUrl === "function"
+      ? this.options.baseUrl()
+      : this.options.baseUrl;
   }
 }
 

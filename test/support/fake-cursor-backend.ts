@@ -65,6 +65,7 @@ export interface FakeRunRequestSnapshot {
   actionCase: string;
   userText: string;
   turns: FakeConversationTurnSnapshot[];
+  pendingToolCalls: string[];
   raw: AgentClientMessage;
 }
 
@@ -108,7 +109,10 @@ function encodeValue(value: unknown): Uint8Array {
   return toBinary(ValueSchema, fromJson(ValueSchema, value));
 }
 
-function buildConversationState(turns: FakeConversationTurnSnapshot[]): ConversationStateStructure {
+function buildConversationState(
+  turns: FakeConversationTurnSnapshot[],
+  options: { pendingToolCalls?: string[] } = {},
+): ConversationStateStructure {
   const turnBytes = turns.map((turn, index) => {
     const userMessageBytes = toBinary(
       UserMessageSchema,
@@ -148,7 +152,7 @@ function buildConversationState(turns: FakeConversationTurnSnapshot[]): Conversa
     turns: turnBytes,
     rootPromptMessagesJson: [],
     todos: [],
-    pendingToolCalls: [],
+    pendingToolCalls: options.pendingToolCalls ?? [],
     previousWorkspaceUris: [],
     fileStates: {},
     fileStatesV2: {},
@@ -203,6 +207,7 @@ function decodeRunRequest(message: AgentClientMessage): FakeRunRequestSnapshot {
     actionCase,
     userText,
     turns: decodeConversationTurns(runRequest.conversationState),
+    pendingToolCalls: [...(runRequest.conversationState?.pendingToolCalls ?? [])],
     raw: message,
   };
 }
@@ -418,8 +423,11 @@ export class FakeRunConnection {
     });
   }
 
-  sendConversationCheckpoint(turns: FakeConversationTurnSnapshot[]): void {
-    this.sendCheckpoint(buildConversationState(turns));
+  sendConversationCheckpoint(
+    turns: FakeConversationTurnSnapshot[],
+    options: { pendingToolCalls?: string[] } = {},
+  ): void {
+    this.sendCheckpoint(buildConversationState(turns, options));
   }
 
   sendEndStreamError(code: string, message: string): void {
