@@ -127,6 +127,7 @@ bun run test:smoke                            # smoke script against a real prox
 bun test test/conversation-replay-recovery.test.ts
 bun test test/conversation-semantic-fuzz.test.ts
 SEMANTIC_FUZZ_COUNT=50 bun test test/conversation-semantic-fuzz.test.ts
+SEMANTIC_FUZZ_COUNT=50 SEMANTIC_FUZZ_FAILURE_POINT_COUNT=16 bun test test/conversation-semantic-fuzz.test.ts
 ```
 
 The test suite is intentionally layered:
@@ -152,6 +153,7 @@ The project uses **semantic fuzzing**, not raw byte fuzzing, as its primary fuzz
 
 - Scenarios are generated from fixed seeds so failures are reproducible.
 - `SEMANTIC_FUZZ_COUNT` controls how many seeded scenarios are generated; if it is unset, the suite falls back to its built-in default seed count.
+- `SEMANTIC_FUZZ_FAILURE_POINT_COUNT` controls how many semantic communication points are replayed per seed; if it is unset, the suite falls back to its built-in default sample size.
 - Each seed produces a small conversation in the currently supported recoverable space: multiple turns, optional tool-use turns, and 1-2 tool calls in a batch.
 - The suite first runs a golden conversation, records the semantic communication points, then replays sampled points with a single injected upstream `reset` or `destroy`.
 - The main invariants are:

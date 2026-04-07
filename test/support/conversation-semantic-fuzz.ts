@@ -192,8 +192,9 @@ export function validateSemanticFuzzResponse(
 export function sampleSemanticFailurePoints(
   points: FakeCommunicationPoint[],
   seed: number,
+  maxSampleCount = 8,
 ): FakeCommunicationPoint[] {
-  if (points.length <= 6) return [...points];
+  if (points.length <= maxSampleCount) return [...points];
 
   const pickedOrdinals = new Set<number>();
   const preferredPatterns = [
@@ -207,6 +208,7 @@ export function sampleSemanticFailurePoints(
   ];
 
   for (const pattern of preferredPatterns) {
+    if (pickedOrdinals.size >= maxSampleCount) break;
     const match = points.find((point) => pattern.test(point.label));
     if (match) pickedOrdinals.add(match.ordinal);
   }
@@ -218,7 +220,7 @@ export function sampleSemanticFailurePoints(
       point.label.startsWith("server."),
   );
   const rng = createRng(seed ^ 0x85ebca6b);
-  while (pickedOrdinals.size < Math.min(8, safePoints.length)) {
+  while (pickedOrdinals.size < Math.min(maxSampleCount, safePoints.length)) {
     pickedOrdinals.add(safePoints[rng.nextInt(safePoints.length)]!.ordinal);
   }
 
