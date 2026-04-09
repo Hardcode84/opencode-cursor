@@ -23,7 +23,7 @@ type StreamPart = {
   [key: string]: unknown;
 };
 
-function fixInterleavingTransform(): TransformStream<StreamPart, StreamPart> {
+export function fixInterleavingTransform(): TransformStream<StreamPart, StreamPart> {
   let textCount = 0;
   let reasoningCount = 0;
   let activeTextId: string | null = null;
@@ -46,7 +46,11 @@ function fixInterleavingTransform(): TransformStream<StreamPart, StreamPart> {
           break;
 
         case "reasoning-end":
-          controller.enqueue({ ...chunk, id: activeReasoningId ?? chunk.id });
+          // The upstream SDK can emit a duplicate reasoning-end during flush even
+          // after we already closed the wrapped segment. Ignore that stale close
+          // instead of leaking the raw "reasoning-0" id downstream.
+          if (!activeReasoningId) break;
+          controller.enqueue({ ...chunk, id: activeReasoningId });
           activeReasoningId = null;
           break;
 
@@ -64,7 +68,11 @@ function fixInterleavingTransform(): TransformStream<StreamPart, StreamPart> {
           break;
 
         case "text-end":
-          controller.enqueue({ ...chunk, id: activeTextId ?? chunk.id });
+          // The upstream SDK keeps its internal text flag open across some
+          // reasoning transitions, so flush() can emit a stale txt-0 close after
+          // we have already closed the wrapped text block. Drop it.
+          if (!activeTextId) break;
+          controller.enqueue({ ...chunk, id: activeTextId });
           activeTextId = null;
           break;
 
