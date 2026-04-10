@@ -18,6 +18,7 @@ import {
   parseCursorMaxModeValue,
   resolveEffectiveCursorMaxMode,
 } from "./max-mode";
+import { prettyCursorModelName } from "./model-names";
 import { MCP_TOOL_PREFIX } from "./native-tools";
 import {
   type OpenAIMessage,
@@ -559,10 +560,12 @@ function buildResumeRequest(
 }
 
 function createModelDetails(modelId: string, maxMode = true) {
+  const displayName = prettyCursorModelName(modelId);
   return create(ModelDetailsSchema, {
     modelId,
-    displayModelId: modelId,
-    displayName: modelId,
+    displayModelId: displayName,
+    displayName,
+    displayNameShort: displayName,
     maxMode,
   });
 }

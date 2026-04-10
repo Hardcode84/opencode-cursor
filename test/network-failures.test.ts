@@ -183,6 +183,35 @@ describe("network failures and timeout integration", () => {
     expect(runSnapshots[1]?.maxMode).toBe(false);
   }, 10_000);
 
+  test("run requests send pretty display names for raw model ids", async () => {
+    backend = await FakeCursorBackend.start();
+    const runSnapshots: FakeRunRequestSnapshot[] = [];
+
+    backend.enqueueRun(async (connection) => {
+      runSnapshots.push(await connection.waitForRunRequest());
+      connection.sendTextDelta("Pretty name sent.");
+      connection.sendEndStreamOk();
+    });
+
+    proxy = await startProxyHarness({
+      runtimeConfig: {
+        apiUrl: backend.apiUrl,
+        agentUrl: backend.agentUrl,
+      },
+    });
+
+    const response = await postStream({
+      model: "claude-4.6-sonnet",
+      messages: [{ role: "user", content: "show display name" }],
+    });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("Pretty name sent.");
+
+    expect(runSnapshots[0]?.modelId).toBe("claude-4.6-sonnet");
+    expect(runSnapshots[0]?.modelDisplayId).toBe("Claude Sonnet 4.6");
+    expect(runSnapshots[0]?.modelDisplayName).toBe("Claude Sonnet 4.6");
+  }, 10_000);
+
   test("streaming timeout after partial output also auto-resumes", async () => {
     backend = await FakeCursorBackend.start();
     backend.enqueueRun(async (connection) => {

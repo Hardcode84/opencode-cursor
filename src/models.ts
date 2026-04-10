@@ -8,6 +8,7 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { callCursorUnaryRpc } from "./cursor-session";
 import { logDebug, logWarn } from "./logger";
+import { prettyCursorModelName, resolveCursorModelName } from "./model-names";
 import {
   GetUsableModelsRequestSchema,
   type GetUsableModelsResponse,
@@ -69,56 +70,56 @@ export interface CursorModel {
 const FALLBACK_MODELS: CursorModel[] = [
   {
     id: "composer-1",
-    name: "Composer 1",
+    name: prettyCursorModelName("composer-1"),
     reasoning: true,
     contextWindow: 200_000,
     maxTokens: 64_000,
   },
   {
     id: "composer-1.5",
-    name: "Composer 1.5",
+    name: prettyCursorModelName("composer-1.5"),
     reasoning: true,
     contextWindow: 1_000_000,
     maxTokens: 64_000,
   },
   {
     id: "claude-4.6-opus-high",
-    name: "Claude 4.6 Opus",
+    name: prettyCursorModelName("claude-4.6-opus-high"),
     reasoning: true,
     contextWindow: 1_000_000,
     maxTokens: 128_000,
   },
   {
     id: "claude-4.6-sonnet-medium",
-    name: "Claude 4.6 Sonnet",
+    name: prettyCursorModelName("claude-4.6-sonnet-medium"),
     reasoning: true,
     contextWindow: 1_000_000,
     maxTokens: 64_000,
   },
   {
     id: "claude-4.5-sonnet",
-    name: "Claude 4.5 Sonnet",
+    name: prettyCursorModelName("claude-4.5-sonnet"),
     reasoning: true,
     contextWindow: 1_000_000,
     maxTokens: 64_000,
   },
   {
     id: "gpt-5.4-medium",
-    name: "GPT-5.4",
+    name: prettyCursorModelName("gpt-5.4-medium"),
     reasoning: true,
     contextWindow: 922_000,
     maxTokens: 128_000,
   },
   {
     id: "gpt-5.2",
-    name: "GPT-5.2",
+    name: prettyCursorModelName("gpt-5.2"),
     reasoning: true,
     contextWindow: 272_000,
     maxTokens: 128_000,
   },
   {
     id: "gemini-3.1-pro",
-    name: "Gemini 3.1 Pro",
+    name: prettyCursorModelName("gemini-3.1-pro"),
     reasoning: true,
     contextWindow: 1_000_000,
     maxTokens: 64_000,
@@ -335,7 +336,7 @@ function normalizeAvailableModel(
 
   return {
     id,
-    name: m.clientDisplayName?.trim() || id,
+    name: resolveCursorModelName(id, m.clientDisplayName),
     reasoning: m.supportsThinking === true,
     contextWindow: context,
     maxTokens: DEFAULT_MAX_TOKENS,
@@ -417,9 +418,9 @@ function normalizeLegacyModels(models: readonly unknown[]): CursorModel[] {
 function pickLegacyName(model: Record<string, unknown>, fallbackId: string): string {
   for (const key of ["displayName", "displayNameShort", "displayModelId"]) {
     const v = model[key];
-    if (typeof v === "string" && v.trim()) return v.trim();
+    if (typeof v === "string" && v.trim()) return resolveCursorModelName(fallbackId, v);
   }
-  return fallbackId;
+  return prettyCursorModelName(fallbackId);
 }
 
 // ---------------------------------------------------------------------------
