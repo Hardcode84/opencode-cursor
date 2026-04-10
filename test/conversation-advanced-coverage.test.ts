@@ -1,13 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   createEchoTools,
-  exchangeRequestContext,
+  exchangeRequestContextOrThrow,
   readEchoToolText,
 } from "./support/conversation-test-helpers";
 import {
   FakeCursorBackend,
   type FakeMcpResultSnapshot,
-  type FakeRunConnection,
   type FakeRunRequestSnapshot,
 } from "./support/fake-cursor-backend";
 import { OpenAIConversationDriver } from "./support/openai-conversation-driver";
@@ -256,11 +255,3 @@ describe("advanced conversation coverage", () => {
     ]);
   }, 15_000);
 });
-
-async function exchangeRequestContextOrThrow(
-  connection: FakeRunConnection,
-  execMessageId: number,
-): Promise<void> {
-  const exchanged = await exchangeRequestContext(connection, execMessageId);
-  if (!exchanged) throw new Error(`Request context exchange interrupted for ${execMessageId}`);
-}

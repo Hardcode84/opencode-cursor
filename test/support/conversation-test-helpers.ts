@@ -50,3 +50,11 @@ export async function exchangeRequestContext(
   await connection.waitForRequestContextResult(execMessageId);
   return !connection.interrupted;
 }
+
+export async function exchangeRequestContextOrThrow(
+  connection: FakeRunConnection,
+  execMessageId: number,
+): Promise<void> {
+  const exchanged = await exchangeRequestContext(connection, execMessageId);
+  if (!exchanged) throw new Error(`Request context exchange interrupted for ${execMessageId}`);
+}

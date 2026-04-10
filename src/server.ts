@@ -330,7 +330,7 @@ export function deriveConversationKey(
     .slice(0, 16);
 }
 
-const OPENCODE_AGENT_COMPACTION = "compaction";
+export const OPENCODE_AGENT_COMPACTION = "compaction";
 
 export function shouldBypassStoredCheckpoint(opencodeAgent?: string): boolean {
   return opencodeAgent === OPENCODE_AGENT_COMPACTION;

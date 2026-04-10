@@ -39,6 +39,12 @@ type ResponseValidator = (
   trace: ConversationDriverRequestTrace,
 ) => string | null;
 type RetryHook = (attempt: number, error: Error) => void | Promise<void>;
+const RESERVED_REQUEST_HEADERS = new Set([
+  "content-type",
+  "x-session-affinity",
+  "x-parent-session-id",
+  "x-opencode-agent",
+]);
 
 export interface NormalizedConversationMessage {
   role: OpenAIMessage["role"];
@@ -47,23 +53,30 @@ export interface NormalizedConversationMessage {
   toolCalls?: Array<{ id: string; name: string; arguments: string }>;
 }
 
+export interface ConversationDriverOptions {
+  baseUrl: string | (() => string);
+  model: string;
+  sessionId: string;
+  parentSessionId?: string;
+  opencodeAgent?: string;
+  /**
+   * Additional non-routing headers for specialized tests.
+   * Reserved proxy routing headers are ignored here; use the dedicated options.
+   */
+  extraHeaders?: Record<string, string>;
+  tools?: OpenAIToolDef[];
+  toolExecutors?: Record<string, ToolExecutor>;
+  initialMessages?: OpenAIMessage[];
+  maxRequestRetries?: number;
+  responseValidator?: ResponseValidator;
+  onRetry?: RetryHook;
+}
+
 export class OpenAIConversationDriver {
   readonly messages: OpenAIMessage[];
   private readonly toolResultCache = new Map<string, string>();
 
-  constructor(
-    private readonly options: {
-      baseUrl: string | (() => string);
-      model: string;
-      sessionId: string;
-      tools?: OpenAIToolDef[];
-      toolExecutors?: Record<string, ToolExecutor>;
-      initialMessages?: OpenAIMessage[];
-      maxRequestRetries?: number;
-      responseValidator?: ResponseValidator;
-      onRetry?: RetryHook;
-    },
-  ) {
+  constructor(private readonly options: ConversationDriverOptions) {
     this.messages = [...(options.initialMessages ?? [])];
   }
 
@@ -158,10 +171,7 @@ export class OpenAIConversationDriver {
   private async postCurrentConversationOnce(): Promise<ConversationDriverRequestTrace> {
     const response = await fetch(`${this.resolveBaseUrl()}/chat/completions`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-session-affinity": this.options.sessionId,
-      },
+      headers: this.buildRequestHeaders(),
       body: JSON.stringify({
         model: this.options.model,
         stream: true,
@@ -193,6 +203,29 @@ export class OpenAIConversationDriver {
       ? this.options.baseUrl()
       : this.options.baseUrl;
   }
+
+  private buildRequestHeaders(): Record<string, string> {
+    const headers = filterExtraHeaders(this.options.extraHeaders);
+    headers["Content-Type"] = "application/json";
+    headers["x-session-affinity"] = this.options.sessionId;
+    if (this.options.parentSessionId) {
+      headers["x-parent-session-id"] = this.options.parentSessionId;
+    }
+    if (this.options.opencodeAgent) {
+      headers["x-opencode-agent"] = this.options.opencodeAgent;
+    }
+    return headers;
+  }
+}
+
+function filterExtraHeaders(
+  extraHeaders: Record<string, string> | undefined,
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(extraHeaders ?? {}).filter(
+      ([header]) => !RESERVED_REQUEST_HEADERS.has(header.toLowerCase()),
+    ),
+  );
 }
 
 async function readSSE(
