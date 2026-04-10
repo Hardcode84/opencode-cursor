@@ -69,6 +69,77 @@ describe("network failures and timeout integration", () => {
     expect(body).toContain("Recovered after timeout");
   }, 10_000);
 
+  test("checkpoint-based auto-resume carries rich request context", async () => {
+    backend = await FakeCursorBackend.start();
+    const runSnapshots: FakeRunRequestSnapshot[] = [];
+    const systemPrompt = "Follow this test system prompt exactly.";
+    const tools = [
+      {
+        type: "function",
+        function: {
+          name: "echo_tool",
+          parameters: {
+            type: "object",
+            properties: {
+              text: { type: "string" },
+            },
+            required: ["text"],
+          },
+        },
+      },
+    ];
+
+    backend.enqueueRun(async (connection) => {
+      runSnapshots.push(await connection.waitForRunRequest());
+      connection.sendConversationCheckpoint([]);
+      await connection.waitForClose(1_000);
+    });
+    backend.enqueueRun(async (connection) => {
+      runSnapshots.push(await connection.waitForRunRequest());
+      connection.sendTextDelta("Recovered with resume context.");
+      connection.sendEndStreamOk();
+    });
+
+    proxy = await startProxyHarness({
+      runtimeConfig: {
+        apiUrl: backend.apiUrl,
+        agentUrl: backend.agentUrl,
+        thinkingTimeoutMs: 50,
+        streamingTimeoutMs: 50,
+        collectingTimeoutMs: 50,
+      },
+    });
+
+    const response = await postStream({
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: "resume with context" },
+      ],
+      tools,
+    });
+    expect(response.status).toBe(200);
+    const body = await response.text();
+
+    expect(backend.runCount).toBe(2);
+    expect(body).toContain("Recovered with resume context.");
+    expect(runSnapshots[1]?.actionCase).toBe("resumeAction");
+
+    const resumeAction =
+      runSnapshots[1]?.raw.message.case === "runRequest"
+        ? runSnapshots[1].raw.message.value.action?.action
+        : undefined;
+    expect(resumeAction?.case).toBe("resumeAction");
+
+    const requestContext =
+      resumeAction?.case === "resumeAction" ? resumeAction.value.requestContext : undefined;
+    expect(requestContext?.cloudRule).toBe(systemPrompt);
+    expect(requestContext?.tools.length).toBe(1);
+    expect(requestContext?.tools[0]?.name).toBe("mcp_opencode_echo_tool");
+    expect(requestContext?.mcpInstructions.length).toBe(1);
+    expect(requestContext?.mcpInstructions[0]?.serverName).toBe("opencode");
+    expect(requestContext?.mcpInstructions[0]?.instructions).toContain("mcp_opencode_");
+  }, 10_000);
+
   test("streaming timeout after partial output also auto-resumes", async () => {
     backend = await FakeCursorBackend.start();
     backend.enqueueRun(async (connection) => {

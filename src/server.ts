@@ -42,11 +42,11 @@ import {
   type McpToolDefinition,
   McpToolDefinitionSchema,
   ModelDetailsSchema,
-  RequestContextSchema,
   ResumeActionSchema,
   UserMessageActionSchema,
   UserMessageSchema,
 } from "./proto/agent_pb";
+import { buildRequestContext } from "./request-context";
 import { type CursorRuntimeConfig, resolveRuntimeConfig } from "./runtime-config";
 import { buildTitleSourceText, detectTitleRequest, handleTitleGenerationRequest } from "./title";
 
@@ -514,6 +514,7 @@ function buildResumeRequest(
   checkpoint: Uint8Array | null,
   existingBlobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
+  cloudRule?: string,
 ): CursorRequestPayload {
   const blobStore = new Map<string, Uint8Array>(existingBlobStore);
 
@@ -525,9 +526,7 @@ function buildResumeRequest(
     action: {
       case: "resumeAction",
       value: create(ResumeActionSchema, {
-        requestContext: create(RequestContextSchema, {
-          tools: mcpTools,
-        }),
+        requestContext: buildRequestContext(mcpTools, cloudRule),
       }),
     },
   });
@@ -628,10 +627,12 @@ function buildAutoResumePayload(options: {
   runtimeConfig: Partial<CursorRuntimeConfig>;
   modelId: string;
   mcpTools: McpToolDefinition[];
+  cloudRule?: string;
   rebuildRequest?: () => CursorRequestPayload;
   attempt: number;
 }): CursorRequestPayload | null {
-  const { stored, convKey, runtimeConfig, modelId, mcpTools, rebuildRequest, attempt } = options;
+  const { stored, convKey, runtimeConfig, modelId, mcpTools, cloudRule, rebuildRequest, attempt } =
+    options;
   if (stored?.checkpoint) {
     const safeCheckpoint = sanitizeStoredCheckpointForBuild(
       stored,
@@ -647,6 +648,7 @@ function buildAutoResumePayload(options: {
         safeCheckpoint,
         stored.blobStore,
         mcpTools,
+        cloudRule,
       );
     }
   }
@@ -768,6 +770,7 @@ async function pumpWithAutoResume(
         runtimeConfig: currentSession.runtimeConfig,
         modelId,
         mcpTools,
+        cloudRule,
         rebuildRequest,
         attempt: resumeCount,
       });

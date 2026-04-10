@@ -36,11 +36,9 @@ import {
   InteractionResponseSchema,
   KvClientMessageSchema,
   type KvServerMessage,
-  McpInstructionsSchema,
   McpResultSchema,
   type McpToolDefinition,
   RequestContextResultSchema,
-  RequestContextSchema,
   RequestContextSuccessSchema,
   SetBlobResultSchema,
   ShellRejectedSchema,
@@ -51,6 +49,7 @@ import {
   WriteShellStdinResultSchema,
 } from "./proto/agent_pb";
 import { frameConnectMessage } from "./protocol";
+import { buildRequestContext } from "./request-context";
 
 // ── Types ──
 
@@ -358,25 +357,7 @@ export function handleExecMessage(
       mcpTools.length,
       state?.pendingExecs.length ?? 0,
     );
-    const requestContext = create(RequestContextSchema, {
-      rules: [],
-      repositoryInfo: [],
-      tools: mcpTools,
-      gitRepos: [],
-      projectLayouts: [],
-      mcpInstructions: [
-        create(McpInstructionsSchema, {
-          serverName: "opencode",
-          instructions:
-            "This environment provides tools prefixed with mcp_opencode_ (e.g. mcp_opencode_read, mcp_opencode_grep, mcp_opencode_task). " +
-            "Always prefer these mcp_opencode_* tools over any built-in native tools. " +
-            "In particular, use mcp_opencode_task for launching subagents — NEVER use the built-in Subagent tool.",
-        }),
-      ],
-      cloudRule: cloudRule || undefined,
-      fileContents: {},
-      customSubagents: [],
-    });
+    const requestContext = buildRequestContext(mcpTools, cloudRule);
     const result = create(RequestContextResultSchema, {
       result: {
         case: "success",
