@@ -13,6 +13,11 @@ import {
 import type { RetryHint } from "./cursor-session";
 import { CursorSession } from "./cursor-session";
 import { errorDetails, logDebug, logError, logInfo, logWarn } from "./logger";
+import {
+  CURSOR_MAX_MODE_HEADER,
+  parseCursorMaxModeValue,
+  resolveEffectiveCursorMaxMode,
+} from "./max-mode";
 import { MCP_TOOL_PREFIX } from "./native-tools";
 import {
   type OpenAIMessage,
@@ -216,6 +221,7 @@ async function handleChatCompletionFetch(req: Request): Promise<Response> {
     const sessionId = req.headers.get("x-session-affinity") ?? undefined;
     const parentSessionId = req.headers.get("x-parent-session-id") ?? undefined;
     const opencodeAgent = req.headers.get("x-opencode-agent") ?? undefined;
+    const maxMode = parseCursorMaxModeValue(req.headers.get(CURSOR_MAX_MODE_HEADER));
     return handleChatCompletion(
       body,
       accessToken,
@@ -223,6 +229,7 @@ async function handleChatCompletionFetch(req: Request): Promise<Response> {
       sessionId,
       parentSessionId,
       opencodeAgent,
+      maxMode,
     );
   } catch (err) {
     if (err instanceof SyntaxError) {
@@ -419,6 +426,7 @@ function buildCursorRequest(
   conversationId: string,
   checkpoint: Uint8Array | null,
   existingBlobStore?: Map<string, Uint8Array>,
+  maxMode = true,
 ): CursorRequestPayload {
   const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
 
@@ -493,7 +501,7 @@ function buildCursorRequest(
   const runRequest = create(AgentRunRequestSchema, {
     conversationState,
     action,
-    modelDetails: createModelDetails(modelId),
+    modelDetails: createModelDetails(modelId, maxMode),
     conversationId,
   });
 
@@ -514,6 +522,7 @@ function buildResumeRequest(
   checkpoint: Uint8Array | null,
   existingBlobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
+  maxMode: boolean,
   cloudRule?: string,
 ): CursorRequestPayload {
   const blobStore = new Map<string, Uint8Array>(existingBlobStore);
@@ -534,7 +543,7 @@ function buildResumeRequest(
   const runRequest = create(AgentRunRequestSchema, {
     conversationState,
     action,
-    modelDetails: createModelDetails(modelId),
+    modelDetails: createModelDetails(modelId, maxMode),
     conversationId,
   });
 
@@ -549,12 +558,12 @@ function buildResumeRequest(
   };
 }
 
-function createModelDetails(modelId: string) {
+function createModelDetails(modelId: string, maxMode = true) {
   return create(ModelDetailsSchema, {
     modelId,
     displayModelId: modelId,
     displayName: modelId,
-    maxMode: true,
+    maxMode,
   });
 }
 
@@ -627,12 +636,22 @@ function buildAutoResumePayload(options: {
   runtimeConfig: Partial<CursorRuntimeConfig>;
   modelId: string;
   mcpTools: McpToolDefinition[];
+  maxMode: boolean;
   cloudRule?: string;
   rebuildRequest?: () => CursorRequestPayload;
   attempt: number;
 }): CursorRequestPayload | null {
-  const { stored, convKey, runtimeConfig, modelId, mcpTools, cloudRule, rebuildRequest, attempt } =
-    options;
+  const {
+    stored,
+    convKey,
+    runtimeConfig,
+    modelId,
+    mcpTools,
+    maxMode,
+    cloudRule,
+    rebuildRequest,
+    attempt,
+  } = options;
   if (stored?.checkpoint) {
     const safeCheckpoint = sanitizeStoredCheckpointForBuild(
       stored,
@@ -648,6 +667,7 @@ function buildAutoResumePayload(options: {
         safeCheckpoint,
         stored.blobStore,
         mcpTools,
+        maxMode,
         cloudRule,
       );
     }
@@ -734,6 +754,7 @@ async function pumpWithAutoResume(
     const mcpTools = currentSession.mcpTools;
     const accessToken = currentSession.accessToken;
     const cloudRule = currentSession.cloudRule;
+    const maxMode = currentSession.maxMode;
     currentSession.close();
     const maxAutoResumes = autoResumeAttemptLimit(result.retryHint);
 
@@ -770,6 +791,7 @@ async function pumpWithAutoResume(
         runtimeConfig: currentSession.runtimeConfig,
         modelId,
         mcpTools,
+        maxMode,
         cloudRule,
         rebuildRequest,
         attempt: resumeCount,
@@ -782,6 +804,7 @@ async function pumpWithAutoResume(
           blobStore: payload.blobStore,
           mcpTools: payload.mcpTools,
           cloudRule,
+          maxMode,
           convKey,
           runtimeConfig: currentSession.runtimeConfig,
           onCheckpoint: makeCheckpointCallback(convKey, currentSession.runtimeConfig),
@@ -813,6 +836,7 @@ function handleChatCompletion(
   sessionId?: string,
   parentSessionId?: string,
   opencodeAgent?: string,
+  maxModeOverride?: boolean,
 ): Response | Promise<Response> {
   if (detectTitleRequest(body)) {
     const sourceText = buildTitleSourceText(body.messages);
@@ -831,6 +855,7 @@ function handleChatCompletion(
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
   const tools = selectToolsForChoice(body.tools ?? [], body.tool_choice);
+  const maxMode = resolveEffectiveCursorMaxMode(maxModeOverride);
 
   if (!userText && toolResults.length === 0) {
     return jsonError("No user message found", "missing_user_message");
@@ -894,6 +919,7 @@ function handleChatCompletion(
     stored.conversationId,
     safeCheckpoint,
     stored.blobStore,
+    maxMode,
   );
   payload.mcpTools = mcpTools;
 
@@ -906,6 +932,7 @@ function handleChatCompletion(
     messages: body.messages.length,
     turns: turns.length,
     blobs: stored.blobStore.size,
+    maxMode,
   });
 
   if (body.stream === false) {
@@ -916,6 +943,7 @@ function handleChatCompletion(
       convKey,
       runtimeConfig,
       systemPrompt,
+      maxMode,
     );
   }
 
@@ -930,6 +958,7 @@ function handleChatCompletion(
     effectiveUserText,
     turns,
     mcpTools,
+    maxMode,
   );
 }
 
@@ -1013,6 +1042,7 @@ interface StreamingPumpOpts {
   effectiveUserText?: string;
   turns?: Turn[];
   mcpTools?: McpToolDefinition[];
+  maxMode?: boolean;
   onSession: (s: CursorSession) => void;
 }
 
@@ -1027,6 +1057,7 @@ async function runStreamingPump(opts: StreamingPumpOpts): Promise<void> {
     effectiveUserText,
     turns,
     mcpTools,
+    maxMode,
     onSession,
   } = opts;
   let currentPayload = opts.initialPayload;
@@ -1038,6 +1069,7 @@ async function runStreamingPump(opts: StreamingPumpOpts): Promise<void> {
       blobStore: currentPayload.blobStore,
       mcpTools: currentPayload.mcpTools,
       cloudRule: systemPrompt,
+      maxMode,
       convKey,
       runtimeConfig: opts.runtimeConfig,
       onCheckpoint: makeCheckpointCallback(convKey, opts.runtimeConfig),
@@ -1061,6 +1093,7 @@ async function runStreamingPump(opts: StreamingPumpOpts): Promise<void> {
         stored.conversationId,
         safeCheckpoint,
         stored.blobStore,
+        maxMode,
       );
     };
     const result = await pumpWithAutoResume(
@@ -1088,6 +1121,7 @@ async function runStreamingPump(opts: StreamingPumpOpts): Promise<void> {
           stored2.conversationId,
           null,
           stored2.blobStore,
+          maxMode,
         );
       } else {
         logWarn("blob not found again - hard retry: full invalidation", { convKey });
@@ -1101,6 +1135,7 @@ async function runStreamingPump(opts: StreamingPumpOpts): Promise<void> {
           fresh.conversationId,
           null,
           fresh.blobStore,
+          maxMode,
         );
       }
       currentPayload.mcpTools = mcpTools ?? [];
@@ -1123,6 +1158,7 @@ function handleStreamingWithRetry(
   effectiveUserText?: string,
   turns?: Turn[],
   mcpTools?: McpToolDefinition[],
+  maxMode?: boolean,
 ): Response {
   const completionId = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -1147,6 +1183,7 @@ function handleStreamingWithRetry(
             effectiveUserText,
             turns,
             mcpTools,
+            maxMode,
             onSession(s) {
               ref.session = s;
               if (ref.cancelled) s.close();
@@ -1224,6 +1261,7 @@ async function handleNonStreamingResponse(
   convKey: string,
   runtimeConfig: Partial<CursorRuntimeConfig>,
   systemPrompt?: string,
+  maxMode?: boolean,
 ): Promise<Response> {
   const session = new CursorSession({
     accessToken,
@@ -1231,6 +1269,7 @@ async function handleNonStreamingResponse(
     blobStore: payload.blobStore,
     mcpTools: payload.mcpTools,
     cloudRule: systemPrompt,
+    maxMode,
     convKey,
     runtimeConfig,
     onCheckpoint: makeCheckpointCallback(convKey, runtimeConfig),

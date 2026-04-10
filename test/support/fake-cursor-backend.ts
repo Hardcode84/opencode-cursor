@@ -61,6 +61,7 @@ export interface FakeConversationTurnSnapshot {
 export interface FakeRunRequestSnapshot {
   conversationId: string;
   modelId: string;
+  maxMode: boolean;
   actionCase: string;
   userText: string;
   turns: FakeConversationTurnSnapshot[];
@@ -207,6 +208,7 @@ function decodeRunRequest(message: AgentClientMessage): FakeRunRequestSnapshot {
   return {
     conversationId: runRequest.conversationId || "",
     modelId: runRequest.modelDetails?.modelId || "",
+    maxMode: runRequest.modelDetails?.maxMode ?? false,
     actionCase,
     userText,
     turns: decodeConversationTurns(runRequest.conversationState),

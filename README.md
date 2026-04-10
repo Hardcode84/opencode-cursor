@@ -24,6 +24,28 @@ Add this to `~/.config/opencode/opencode.json`:
 The `cursor` provider stub is required because OpenCode drops providers that do
 not already exist in its bundled provider catalog.
 
+To disable Cursor's max mode for this provider, add a provider option:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "opencode-cursor-oauth"
+  ],
+  "provider": {
+    "cursor": {
+      "name": "Cursor",
+      "options": {
+        "maxMode": false
+      }
+    }
+  }
+}
+```
+
+If you use OpenCode model overrides, `model.options.maxMode` (or `max_mode`)
+also works and takes precedence over the provider-level setting.
+
 ## Authenticate
 
 ```sh

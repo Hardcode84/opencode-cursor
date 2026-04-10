@@ -15,6 +15,7 @@ import {
   refreshCursorToken,
 } from "./auth";
 import { configureLogger, logWarn } from "./logger";
+import { CURSOR_MAX_MODE_HEADER, resolveCursorMaxModeOption } from "./max-mode";
 import { type CursorModel, getCursorModels } from "./models";
 import { resolveRuntimeConfig } from "./runtime-config";
 import { startProxy } from "./server";
@@ -22,6 +23,9 @@ import { startProxy } from "./server";
 const SDK_WRAPPER_PATH = `file://${resolve(dirname(fileURLToPath(import.meta.url)), "opencode-cursor-sdk.js")}`;
 
 const CURSOR_PROVIDER_ID = "cursor";
+type ChatHeadersHook = NonNullable<Hooks["chat.headers"]>;
+type ChatHeadersInput = Parameters<ChatHeadersHook>[0];
+type ChatHeadersOutput = Parameters<ChatHeadersHook>[1];
 
 /**
  * OpenCode plugin that provides Cursor authentication and model access.
@@ -34,13 +38,16 @@ export const CursorAuthPlugin: Plugin = async (input: PluginInput): Promise<Hook
   let cursorModelList: CursorModel[] | null = null;
 
   return {
-    "chat.headers": async (
-      ctx: { sessionID: string; agent: string },
-      out: { headers: Record<string, string> },
-    ) => {
+    "chat.headers": async (ctx: ChatHeadersInput, out: ChatHeadersOutput) => {
       out.headers ??= {};
       if (ctx.sessionID) out.headers["x-session-affinity"] = ctx.sessionID;
       if (ctx.agent) out.headers["x-opencode-agent"] = ctx.agent;
+      if (ctx.model.providerID !== CURSOR_PROVIDER_ID) return;
+
+      const maxMode = resolveCursorMaxModeOption(ctx.model.options, ctx.provider.options);
+      if (maxMode !== undefined) {
+        out.headers[CURSOR_MAX_MODE_HEADER] = String(maxMode);
+      }
     },
 
     auth: {

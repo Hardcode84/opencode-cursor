@@ -47,6 +47,7 @@ export interface SessionOptions {
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
   cloudRule?: string;
+  maxMode?: boolean;
   convKey: string;
   runtimeConfig?: Partial<CursorRuntimeConfig>;
   onCheckpoint?: (bytes: Uint8Array, blobStore: Map<string, Uint8Array>) => void;
@@ -182,6 +183,10 @@ export class CursorSession implements BridgeWriter {
 
   get cloudRule(): string | undefined {
     return this.options.cloudRule;
+  }
+
+  get maxMode(): boolean {
+    return this.options.maxMode ?? true;
   }
 
   get outputTokens(): number {

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { CURSOR_MAX_MODE_HEADER } from "../src/max-mode";
 import { deriveConversationKey } from "../src/server";
 import {
   FakeCursorBackend,
@@ -21,11 +22,14 @@ function chatBody(overrides: Record<string, unknown> = {}) {
   };
 }
 
-async function postStream(body: Record<string, unknown> = {}): Promise<Response> {
+async function postStream(
+  body: Record<string, unknown> = {},
+  headers: Record<string, string> = {},
+): Promise<Response> {
   if (!proxy) throw new Error("proxy not started");
   return fetch(`${proxy.baseUrl}/chat/completions`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify(chatBody(body)),
   });
 }
@@ -138,6 +142,45 @@ describe("network failures and timeout integration", () => {
     expect(requestContext?.mcpInstructions.length).toBe(1);
     expect(requestContext?.mcpInstructions[0]?.serverName).toBe("opencode");
     expect(requestContext?.mcpInstructions[0]?.instructions).toContain("mcp_opencode_");
+  }, 10_000);
+
+  test("max-mode header is preserved across checkpoint auto-resume", async () => {
+    backend = await FakeCursorBackend.start();
+    const runSnapshots: FakeRunRequestSnapshot[] = [];
+
+    backend.enqueueRun(async (connection) => {
+      runSnapshots.push(await connection.waitForRunRequest());
+      connection.sendConversationCheckpoint([]);
+      await connection.waitForClose(1_000);
+    });
+    backend.enqueueRun(async (connection) => {
+      runSnapshots.push(await connection.waitForRunRequest());
+      connection.sendTextDelta("Recovered with max mode override.");
+      connection.sendEndStreamOk();
+    });
+
+    proxy = await startProxyHarness({
+      runtimeConfig: {
+        apiUrl: backend.apiUrl,
+        agentUrl: backend.agentUrl,
+        thinkingTimeoutMs: 50,
+        streamingTimeoutMs: 50,
+        collectingTimeoutMs: 50,
+      },
+    });
+
+    const response = await postStream(
+      { messages: [{ role: "user", content: "resume with max mode override" }] },
+      { [CURSOR_MAX_MODE_HEADER]: "false" },
+    );
+    expect(response.status).toBe(200);
+    const body = await response.text();
+
+    expect(backend.runCount).toBe(2);
+    expect(body).toContain("Recovered with max mode override.");
+    expect(runSnapshots[0]?.maxMode).toBe(false);
+    expect(runSnapshots[1]?.actionCase).toBe("resumeAction");
+    expect(runSnapshots[1]?.maxMode).toBe(false);
   }, 10_000);
 
   test("streaming timeout after partial output also auto-resumes", async () => {
